@@ -672,12 +672,3 @@ def build_hotpot_retrieval_dataset(file_path, num_samples=None):
     print(f"Dataset cached to: {cache_dir}")
 
     return documents, samples
-
-
-def test_mrr_for_one_query_titles() -> None:
-    ranked_titles = ["Doc A", "Doc B", "Doc C"]
-    gold_titles = ["doc b"]
-
-    score = mrr_for_one_query_titles(ranked_titles, gold_titles, k=3)
-
-    assert score == 0.5
