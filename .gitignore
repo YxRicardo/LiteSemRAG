@@ -1,0 +1,10 @@
+# 忽略所有文件
+*
+
+# 允许目录
+!*/
+
+# 允许指定文件
+!RAG_graph.py
+!text_processing.py
+!utils.py
