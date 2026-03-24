@@ -31,30 +31,28 @@ class RedirectPair:
 
 class WikipediaRedirectIndex:
     """
-    Dependency-free redirect index stored on disk as sharded gzip pickles.
+    Dependency-free redirect index stored as sharded gzip pickles.
 
     Storage layout:
     - metadata.json
-    - canonical_map.pkl.gz
     - redirect_buckets/<bucket>.pkl.gz
-
-    Query behavior:
-    - redirect -> canonical: loads only the relevant shard
-    - canonical -> redirects: loads one canonical map
+    - canonical_buckets/<bucket>.pkl.gz
     """
 
     def __init__(self, index_dir: str | Path) -> None:
         self.index_dir = Path(index_dir)
         self.bucket_dir = self.index_dir / "redirect_buckets"
+        self.canonical_bucket_dir = self.index_dir / "canonical_buckets"
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.bucket_dir.mkdir(parents=True, exist_ok=True)
+        self.canonical_bucket_dir.mkdir(parents=True, exist_ok=True)
         self._bucket_cache: dict[str, dict[str, tuple[str, str]]] = {}
-        self._canonical_map: dict[str, dict[str, object]] | None = None
+        self._canonical_bucket_cache: dict[str, dict[str, dict[str, object]]] = {}
         self._metadata_cache: dict[str, str] | None = None
 
     def close(self) -> None:
         self._bucket_cache.clear()
-        self._canonical_map = None
+        self._canonical_bucket_cache.clear()
         self._metadata_cache = None
 
     def __enter__(self) -> "WikipediaRedirectIndex":
@@ -67,15 +65,12 @@ class WikipediaRedirectIndex:
     def metadata_path(self) -> Path:
         return self.index_dir / "metadata.json"
 
-    @property
-    def canonical_map_path(self) -> Path:
-        return self.index_dir / "canonical_map.pkl.gz"
-
     def clear(self) -> None:
         if self.index_dir.exists():
             shutil.rmtree(self.index_dir)
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.bucket_dir.mkdir(parents=True, exist_ok=True)
+        self.canonical_bucket_dir.mkdir(parents=True, exist_ok=True)
         self.close()
 
     def set_metadata(self, key: str, value: str) -> None:
@@ -92,45 +87,67 @@ class WikipediaRedirectIndex:
     def bulk_add_pairs(
         self,
         pairs: Iterable[RedirectPair | Sequence[str]],
+        flush_every: int = 100000,
     ) -> int:
-        canonical_map: dict[str, dict[str, object]] = {}
-        bucket_maps: dict[str, dict[str, tuple[str, str]]] = {}
+        build_dir = self.index_dir / "_build"
+        redirect_spool_dir = build_dir / "redirect_spool"
+        canonical_spool_dir = build_dir / "canonical_spool"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        redirect_spool_dir.mkdir(parents=True, exist_ok=True)
+        canonical_spool_dir.mkdir(parents=True, exist_ok=True)
+
+        redirect_buffers: dict[str, list[tuple[str, str, str]]] = {}
+        canonical_buffers: dict[str, list[tuple[str, str, str]]] = {}
         inserted = 0
 
-        for pair in pairs:
-            redirect, canonical = self._coerce_pair(pair)
-            if not redirect or not canonical:
-                continue
+        try:
+            for pair in pairs:
+                redirect, canonical = self._coerce_pair(pair)
+                if not redirect or not canonical:
+                    continue
 
-            normalized_redirect = normalize_wikipedia_title(redirect)
-            normalized_canonical = normalize_wikipedia_title(canonical)
-            if normalized_redirect == normalized_canonical:
-                continue
+                normalized_redirect = normalize_wikipedia_title(redirect)
+                normalized_canonical = normalize_wikipedia_title(canonical)
+                if normalized_redirect == normalized_canonical:
+                    continue
 
-            bucket = bucket_maps.setdefault(get_bucket_key(normalized_redirect), {})
-            bucket[normalized_redirect] = (redirect, canonical)
+                redirect_bucket = get_bucket_key(normalized_redirect)
+                canonical_bucket = get_bucket_key(normalized_canonical)
 
-            canonical_entry = canonical_map.setdefault(
-                normalized_canonical,
-                {"title": canonical, "redirects": []},
+                redirect_buffers.setdefault(redirect_bucket, []).append(
+                    (normalized_redirect, redirect, canonical)
+                )
+                canonical_buffers.setdefault(canonical_bucket, []).append(
+                    (normalized_canonical, canonical, redirect)
+                )
+                inserted += 1
+
+                if inserted % flush_every == 0:
+                    self._flush_spool_buffers(redirect_spool_dir, redirect_buffers)
+                    self._flush_spool_buffers(canonical_spool_dir, canonical_buffers)
+                    print(f"[index-build] spooled={inserted:,}", flush=True)
+
+            self._flush_spool_buffers(redirect_spool_dir, redirect_buffers)
+            self._flush_spool_buffers(canonical_spool_dir, canonical_buffers)
+
+            print("[index-build] finalizing redirect buckets...", flush=True)
+            self._finalize_redirect_buckets(redirect_spool_dir)
+
+            print("[index-build] finalizing canonical buckets...", flush=True)
+            canonical_pages = self._finalize_canonical_buckets(canonical_spool_dir)
+
+            self.set_metadata("canonical_pages", str(canonical_pages))
+            self.set_metadata("redirects", str(inserted))
+            print(
+                f"[index-build] completed: canonical_pages={canonical_pages:,}, redirects={inserted:,}",
+                flush=True,
             )
-            canonical_entry["title"] = canonical
-            canonical_entry["redirects"].append(redirect)
-            inserted += 1
+        finally:
+            if build_dir.exists():
+                shutil.rmtree(build_dir)
 
-        for bucket_key, bucket_data in bucket_maps.items():
-            self._write_pickle(self.bucket_dir / f"{bucket_key}.pkl.gz", bucket_data)
-
-        normalized_canonical_map = {
-            key: {
-                "title": value["title"],
-                "redirects": sorted(set(value["redirects"]), key=str.casefold),
-            }
-            for key, value in canonical_map.items()
-        }
-        self._write_pickle(self.canonical_map_path, normalized_canonical_map)
-        self._canonical_map = normalized_canonical_map
-        self._bucket_cache = bucket_maps
+        self._bucket_cache.clear()
+        self._canonical_bucket_cache.clear()
         return inserted
 
     @staticmethod
@@ -146,22 +163,25 @@ class WikipediaRedirectIndex:
         if redirect_entry is not None:
             return redirect_entry[1]
 
-        canonical_entry = self._load_canonical_map().get(normalized)
+        canonical_entry = self._load_canonical_bucket(get_bucket_key(normalized)).get(normalized)
         if canonical_entry is None:
             return None
         return str(canonical_entry["title"])
 
     def get_synonyms(self, title: str, include_canonical: bool = True) -> list[str]:
         normalized = normalize_wikipedia_title(title)
-        canonical_map = self._load_canonical_map()
-        canonical_entry = canonical_map.get(normalized)
+        canonical_bucket = self._load_canonical_bucket(get_bucket_key(normalized))
+        canonical_entry = canonical_bucket.get(normalized)
 
         if canonical_entry is None:
-            bucket = self._load_bucket(get_bucket_key(normalized))
-            redirect_entry = bucket.get(normalized)
+            redirect_bucket = self._load_bucket(get_bucket_key(normalized))
+            redirect_entry = redirect_bucket.get(normalized)
             if redirect_entry is None:
                 return []
-            canonical_entry = canonical_map.get(normalize_wikipedia_title(redirect_entry[1]))
+            canonical_normalized = normalize_wikipedia_title(redirect_entry[1])
+            canonical_entry = self._load_canonical_bucket(get_bucket_key(canonical_normalized)).get(
+                canonical_normalized
+            )
             if canonical_entry is None:
                 return []
 
@@ -178,10 +198,23 @@ class WikipediaRedirectIndex:
                 yield RedirectPair(redirect=redirect, canonical=canonical)
 
     def stats(self) -> dict[str, int]:
-        canonical_map = self._load_canonical_map()
-        redirect_count = sum(len(value["redirects"]) for value in canonical_map.values())
+        metadata = self._load_metadata()
+        canonical_pages = metadata.get("canonical_pages")
+        redirects = metadata.get("redirects")
+        if canonical_pages is not None and redirects is not None:
+            return {
+                "canonical_pages": int(canonical_pages),
+                "redirects": int(redirects),
+            }
+
+        canonical_pages_count = 0
+        redirect_count = 0
+        for bucket_file in self.canonical_bucket_dir.glob("*.pkl.gz"):
+            bucket = self._read_pickle(bucket_file)
+            canonical_pages_count += len(bucket)
+            redirect_count += sum(len(value["redirects"]) for value in bucket.values())
         return {
-            "canonical_pages": len(canonical_map),
+            "canonical_pages": canonical_pages_count,
             "redirects": redirect_count,
         }
 
@@ -194,15 +227,6 @@ class WikipediaRedirectIndex:
         self._metadata_cache = json.loads(self.metadata_path.read_text(encoding="utf-8"))
         return self._metadata_cache
 
-    def _load_canonical_map(self) -> dict[str, dict[str, object]]:
-        if self._canonical_map is not None:
-            return self._canonical_map
-        if not self.canonical_map_path.exists():
-            self._canonical_map = {}
-            return self._canonical_map
-        self._canonical_map = self._read_pickle(self.canonical_map_path)
-        return self._canonical_map
-
     def _load_bucket(self, bucket_key: str) -> dict[str, tuple[str, str]]:
         if bucket_key in self._bucket_cache:
             return self._bucket_cache[bucket_key]
@@ -212,6 +236,83 @@ class WikipediaRedirectIndex:
             return self._bucket_cache[bucket_key]
         self._bucket_cache[bucket_key] = self._read_pickle(path)
         return self._bucket_cache[bucket_key]
+
+    def _load_canonical_bucket(self, bucket_key: str) -> dict[str, dict[str, object]]:
+        if bucket_key in self._canonical_bucket_cache:
+            return self._canonical_bucket_cache[bucket_key]
+        path = self.canonical_bucket_dir / f"{bucket_key}.pkl.gz"
+        if not path.exists():
+            self._canonical_bucket_cache[bucket_key] = {}
+            return self._canonical_bucket_cache[bucket_key]
+        self._canonical_bucket_cache[bucket_key] = self._read_pickle(path)
+        return self._canonical_bucket_cache[bucket_key]
+
+    def _flush_spool_buffers(
+        self,
+        spool_dir: Path,
+        buffers: dict[str, list[tuple[str, str, str]]],
+    ) -> None:
+        for bucket_key, rows in buffers.items():
+            if not rows:
+                continue
+            spool_path = spool_dir / f"{bucket_key}.jsonl"
+            spool_path.parent.mkdir(parents=True, exist_ok=True)
+            with spool_path.open("a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, ensure_ascii=False))
+                    handle.write("\n")
+        buffers.clear()
+
+    def _finalize_redirect_buckets(self, spool_dir: Path) -> None:
+        spool_files = sorted(spool_dir.glob("*.jsonl"))
+        total_files = len(spool_files)
+        for index, spool_file in enumerate(spool_files, start=1):
+            bucket: dict[str, tuple[str, str]] = {}
+            with spool_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    normalized_redirect, redirect, canonical = json.loads(line)
+                    bucket[normalized_redirect] = (redirect, canonical)
+            self._write_pickle(self.bucket_dir / f"{spool_file.stem}.pkl.gz", bucket)
+            if index % 50 == 0 or index == total_files:
+                print(
+                    f"[index-build] redirect buckets finalized={index:,}/{total_files:,}",
+                    flush=True,
+                )
+
+    def _finalize_canonical_buckets(self, spool_dir: Path) -> int:
+        spool_files = sorted(spool_dir.glob("*.jsonl"))
+        total_files = len(spool_files)
+        canonical_pages = 0
+        for index, spool_file in enumerate(spool_files, start=1):
+            bucket: dict[str, dict[str, object]] = {}
+            with spool_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    normalized_canonical, canonical, redirect = json.loads(line)
+                    entry = bucket.setdefault(
+                        normalized_canonical,
+                        {"title": canonical, "redirects": set()},
+                    )
+                    entry["title"] = canonical
+                    entry["redirects"].add(redirect)
+
+            normalized_bucket = {
+                key: {
+                    "title": value["title"],
+                    "redirects": sorted(value["redirects"], key=str.casefold),
+                }
+                for key, value in bucket.items()
+            }
+            canonical_pages += len(normalized_bucket)
+            self._write_pickle(
+                self.canonical_bucket_dir / f"{spool_file.stem}.pkl.gz",
+                normalized_bucket,
+            )
+            if index % 50 == 0 or index == total_files:
+                print(
+                    f"[index-build] canonical buckets finalized={index:,}/{total_files:,}",
+                    flush=True,
+                )
+        return canonical_pages
 
     @staticmethod
     def _write_pickle(path: Path, value: object) -> None:
