@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from typing import Iterator
@@ -10,16 +11,61 @@ from typing import Iterator
 from wikipedia_redirects import RedirectPair, WikipediaRedirectIndex
 
 
-def download_file(url: str, destination: Path) -> Path:
+def format_bytes(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{num_bytes}B"
+
+
+def download_file(url: str, destination: Path, timeout: int = 30) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
+        print(f"Using existing file: {destination}")
         return destination
-    with urllib.request.urlopen(url) as response, destination.open("wb") as output:
+
+    print(f"Downloading: {url}")
+    start_time = time.time()
+    last_report_time = start_time
+    downloaded = 0
+
+    with urllib.request.urlopen(url, timeout=timeout) as response, destination.open("wb") as output:
+        total_size_header = response.headers.get("Content-Length")
+        total_size = int(total_size_header) if total_size_header and total_size_header.isdigit() else None
+
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
                 break
             output.write(chunk)
+            downloaded += len(chunk)
+
+            now = time.time()
+            if now - last_report_time >= 2:
+                elapsed = max(now - start_time, 1e-6)
+                speed = downloaded / elapsed
+                if total_size:
+                    progress = downloaded / total_size * 100
+                    print(
+                        f"  {format_bytes(downloaded)} / {format_bytes(total_size)} "
+                        f"({progress:.1f}%), {format_bytes(int(speed))}/s",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"  {format_bytes(downloaded)} downloaded, {format_bytes(int(speed))}/s",
+                        flush=True,
+                    )
+                last_report_time = now
+
+    elapsed = max(time.time() - start_time, 1e-6)
+    print(
+        f"Finished: {destination} ({format_bytes(downloaded)} in {elapsed:.1f}s)",
+        flush=True,
+    )
     return destination
 
 
@@ -225,3 +271,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# python prepare_wikipedia_redirects.py --wiki enwiki --dump-tag latest
