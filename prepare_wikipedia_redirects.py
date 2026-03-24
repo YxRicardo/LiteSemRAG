@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import os
 import re
 import sys
 import time
 import urllib.request
+from contextlib import suppress
 from pathlib import Path
 from typing import Iterator
 
@@ -20,6 +22,18 @@ def format_bytes(num_bytes: int) -> str:
             return f"{value:.1f}{unit}"
         value /= 1024
     return f"{num_bytes}B"
+
+
+def is_valid_gzip(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with gzip.open(path, "rb") as handle:
+            while handle.read(1024 * 1024):
+                pass
+        return True
+    except (OSError, EOFError):
+        return False
 
 
 class ProgressLogger:
@@ -52,42 +66,60 @@ class ProgressLogger:
 def download_file(url: str, destination: Path, timeout: int = 30) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        print(f"Using existing file: {destination}")
-        return destination
+        if is_valid_gzip(destination):
+            print(f"Using existing file: {destination}")
+            return destination
+        print(f"Existing file is incomplete or corrupted, re-downloading: {destination}")
+        destination.unlink()
 
     print(f"Downloading: {url}")
     start_time = time.time()
     last_report_time = start_time
     downloaded = 0
+    temp_path = destination.with_suffix(destination.suffix + ".part")
+    with suppress(FileNotFoundError):
+        temp_path.unlink()
 
-    with urllib.request.urlopen(url, timeout=timeout) as response, destination.open("wb") as output:
-        total_size_header = response.headers.get("Content-Length")
-        total_size = int(total_size_header) if total_size_header and total_size_header.isdigit() else None
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response, temp_path.open("wb") as output:
+            total_size_header = response.headers.get("Content-Length")
+            total_size = int(total_size_header) if total_size_header and total_size_header.isdigit() else None
 
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            output.write(chunk)
-            downloaded += len(chunk)
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                downloaded += len(chunk)
 
-            now = time.time()
-            if now - last_report_time >= 2:
-                elapsed = max(now - start_time, 1e-6)
-                speed = downloaded / elapsed
-                if total_size:
-                    progress = downloaded / total_size * 100
-                    print(
-                        f"  {format_bytes(downloaded)} / {format_bytes(total_size)} "
-                        f"({progress:.1f}%), {format_bytes(int(speed))}/s",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"  {format_bytes(downloaded)} downloaded, {format_bytes(int(speed))}/s",
-                        flush=True,
-                    )
-                last_report_time = now
+                now = time.time()
+                if now - last_report_time >= 2:
+                    elapsed = max(now - start_time, 1e-6)
+                    speed = downloaded / elapsed
+                    if total_size:
+                        progress = downloaded / total_size * 100
+                        print(
+                            f"  {format_bytes(downloaded)} / {format_bytes(total_size)} "
+                            f"({progress:.1f}%), {format_bytes(int(speed))}/s",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"  {format_bytes(downloaded)} downloaded, {format_bytes(int(speed))}/s",
+                            flush=True,
+                        )
+                    last_report_time = now
+    except Exception:
+        with suppress(FileNotFoundError):
+            temp_path.unlink()
+        raise
+
+    os.replace(temp_path, destination)
+
+    if not is_valid_gzip(destination):
+        with suppress(FileNotFoundError):
+            destination.unlink()
+        raise IOError(f"Downloaded file is corrupted: {destination}")
 
     elapsed = max(time.time() - start_time, 1e-6)
     print(
@@ -342,6 +374,14 @@ def main() -> int:
         raise FileNotFoundError(f"Missing page dump: {page_dump_path}")
     if not redirect_dump_path.exists():
         raise FileNotFoundError(f"Missing redirect dump: {redirect_dump_path}")
+    if not is_valid_gzip(page_dump_path):
+        raise IOError(
+            f"Corrupted gzip file: {page_dump_path}. Delete it and rerun without --skip-download."
+        )
+    if not is_valid_gzip(redirect_dump_path):
+        raise IOError(
+            f"Corrupted gzip file: {redirect_dump_path}. Delete it and rerun without --skip-download."
+        )
 
     print("Building redirect index...")
     stats = build_index(page_dump_path, redirect_dump_path, index_dir, wiki=wiki, dump_tag=dump_tag)
