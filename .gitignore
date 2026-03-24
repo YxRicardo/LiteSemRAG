@@ -8,3 +8,9 @@
 !RAG_graph.py
 !text_processing.py
 !utils.py
+!wikipedia_redirects.py
+!prepare_wikipedia_redirects.py
+
+# 忽略 Wikipedia redirect 生成数据
+data/
+tmp_redirect_index/
