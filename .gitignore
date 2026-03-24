@@ -10,6 +10,7 @@
 !utils.py
 !wikipedia_redirects.py
 !prepare_wikipedia_redirects.py
+!inspect_redirect_index.py
 
 # 忽略 Wikipedia redirect 生成数据
 data/
