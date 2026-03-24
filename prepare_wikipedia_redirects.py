@@ -63,6 +63,17 @@ class ProgressLogger:
         self.report(count, extra=extra)
 
 
+def print_inline_progress(message: str) -> None:
+    print(f"\r{message}", end="", flush=True)
+
+
+def finish_inline_progress(message: str | None = None) -> None:
+    if message is None:
+        print(flush=True)
+    else:
+        print(f"\r{message}", flush=True)
+
+
 def download_file(url: str, destination: Path, timeout: int = 30) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
@@ -98,18 +109,17 @@ def download_file(url: str, destination: Path, timeout: int = 30) -> Path:
                     speed = downloaded / elapsed
                     if total_size:
                         progress = downloaded / total_size * 100
-                        print(
+                        print_inline_progress(
                             f"  {format_bytes(downloaded)} / {format_bytes(total_size)} "
-                            f"({progress:.1f}%), {format_bytes(int(speed))}/s",
-                            flush=True,
+                            f"({progress:.1f}%), {format_bytes(int(speed))}/s"
                         )
                     else:
-                        print(
-                            f"  {format_bytes(downloaded)} downloaded, {format_bytes(int(speed))}/s",
-                            flush=True,
+                        print_inline_progress(
+                            f"  {format_bytes(downloaded)} downloaded, {format_bytes(int(speed))}/s"
                         )
                     last_report_time = now
     except Exception:
+        finish_inline_progress()
         with suppress(FileNotFoundError):
             temp_path.unlink()
         raise
@@ -122,9 +132,8 @@ def download_file(url: str, destination: Path, timeout: int = 30) -> Path:
         raise IOError(f"Downloaded file is corrupted: {destination}")
 
     elapsed = max(time.time() - start_time, 1e-6)
-    print(
-        f"Finished: {destination} ({format_bytes(downloaded)} in {elapsed:.1f}s)",
-        flush=True,
+    finish_inline_progress(
+        f"Finished: {destination} ({format_bytes(downloaded)} in {elapsed:.1f}s)"
     )
     return destination
 
