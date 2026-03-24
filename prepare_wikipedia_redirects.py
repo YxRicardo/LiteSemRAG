@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import re
 import sys
 import time
 import urllib.request
@@ -105,6 +106,10 @@ def parse_sql_values(values_part: str) -> Iterator[list[object]]:
                 elif char == "\\":
                     escape_next = True
                 elif char == "'":
+                    if i + 1 < n and values_part[i + 1] == "'":
+                        token_chars.append("'")
+                        i += 2
+                        continue
                     in_string = False
                 else:
                     token_chars.append(char)
@@ -140,7 +145,7 @@ def convert_sql_value(raw: str) -> object:
         return None
     if value == "":
         return ""
-    if value.lstrip("-").isdigit():
+    if re.fullmatch(r"-?[0-9]+", value):
         return int(value)
     return value.replace("_", " ")
 
