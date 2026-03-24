@@ -1146,13 +1146,96 @@ class ProtoGraphRAG:
 
         return result
 
+    def _select_multi_proto_token_nodes(
+            self,
+            inspect_data,
+            token_contains=None,
+            sort_by="proto_count",
+            max_token_nodes=None,
+            max_protos_per_token=None,
+    ):
+        items = list(inspect_data.items())
+
+        if token_contains:
+            keyword = token_contains.lower()
+            items = [
+                (token_text, token_info)
+                for token_text, token_info in items
+                if keyword in token_text.lower()
+            ]
+
+        if sort_by == "token_text":
+            items.sort(key=lambda x: x[0].lower())
+        elif sort_by == "total_chunk_count":
+            items.sort(
+                key=lambda x: sum(proto["chunk_count"] for proto in x[1]["prototypes"]),
+                reverse=True,
+            )
+        else:
+            items.sort(key=lambda x: x[1]["proto_count"], reverse=True)
+
+        if max_token_nodes is not None:
+            items = items[:max_token_nodes]
+
+        selected_data = {}
+        for token_text, token_info in items:
+            prototypes = token_info["prototypes"]
+            if max_protos_per_token is not None:
+                prototypes = sorted(
+                    prototypes,
+                    key=lambda x: x["chunk_count"],
+                    reverse=True,
+                )[:max_protos_per_token]
+
+            selected_data[token_text] = {
+                "token_node_id": token_info["token_node_id"],
+                "proto_count": token_info["proto_count"],
+                "displayed_proto_count": len(prototypes),
+                "total_chunk_count": sum(proto["chunk_count"] for proto in token_info["prototypes"]),
+                "prototypes": prototypes,
+            }
+
+        return selected_data
+
+    def _limit_proto_sentence_examples(self, inspect_data, max_examples_per_token=None):
+        if max_examples_per_token is None:
+            return inspect_data
+
+        limited_data = {}
+        for token_text, token_info in inspect_data.items():
+            remaining = max_examples_per_token
+            limited_prototypes = []
+
+            for proto_info in token_info["prototypes"]:
+                if remaining <= 0:
+                    limited_examples = []
+                else:
+                    limited_examples = proto_info["sentence_examples"][:remaining]
+                remaining -= len(limited_examples)
+
+                limited_proto = dict(proto_info)
+                limited_proto["sentence_examples"] = limited_examples
+                limited_prototypes.append(limited_proto)
+
+            limited_token_info = dict(token_info)
+            limited_token_info["prototypes"] = limited_prototypes
+            limited_token_info["displayed_example_count"] = (
+                max_examples_per_token - max(remaining, 0)
+            )
+            limited_data[token_text] = limited_token_info
+
+        return limited_data
+
     def _format_multi_proto_token_nodes_text(self, inspect_data):
         lines = []
 
         for token_text, token_info in inspect_data.items():
             lines.append(
                 f"[Token] {token_text} | token_node_id={token_info['token_node_id']} | "
-                f"proto_count={token_info['proto_count']}"
+                f"proto_count={token_info['proto_count']} | "
+                f"displayed_proto_count={token_info['displayed_proto_count']} | "
+                f"total_chunk_count={token_info['total_chunk_count']} | "
+                f"displayed_example_count={token_info.get('displayed_example_count', 'all')}"
             )
 
             for proto_info in token_info["prototypes"]:
@@ -1171,23 +1254,36 @@ class ProtoGraphRAG:
 
         return "\n".join(lines).rstrip()
 
-    def _build_multi_proto_token_nodes_html(self, inspect_data):
+    def _build_multi_proto_token_nodes_html(self, inspect_data, open_details=False):
+        total_tokens = len(inspect_data)
         html_parts = [
             "<div style='font-family:Arial, sans-serif; line-height:1.5;'>"
         ]
+        html_parts.append(
+            "<div style='margin-bottom:12px; padding:10px 12px; background:#f3f6f9; "
+            "border:1px solid #d8e0e8; border-radius:8px;'>"
+            f"<strong>Matched token nodes:</strong> {total_tokens}"
+            "</div>"
+        )
 
         for token_text, token_info in inspect_data.items():
             token_header = (
-                f"{escape(token_text)} "
+                f"{escape(token_text)}"
+            )
+            token_meta = (
                 f"<span style='color:#666;'>"
-                f"(token_node_id={token_info['token_node_id']}, "
-                f"proto_count={token_info['proto_count']})"
+                f"token_node_id={token_info['token_node_id']} | "
+                f"proto_count={token_info['proto_count']}, "
+                f"displayed_proto_count={token_info['displayed_proto_count']}, "
+                f"total_chunk_count={token_info['total_chunk_count']}, "
+                f"displayed_example_count={token_info.get('displayed_example_count', 'all')}"
                 f"</span>"
             )
             html_parts.append(
                 "<details style='margin:10px 0; border:1px solid #ddd; "
-                "border-radius:8px; padding:8px 12px; background:#fafafa;' open>"
+                f"border-radius:8px; padding:8px 12px; background:#fafafa;' {'open' if open_details else ''}>"
                 f"<summary style='cursor:pointer; font-weight:700;'>{token_header}</summary>"
+                f"<div style='margin:6px 0 0 2px; font-size:12px;'>{token_meta}</div>"
             )
 
             for proto_info in token_info["prototypes"]:
@@ -1220,10 +1316,32 @@ class ProtoGraphRAG:
         html_parts.append("</div>")
         return "".join(html_parts)
 
-    def show_multi_proto_token_nodes(self, min_proto_count=2, max_sentences_per_proto=3, as_html=True):
+    def show_multi_proto_token_nodes(
+            self,
+            min_proto_count=2,
+            max_sentences_per_proto=3,
+            as_html=True,
+            token_contains=None,
+            sort_by="proto_count",
+            max_token_nodes=20,
+            max_protos_per_token=5,
+            max_examples_per_token=10,
+            open_details=False,
+    ):
         inspect_data = self.inspect_multi_proto_token_nodes(
             min_proto_count=min_proto_count,
             max_sentences_per_proto=max_sentences_per_proto,
+        )
+        inspect_data = self._select_multi_proto_token_nodes(
+            inspect_data,
+            token_contains=token_contains,
+            sort_by=sort_by,
+            max_token_nodes=max_token_nodes,
+            max_protos_per_token=max_protos_per_token,
+        )
+        inspect_data = self._limit_proto_sentence_examples(
+            inspect_data,
+            max_examples_per_token=max_examples_per_token,
         )
 
         if not inspect_data:
@@ -1239,7 +1357,7 @@ class ProtoGraphRAG:
         if as_html:
             try:
                 from IPython.display import HTML
-                return HTML(self._build_multi_proto_token_nodes_html(inspect_data))
+                return HTML(self._build_multi_proto_token_nodes_html(inspect_data, open_details=open_details))
             except ImportError:
                 pass
 
