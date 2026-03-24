@@ -22,6 +22,33 @@ def format_bytes(num_bytes: int) -> str:
     return f"{num_bytes}B"
 
 
+class ProgressLogger:
+    def __init__(self, label: str, report_every: int = 200000) -> None:
+        self.label = label
+        self.report_every = report_every
+        self.start_time = time.time()
+        self.last_report_time = self.start_time
+
+    def maybe_report(self, count: int, extra: str = "") -> None:
+        if count == 0 or count % self.report_every != 0:
+            return
+        self.report(count, extra=extra)
+
+    def report(self, count: int, extra: str = "") -> None:
+        now = time.time()
+        elapsed = max(now - self.start_time, 1e-6)
+        speed = count / elapsed
+        suffix = f", {extra}" if extra else ""
+        print(
+            f"[{self.label}] processed={count:,}, rate={speed:,.0f}/s{suffix}",
+            flush=True,
+        )
+        self.last_report_time = now
+
+    def done(self, count: int, extra: str = "") -> None:
+        self.report(count, extra=extra)
+
+
 def download_file(url: str, destination: Path, timeout: int = 30) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
@@ -156,19 +183,51 @@ def iter_redirect_pairs(
     article_namespace: int = 0,
 ) -> Iterator[RedirectPair]:
     redirect_targets: dict[int, str] = {}
+    redirect_row_count = 0
+    redirect_kept_count = 0
+    redirect_progress = ProgressLogger("redirect.sql", report_every=500000)
 
     for row in iter_sql_insert_rows(redirect_dump_path, "redirect"):
+        redirect_row_count += 1
         if len(row) < 3:
+            redirect_progress.maybe_report(
+                redirect_row_count,
+                extra=f"kept={redirect_kept_count:,}",
+            )
             continue
         page_id = int(row[0])
         namespace = int(row[1])
         target_title = str(row[2])
         if namespace != article_namespace:
+            redirect_progress.maybe_report(
+                redirect_row_count,
+                extra=f"kept={redirect_kept_count:,}",
+            )
             continue
         redirect_targets[page_id] = target_title
+        redirect_kept_count += 1
+        redirect_progress.maybe_report(
+            redirect_row_count,
+            extra=f"kept={redirect_kept_count:,}",
+        )
+
+    redirect_progress.done(
+        redirect_row_count,
+        extra=f"kept={redirect_kept_count:,}",
+    )
+
+    page_row_count = 0
+    page_redirect_count = 0
+    emitted_pair_count = 0
+    page_progress = ProgressLogger("page.sql", report_every=500000)
 
     for row in iter_sql_insert_rows(page_dump_path, "page"):
+        page_row_count += 1
         if len(row) < 5:
+            page_progress.maybe_report(
+                page_row_count,
+                extra=f"redirect_pages={page_redirect_count:,}, emitted={emitted_pair_count:,}",
+            )
             continue
         page_id = int(row[0])
         namespace = int(row[1])
@@ -176,13 +235,32 @@ def iter_redirect_pairs(
         is_redirect = int(row[4])
 
         if namespace != article_namespace or is_redirect != 1:
+            page_progress.maybe_report(
+                page_row_count,
+                extra=f"redirect_pages={page_redirect_count:,}, emitted={emitted_pair_count:,}",
+            )
             continue
 
+        page_redirect_count += 1
         target_title = redirect_targets.get(page_id)
         if target_title is None:
+            page_progress.maybe_report(
+                page_row_count,
+                extra=f"redirect_pages={page_redirect_count:,}, emitted={emitted_pair_count:,}",
+            )
             continue
 
+        emitted_pair_count += 1
+        page_progress.maybe_report(
+            page_row_count,
+            extra=f"redirect_pages={page_redirect_count:,}, emitted={emitted_pair_count:,}",
+        )
         yield RedirectPair(redirect=page_title, canonical=target_title)
+
+    page_progress.done(
+        page_row_count,
+        extra=f"redirect_pages={page_redirect_count:,}, emitted={emitted_pair_count:,}",
+    )
 
 
 def build_index(
