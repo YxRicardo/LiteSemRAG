@@ -1535,12 +1535,14 @@ class ProtoGraphRAG:
         pt_path = getattr(obj, "tensors_path", pkl_path.replace(".pkl", "_tensors.pt"))
         tensor_pack = torch.load(pt_path)
 
-        obj.query_database = tensor_pack.get("query_database", None).to(obj.device)
+        query_database = tensor_pack.get("query_database", None)
+        obj.query_database = query_database.to(obj.device) if query_database is not None else None
 
         proto_embeds = tensor_pack.get("proto_embeds", [])
         # 按索引回填
         for i, p in enumerate(obj.proto_nodes):
-            p.embed = proto_embeds[i].to("cpu") if i < len(proto_embeds) else None
+            embed = proto_embeds[i] if i < len(proto_embeds) else None
+            p.embed = embed.to("cpu") if embed is not None else None
 
         # 重建运行态（按你原逻辑）
         obj._load_text_encoder()
@@ -1548,6 +1550,8 @@ class ProtoGraphRAG:
         obj.executor = ThreadPoolExecutor(max_workers=4)
         obj._load_nlp()
         obj.node_id2instance()
+        if obj.query_database is None and obj.proto_nodes and all(p.embed is not None for p in obj.proto_nodes):
+            obj.build_query_database()
         obj.load_reranker()
         return obj
 
