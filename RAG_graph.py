@@ -3,6 +3,7 @@ import math
 import pickle
 import time
 import traceback
+from html import escape
 from collections import Counter, defaultdict
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor
@@ -575,7 +576,6 @@ class ProtoGraphRAG:
             fuzzy_match = len(match["fuzzy_protos"]) > 0
             if exact_match:
                 max_proto_node = match["exact_proto"]
-                #low_level_tokens.append(token + f"(exact matched), idf:{max_proto_node.token_node.idf}")
                 low_level_tokens.append(token + f"(exact matched)")
                 if token_type == 'ent':
                     low_level_protos.append((max_proto_node, 0, 1))
@@ -591,7 +591,6 @@ class ProtoGraphRAG:
                             high_level_protos.append((proto_node,1, weight))
                         else:
                             high_level_protos.append((proto_node, 2, weight))
-                        #high_level_tokens.append(proto_node.token_node.token_text + f"(partial matched), idf:{proto_node.token_node.idf}")
                         high_level_tokens.append(
                             proto_node.token_node.token_text + f"(partial matched)")
                     else:
@@ -599,12 +598,10 @@ class ProtoGraphRAG:
                             low_level_protos.append((proto_node,1, weight))
                         else:
                             low_level_protos.append((proto_node,2, weight))
-                        #low_level_tokens.append(proto_node.token_node.token_text + f"(partial matched), idf:{proto_node.token_node.idf}")
                         low_level_tokens.append(
                             proto_node.token_node.token_text + f"(partial matched)")
             if not (exact_match or fuzzy_match):
                 low_level_protos.append((match["semantic_proto"], 3, match["semantic_weight"]))
-                #low_level_tokens.append(self.proto_nodes[proto_node_indices[0]].token_node.token_text  + f"(sim matched), idf:{self.proto_nodes[proto_node_indices[0]].token_node.idf}")
                 low_level_tokens.append(match["semantic_proto"].token_node.token_text + f"(sim matched)")
 
                 high_level_tokens.append(['N/A'])
@@ -1076,6 +1073,177 @@ class ProtoGraphRAG:
 
     def chunk_id2text(self, ids):
         return [self.chunk_nodes[id].chunk_text for id in ids]
+
+    def _extract_sentence_for_token(self, chunk_text, token_text):
+        if not chunk_text:
+            return ""
+
+        token_text_lower = token_text.lower()
+        doc = self.nlp(chunk_text)
+
+        for sent in doc.sents:
+            sent_text = sent.text.strip()
+            if not sent_text:
+                continue
+            if token_text_lower in sent_text.lower():
+                return sent_text
+
+        if len(doc) > 0:
+            first_sent = next(doc.sents, None)
+            if first_sent is not None:
+                return first_sent.text.strip()
+
+        return chunk_text.strip()
+
+    def _collect_proto_sentence_examples(self, proto_node, token_text, max_sentences_per_proto=3):
+        examples = []
+        seen_sentences = set()
+
+        for chunk_node in proto_node.chunk_node_list:
+            sentence_text = self._extract_sentence_for_token(chunk_node.chunk_text, token_text)
+            if not sentence_text:
+                continue
+            sentence_key = sentence_text.lower()
+            if sentence_key in seen_sentences:
+                continue
+
+            seen_sentences.add(sentence_key)
+            examples.append({
+                "doc_name": chunk_node.doc_node.doc_name,
+                "chunk_node_id": chunk_node.chunk_node_id,
+                "sentence_text": sentence_text,
+            })
+
+            if len(examples) >= max_sentences_per_proto:
+                break
+
+        return examples
+
+    def inspect_multi_proto_token_nodes(self, min_proto_count=2, max_sentences_per_proto=3):
+        result = {}
+
+        for token_node in self.token_nodes:
+            proto_count = len(token_node.proto_node_list)
+            if proto_count < min_proto_count:
+                continue
+
+            result[token_node.token_text] = {
+                "token_node_id": token_node.token_node_id,
+                "proto_count": proto_count,
+                "prototypes": [],
+            }
+
+            for proto_node in token_node.proto_node_list:
+                result[token_node.token_text]["prototypes"].append({
+                    "proto_node_id": proto_node.proto_node_id,
+                    "chunk_count": len(proto_node.chunk_node_list),
+                    "sentence_examples": self._collect_proto_sentence_examples(
+                        proto_node,
+                        token_node.token_text,
+                        max_sentences_per_proto=max_sentences_per_proto,
+                    ),
+                })
+
+        return result
+
+    def _format_multi_proto_token_nodes_text(self, inspect_data):
+        lines = []
+
+        for token_text, token_info in inspect_data.items():
+            lines.append(
+                f"[Token] {token_text} | token_node_id={token_info['token_node_id']} | "
+                f"proto_count={token_info['proto_count']}"
+            )
+
+            for proto_info in token_info["prototypes"]:
+                lines.append(
+                    f"  [Proto] proto_node_id={proto_info['proto_node_id']} | "
+                    f"chunk_count={proto_info['chunk_count']}"
+                )
+
+                for idx, example in enumerate(proto_info["sentence_examples"], start=1):
+                    lines.append(
+                        f"    ({idx}) doc={example['doc_name']} | chunk_id={example['chunk_node_id']}"
+                    )
+                    lines.append(f"        {example['sentence_text']}")
+
+            lines.append("")
+
+        return "\n".join(lines).rstrip()
+
+    def _build_multi_proto_token_nodes_html(self, inspect_data):
+        html_parts = [
+            "<div style='font-family:Arial, sans-serif; line-height:1.5;'>"
+        ]
+
+        for token_text, token_info in inspect_data.items():
+            token_header = (
+                f"{escape(token_text)} "
+                f"<span style='color:#666;'>"
+                f"(token_node_id={token_info['token_node_id']}, "
+                f"proto_count={token_info['proto_count']})"
+                f"</span>"
+            )
+            html_parts.append(
+                "<details style='margin:10px 0; border:1px solid #ddd; "
+                "border-radius:8px; padding:8px 12px; background:#fafafa;' open>"
+                f"<summary style='cursor:pointer; font-weight:700;'>{token_header}</summary>"
+            )
+
+            for proto_info in token_info["prototypes"]:
+                proto_header = (
+                    f"proto_node_id={proto_info['proto_node_id']} | "
+                    f"chunk_count={proto_info['chunk_count']}"
+                )
+                html_parts.append(
+                    "<div style='margin:10px 0 6px 16px; padding:8px 10px; "
+                    "border-left:4px solid #4c78a8; background:#fff;'>"
+                    f"<div style='font-weight:600; margin-bottom:6px;'>{escape(proto_header)}</div>"
+                )
+
+                for example in proto_info["sentence_examples"]:
+                    meta = (
+                        f"doc={example['doc_name']} | "
+                        f"chunk_id={example['chunk_node_id']}"
+                    )
+                    html_parts.append(
+                        "<div style='margin:8px 0 10px 8px;'>"
+                        f"<div style='font-size:12px; color:#666; margin-bottom:2px;'>{escape(meta)}</div>"
+                        f"<div style='white-space:pre-wrap;'>{escape(example['sentence_text'])}</div>"
+                        "</div>"
+                    )
+
+                html_parts.append("</div>")
+
+            html_parts.append("</details>")
+
+        html_parts.append("</div>")
+        return "".join(html_parts)
+
+    def show_multi_proto_token_nodes(self, min_proto_count=2, max_sentences_per_proto=3, as_html=True):
+        inspect_data = self.inspect_multi_proto_token_nodes(
+            min_proto_count=min_proto_count,
+            max_sentences_per_proto=max_sentences_per_proto,
+        )
+
+        if not inspect_data:
+            empty_text = "No token nodes matched the multi-prototype condition."
+            if as_html:
+                try:
+                    from IPython.display import HTML
+                    return HTML(f"<div>{escape(empty_text)}</div>")
+                except ImportError:
+                    return empty_text
+            return empty_text
+
+        if as_html:
+            try:
+                from IPython.display import HTML
+                return HTML(self._build_multi_proto_token_nodes_html(inspect_data))
+            except ImportError:
+                pass
+
+        return self._format_multi_proto_token_nodes_text(inspect_data)
 
 
     def delete_by_document(self, doc_name_list):
