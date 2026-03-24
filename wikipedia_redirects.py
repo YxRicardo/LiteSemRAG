@@ -29,6 +29,14 @@ class RedirectPair:
     canonical: str
 
 
+def print_inline_progress(message: str) -> None:
+    print(f"\r{message}", end="", flush=True)
+
+
+def finish_inline_progress(message: str) -> None:
+    print(f"\r{message}", flush=True)
+
+
 class WikipediaRedirectIndex:
     """
     Dependency-free redirect index stored as sharded gzip pickles.
@@ -125,11 +133,12 @@ class WikipediaRedirectIndex:
                 if inserted % flush_every == 0:
                     self._flush_spool_buffers(redirect_spool_dir, redirect_buffers)
                     self._flush_spool_buffers(canonical_spool_dir, canonical_buffers)
-                    print(f"[index-build] spooled={inserted:,}", flush=True)
+                    print_inline_progress(f"[index-build] spooled={inserted:,}")
 
             self._flush_spool_buffers(redirect_spool_dir, redirect_buffers)
             self._flush_spool_buffers(canonical_spool_dir, canonical_buffers)
 
+            finish_inline_progress(f"[index-build] spooled={inserted:,}")
             print("[index-build] finalizing redirect buckets...", flush=True)
             self._finalize_redirect_buckets(redirect_spool_dir)
 
@@ -274,10 +283,13 @@ class WikipediaRedirectIndex:
                     bucket[normalized_redirect] = (redirect, canonical)
             self._write_pickle(self.bucket_dir / f"{spool_file.stem}.pkl.gz", bucket)
             if index % 50 == 0 or index == total_files:
-                print(
-                    f"[index-build] redirect buckets finalized={index:,}/{total_files:,}",
-                    flush=True,
+                print_inline_progress(
+                    f"[index-build] redirect buckets finalized={index:,}/{total_files:,}"
                 )
+        if total_files > 0:
+            finish_inline_progress(
+                f"[index-build] redirect buckets finalized={total_files:,}/{total_files:,}"
+            )
 
     def _finalize_canonical_buckets(self, spool_dir: Path) -> int:
         spool_files = sorted(spool_dir.glob("*.jsonl"))
@@ -308,10 +320,13 @@ class WikipediaRedirectIndex:
                 normalized_bucket,
             )
             if index % 50 == 0 or index == total_files:
-                print(
-                    f"[index-build] canonical buckets finalized={index:,}/{total_files:,}",
-                    flush=True,
+                print_inline_progress(
+                    f"[index-build] canonical buckets finalized={index:,}/{total_files:,}"
                 )
+        if total_files > 0:
+            finish_inline_progress(
+                f"[index-build] canonical buckets finalized={total_files:,}/{total_files:,}"
+            )
         return canonical_pages
 
     @staticmethod

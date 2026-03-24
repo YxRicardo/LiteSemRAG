@@ -42,6 +42,7 @@ class ProgressLogger:
         self.report_every = report_every
         self.start_time = time.time()
         self.last_report_time = self.start_time
+        self._has_output = False
 
     def maybe_report(self, count: int, extra: str = "") -> None:
         if count == 0 or count % self.report_every != 0:
@@ -53,14 +54,22 @@ class ProgressLogger:
         elapsed = max(now - self.start_time, 1e-6)
         speed = count / elapsed
         suffix = f", {extra}" if extra else ""
-        print(
-            f"[{self.label}] processed={count:,}, rate={speed:,.0f}/s{suffix}",
-            flush=True,
+        print_inline_progress(
+            f"[{self.label}] processed={count:,}, rate={speed:,.0f}/s{suffix}"
         )
         self.last_report_time = now
+        self._has_output = True
 
     def done(self, count: int, extra: str = "") -> None:
-        self.report(count, extra=extra)
+        now = time.time()
+        elapsed = max(now - self.start_time, 1e-6)
+        speed = count / elapsed
+        suffix = f", {extra}" if extra else ""
+        finish_inline_progress(
+            f"[{self.label}] processed={count:,}, rate={speed:,.0f}/s{suffix}"
+        )
+        self.last_report_time = now
+        self._has_output = False
 
 
 def print_inline_progress(message: str) -> None:
