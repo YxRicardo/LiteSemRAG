@@ -3,15 +3,65 @@ from __future__ import annotations
 import gzip
 import json
 import pickle
+import re
 import shutil
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
+_PAREN_PATTERN = re.compile(r"\([^()]*\)|\uFF08[^\uFF08\uFF09]*\uFF09")
+_SPACE_PATTERN = re.compile(r"\s+")
+
+
+def _strip_parenthetical_content(text: str) -> str:
+    previous = None
+    current = text
+    while previous != current:
+        previous = current
+        current = _PAREN_PATTERN.sub(" ", current)
+    return current
+
+
+def _remove_special_symbols(text: str) -> str:
+    cleaned_chars: list[str] = []
+    for char in text:
+        if char.isascii() and (char.isalnum() or char in {" ", "'", "-", "&", "/", "."}):
+            cleaned_chars.append(char)
+            continue
+
+        category = unicodedata.category(char)
+        if category.startswith("Z"):
+            cleaned_chars.append(" ")
+            continue
+
+        cleaned_chars.append(" ")
+    return "".join(cleaned_chars)
+
+
 def normalize_wikipedia_title(title: str) -> str:
-    text = str(title).strip().replace("_", " ")
-    return " ".join(text.split()).casefold()
+    text = unicodedata.normalize("NFKC", str(title).strip().replace("_", " "))
+    text = text.casefold()
+    text = _strip_parenthetical_content(text)
+    text = _remove_special_symbols(text)
+    text = text.replace(".", " ")
+    text = _SPACE_PATTERN.sub(" ", text).strip()
+    return text
+
+
+def should_keep_index_title(normalized_title: str) -> bool:
+    if not normalized_title:
+        return False
+    if not re.search(r"[a-z0-9]", normalized_title):
+        return False
+    if not re.search(r"[a-z]", normalized_title):
+        return False
+    return True
+
+
+def contains_non_ascii(text: str) -> bool:
+    return not text.isascii()
 
 
 def get_bucket_key(normalized_title: str) -> str:
@@ -113,9 +163,17 @@ class WikipediaRedirectIndex:
                 redirect, canonical = self._coerce_pair(pair)
                 if not redirect or not canonical:
                     continue
+                if contains_non_ascii(redirect):
+                    continue
+                if contains_non_ascii(canonical):
+                    continue
 
                 normalized_redirect = normalize_wikipedia_title(redirect)
                 normalized_canonical = normalize_wikipedia_title(canonical)
+                if not should_keep_index_title(normalized_redirect):
+                    continue
+                if not should_keep_index_title(normalized_canonical):
+                    continue
                 if normalized_redirect == normalized_canonical:
                     continue
 
@@ -123,10 +181,10 @@ class WikipediaRedirectIndex:
                 canonical_bucket = get_bucket_key(normalized_canonical)
 
                 redirect_buffers.setdefault(redirect_bucket, []).append(
-                    (normalized_redirect, redirect, canonical)
+                    (normalized_redirect, normalized_redirect, normalized_canonical)
                 )
                 canonical_buffers.setdefault(canonical_bucket, []).append(
-                    (normalized_canonical, canonical, redirect)
+                    (normalized_canonical, normalized_canonical, normalized_redirect)
                 )
                 inserted += 1
 
