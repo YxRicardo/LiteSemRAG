@@ -14,7 +14,7 @@ import threading
 import spacy
 import torch
 import torch.nn.functional as F
-from localizeJina import LocalJinaReranker
+#from localizeJina import LocalJinaReranker
 from spacy.tokenizer import Tokenizer
 from spacy.util import compile_infix_regex
 from transformers import AutoModel, AutoTokenizer
@@ -301,7 +301,8 @@ class ProtoGraphRAG:
         self.discard_no_word = discard_no_word
 
     def load_reranker(self):
-        self.reranker = LocalJinaReranker()
+        #self.reranker = LocalJinaReranker()
+        self.reranker = None
 
     def shutdown(self):
         self.executor.shutdown()
@@ -1446,9 +1447,22 @@ class ProtoGraphRAG:
     # ⭐ 反序列化后做什么
     def __setstate__(self, state):
         self.__dict__.update(state)
-        self._load_text_encoder()
+        self.text_encoder = None
+        self.tokenizer = None
+        self.executor = None
+        self.nlp = None
+        self.reranker = None
+
+    def _restore_runtime_components(self, load_nlp=True, load_reranker=False):
+        if self.text_encoder is None or self.tokenizer is None:
+            self._load_text_encoder()
         self.save_doc_to_json()
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        if self.executor is None:
+            self.executor = ThreadPoolExecutor(max_workers=4)
+        if load_nlp and self.nlp is None:
+            self._load_nlp()
+        if load_reranker and self.reranker is None:
+            self.load_reranker()
 
     def save_data(self, path):
         with open(path, "wb") as f:
@@ -1462,7 +1476,7 @@ class ProtoGraphRAG:
     def load_data(cls, path):
         with open(path, "rb") as f:
             obj= pickle.load(f)
-        obj._load_nlp()
+        obj._restore_runtime_components(load_nlp=True, load_reranker=False)
         return obj
 
     def save_data_split(self, pkl_path: str):
@@ -1545,10 +1559,7 @@ class ProtoGraphRAG:
             p.embed = embed.to("cpu") if embed is not None else None
 
         # 重建运行态（按你原逻辑）
-        obj._load_text_encoder()
-        obj.save_doc_to_json()
-        obj.executor = ThreadPoolExecutor(max_workers=4)
-        obj._load_nlp()
+        obj._restore_runtime_components(load_nlp=True, load_reranker=False)
         obj.node_id2instance()
         if obj.query_database is None and obj.proto_nodes and all(p.embed is not None for p in obj.proto_nodes):
             obj.build_query_database()
