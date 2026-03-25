@@ -11,6 +11,7 @@
 !wikipedia_redirects.py
 !prepare_wikipedia_redirects.py
 !inspect_redirect_index.py
+!wikipedia_redirect_index_demo.ipynb
 
 # 忽略 Wikipedia redirect 生成数据
 data/
