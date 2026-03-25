@@ -273,7 +273,7 @@ def iter_redirect_pairs(
 
     for row in iter_sql_insert_rows(page_dump_path, "page"):
         page_row_count += 1
-        if len(row) < 5:
+        if len(row) < 4:
             page_progress.maybe_report(
                 page_row_count,
                 extra=f"redirect_pages={page_redirect_count:,}, emitted={emitted_pair_count:,}",
@@ -282,7 +282,7 @@ def iter_redirect_pairs(
         page_id = int(row[0])
         namespace = int(row[1])
         page_title = str(row[2])
-        is_redirect = int(row[4])
+        is_redirect = int(row[3])
 
         if namespace != article_namespace or is_redirect != 1:
             page_progress.maybe_report(
