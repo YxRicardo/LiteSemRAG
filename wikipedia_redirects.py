@@ -237,18 +237,19 @@ class WikipediaRedirectIndex:
 
     def get_synonyms(self, title: str, include_canonical: bool = True) -> list[str]:
         normalized = normalize_wikipedia_title(title)
-        canonical_bucket = self._load_canonical_bucket(get_bucket_key(normalized))
-        canonical_entry = canonical_bucket.get(normalized)
+        redirect_bucket = self._load_bucket(get_bucket_key(normalized))
+        redirect_entry = redirect_bucket.get(normalized)
 
-        if canonical_entry is None:
-            redirect_bucket = self._load_bucket(get_bucket_key(normalized))
-            redirect_entry = redirect_bucket.get(normalized)
-            if redirect_entry is None:
-                return []
+        if redirect_entry is not None:
             canonical_normalized = normalize_wikipedia_title(redirect_entry[1])
             canonical_entry = self._load_canonical_bucket(get_bucket_key(canonical_normalized)).get(
                 canonical_normalized
             )
+            if canonical_entry is None:
+                return []
+        else:
+            canonical_bucket = self._load_canonical_bucket(get_bucket_key(normalized))
+            canonical_entry = canonical_bucket.get(normalized)
             if canonical_entry is None:
                 return []
 
