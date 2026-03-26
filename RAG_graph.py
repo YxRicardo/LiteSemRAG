@@ -259,7 +259,8 @@ class Prototype:
 class ProtoGraphRAG:
     def __init__(self, text_embed_dim, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
                  anomaly_section_size=50,query_token_percentile=0.8,
-                 retrieve_top_k=5, chunk_size=300, remove_duplicate_token=True, device="cuda", discard_no_word=False):
+                 retrieve_top_k=5, chunk_size=300, remove_duplicate_token=True, device="cuda",
+                 discard_no_word=False, plot_embeds=False):
         self.text_embed_dim = text_embed_dim
         self.df_ratio = df_ratio
         self.doc_nodes = []
@@ -299,6 +300,7 @@ class ProtoGraphRAG:
         self.load_reranker()
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
+        self.plot_embeds = plot_embeds
 
     def load_reranker(self):
         #self.reranker = LocalJinaReranker()
@@ -369,7 +371,8 @@ class ProtoGraphRAG:
                                                                     min_cluster_size=int(len(token_node.embeds_buffer)/20),
                                                                     percentile=self.anomaly_threshold_percentile, merge_chunks=False)
             if n_clusters >= 1:
-                self.plot_embed_distribution(token_node, clusters)
+                if self.plot_embeds:
+                    self.plot_embed_distribution(token_node, clusters)
                 for clusters_label in range(n_clusters):
                     new_proto_node = self.create_proto_node(token_node)
                     new_proto_node.embed = torch.from_numpy(cluster_centers[clusters_label])
@@ -459,6 +462,8 @@ class ProtoGraphRAG:
             self.remove_duplicate_token = True
         if not hasattr(self, "discard_no_word"):
             self.discard_no_word = False
+        if not hasattr(self, "plot_embeds"):
+            self.plot_embeds = False
 
     def debug_extract_important_spans(
         self,
