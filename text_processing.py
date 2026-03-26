@@ -103,7 +103,7 @@ def _debug_skip(item_type, item, reason, stage=None):
 
 
 def _debug_keep(item_type, item, reason="passed all filters", stage=None):
-    print(f"{_debug_prefix(item_type, stage)} Keeping '{_debug_item_text(item)}': {reason}.")
+    return
 
 
 def _debug_dump_spans(name, spans):
