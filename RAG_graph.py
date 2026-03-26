@@ -1468,7 +1468,8 @@ class ProtoGraphRAG:
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.text_encoder_addr,
             local_files_only=True,
-            fix_mistral_regex=True
+            fix_mistral_regex=True,
+            use_fast=False,
         )
         self.text_encoder = AutoModel.from_pretrained(
             self.text_encoder_addr,

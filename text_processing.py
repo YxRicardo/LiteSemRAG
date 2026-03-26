@@ -546,14 +546,23 @@ def get_token_indices_for_phrase(start_char, end_char, offsets):
 
     return token_indices
 
+
+def _get_tokenizer_max_length(tokenizer, fallback=512):
+    max_length = getattr(tokenizer, "model_max_length", None)
+    if isinstance(max_length, int) and 0 < max_length < 100000:
+        return max_length
+    return fallback
+
 def encode_chunk(text, text_encoder, tokenizer, device):
+    max_length = _get_tokenizer_max_length(tokenizer)
 
     inputs = tokenizer(
 
         text,
         return_tensors="pt",
         return_offsets_mapping=True,
-        truncation=True
+        truncation=True,
+        max_length=max_length,
     )
 
     offsets = inputs["offset_mapping"][0]
@@ -570,13 +579,15 @@ def encode_chunk(text, text_encoder, tokenizer, device):
 
 
 def encode_chunk_batch(text_list, text_encoder, tokenizer, device):
+    max_length = _get_tokenizer_max_length(tokenizer)
 
     inputs = tokenizer(
         text_list,
         return_tensors="pt",
         return_offsets_mapping=True,
         truncation=True,
-        padding=True
+        padding=True,
+        max_length=max_length,
     )
 
     offsets = inputs["offset_mapping"]
@@ -616,11 +627,13 @@ def get_token_embeds(token_embeddings, offsets, phrase_list, token_list):
     return phrase_embs, token_embs
 
 def encode_text(query_text, text_encoder, tokenizer, device):
+    max_length = _get_tokenizer_max_length(tokenizer)
     inputs = tokenizer(
         query_text,
         return_tensors="pt",
         return_offsets_mapping=True,
-        truncation=True
+        truncation=True,
+        max_length=max_length,
     )
     offsets = inputs["offset_mapping"][0]
     with torch.no_grad():
