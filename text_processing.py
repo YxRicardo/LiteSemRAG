@@ -278,7 +278,7 @@ def _is_valid_token(token, debug_mode=False, debug_stage=None):
             )
         return False
 
-    if debug_mode:
+    if debug_mode and debug_stage != "token_filter":
         _debug_keep("token", token, stage=debug_stage)
     return True
 
