@@ -84,7 +84,39 @@ def split_doc(doc_name, nlp, max_tokens=300):
     return chunks
 
 
-def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False):
+def _debug_item_text(item):
+    return getattr(item, "text", str(item))
+
+
+def _debug_prefix(item_type, stage=None):
+    if stage:
+        return f"[{stage}][{item_type}]"
+    return f"[{item_type}]"
+
+
+def _debug_stage(stage):
+    print(f"\n=== {stage} ===")
+
+
+def _debug_skip(item_type, item, reason, stage=None):
+    print(f"{_debug_prefix(item_type, stage)} Skipping '{_debug_item_text(item)}': {reason}")
+
+
+def _debug_keep(item_type, item, reason="passed all filters", stage=None):
+    print(f"{_debug_prefix(item_type, stage)} Keeping '{_debug_item_text(item)}': {reason}.")
+
+
+def _debug_dump_spans(name, spans):
+    print(f"[final_output] {name} ({len(spans)} items):")
+    if not spans:
+        print("  (none)")
+        return
+
+    for index, (text, start_char, end_char) in enumerate(spans, start=1):
+        print(f"  {index}. '{text}' [{start_char}, {end_char})")
+
+
+def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_stage=None):
     entity_spans = []
     token_intervals = []
     char_intervals = []
@@ -92,16 +124,21 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False):
     for ent in doc.ents:
         if all_words_are_digits(ent.text):
             if debug_mode:
-                print(f"ent {ent.text} doesn't pass point1")
+                _debug_skip("entity", ent, "every word in the entity is numeric", stage=debug_stage)
             continue
 
         if discard_no_word and re.search(r"[a-zA-Z]", ent.text) is None:
             if debug_mode:
-                print(f"ent {ent.text} doesn't pass point2")
+                _debug_skip(
+                    "entity",
+                    ent,
+                    "discard_no_word=True and the entity contains no alphabetic characters",
+                    stage=debug_stage,
+                )
             continue
 
         if debug_mode:
-            print(f"ent {ent.text} pass all test")
+            _debug_keep("entity", ent, stage=debug_stage)
 
         entity_spans.append((normalize_text(ent.text), ent.start_char, ent.end_char))
         token_intervals.append((ent.start, ent.end))
@@ -110,20 +147,35 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False):
     return entity_spans, token_intervals, char_intervals
 
 
-def _is_valid_noun_chunk(noun_chunk, min_tokens=2, debug_mode=False):
+def _is_valid_noun_chunk(noun_chunk, min_tokens=2, debug_mode=False, debug_stage=None):
     if all(token.is_stop or token.is_punct for token in noun_chunk):
         if debug_mode:
-            print(f"chunk {noun_chunk} doesn't pass point1")
+            _debug_skip(
+                "noun_chunk",
+                noun_chunk,
+                "all tokens are stop words or punctuation",
+                stage=debug_stage,
+            )
         return False
 
     if not any(token.pos_ in ["NOUN", "PROPN", "ADJ"] for token in noun_chunk):
         if debug_mode:
-            print(f"chunk {noun_chunk} doesn't pass point2")
+            _debug_skip(
+                "noun_chunk",
+                noun_chunk,
+                "it contains no token with POS in {NOUN, PROPN, ADJ}",
+                stage=debug_stage,
+            )
         return False
 
     if noun_chunk.root.pos_ not in ["NOUN", "PROPN"]:
         if debug_mode:
-            print(f"chunk {noun_chunk} doesn't pass point3")
+            _debug_skip(
+                "noun_chunk",
+                noun_chunk,
+                f"root token '{noun_chunk.root.text}' has POS={noun_chunk.root.pos_}; expected NOUN or PROPN",
+                stage=debug_stage,
+            )
         return False
 
     valid_tokens = [
@@ -134,63 +186,117 @@ def _is_valid_noun_chunk(noun_chunk, min_tokens=2, debug_mode=False):
     phrase_text = noun_chunk.text.strip()
     if not re.match(r"^(?!.*\.\.)(?![.'])[A-Za-z0-9][A-Za-z0-9.\-\' ]*[A-Za-z0-9]$", phrase_text):
         if debug_mode:
-            print(f"chunk {noun_chunk} doesn't pass point4")
+            _debug_skip(
+                "noun_chunk",
+                noun_chunk,
+                f"text '{phrase_text}' contains unsupported punctuation or boundary characters",
+                stage=debug_stage,
+            )
         return False
 
     if len(valid_tokens) < min_tokens:
         if debug_mode:
-            print(f"chunk {noun_chunk} doesn't pass point5")
+            _debug_skip(
+                "noun_chunk",
+                noun_chunk,
+                f"only {len(valid_tokens)} non-stopword tokens remain; requires at least {min_tokens}",
+                stage=debug_stage,
+            )
         return False
 
     if debug_mode:
-        print(f"chunk {noun_chunk} pass all test")
+        _debug_keep("noun_chunk", noun_chunk, stage=debug_stage)
     return True
 
 
-def _is_valid_token(token, debug_mode=False):
+def _is_valid_token(token, debug_mode=False, debug_stage=None):
     if token.is_space or token.is_punct or token.is_stop:
         if debug_mode:
-            print(f"token {token} doesn't pass point1")
+            failed_checks = []
+            if token.is_space:
+                failed_checks.append("space")
+            if token.is_punct:
+                failed_checks.append("punctuation")
+            if token.is_stop:
+                failed_checks.append("stop word")
+            _debug_skip(
+                "token",
+                token,
+                f"filtered out because it is marked as {', '.join(failed_checks)}",
+                stage=debug_stage,
+            )
         return False
 
     if re.fullmatch(r"\d+(\.\d+)?", token.text):
         if debug_mode:
-            print(f"token {token} doesn't pass point2")
+            _debug_skip(
+                "token",
+                token,
+                "token text is a pure integer or decimal number",
+                stage=debug_stage,
+            )
         return False
 
     is_model = any(c.isdigit() for c in token.text)
     if token.pos_ not in ["NOUN", "PROPN", "ADJ"] and not is_model:
         if debug_mode:
-            print(f"token {token} doesn't pass point3")
+            _debug_skip(
+                "token",
+                token,
+                f"POS={token.pos_} is not in {{NOUN, PROPN, ADJ}} and the token does not look like a model/code token",
+                stage=debug_stage,
+            )
         return False
 
     if all(not c.isalnum() for c in token.text):
         if debug_mode:
-            print(f"token {token} doesn't pass point4")
+            _debug_skip(
+                "token",
+                token,
+                "token contains no alphanumeric characters",
+                stage=debug_stage,
+            )
         return False
 
     if len(token.text) < 2:
         if debug_mode:
-            print(f"token {token} doesn't pass point5")
+            _debug_skip(
+                "token",
+                token,
+                "token length is shorter than 2 characters",
+                stage=debug_stage,
+            )
         return False
 
     if len(token.text) <= 2 and token.text.islower():
         if debug_mode:
-            print(f"token {token} doesn't pass point6")
+            _debug_skip(
+                "token",
+                token,
+                "very short lowercase token is treated as low-signal noise",
+                stage=debug_stage,
+            )
         return False
 
     if debug_mode:
-        print(f"token {token} pass all test")
+        _debug_keep("token", token, stage=debug_stage)
     return True
 
 def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,discard_no_word=False,debug_mode=False):
     doc = nlp(chunk)
 
+    if debug_mode:
+        _debug_stage("entity_filter")
+
     important_phrases, phrase_token_spans, _ = _collect_valid_entities(
         doc,
         discard_no_word=discard_no_word,
         debug_mode=debug_mode,
+        debug_stage="entity_filter",
     )
+
+    if debug_mode:
+        _debug_stage("noun_chunk_filter")
 
     for noun_chunk in doc.noun_chunks:
         start_char = noun_chunk.start_char
@@ -200,10 +306,20 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
 
         if phrase_is_contained(phrase_token_spans, (start_token, end_token)):
             if debug_mode:
-                print(f"chunk {noun_chunk} doesn't pass due to duplication")
+                _debug_skip(
+                    "noun_chunk",
+                    noun_chunk,
+                    "its token span is already covered by an accepted entity",
+                    stage="noun_chunk_filter",
+                )
             continue
 
-        if not _is_valid_noun_chunk(noun_chunk, min_tokens=min_tokens, debug_mode=debug_mode):
+        if not _is_valid_noun_chunk(
+            noun_chunk,
+            min_tokens=min_tokens,
+            debug_mode=debug_mode,
+            debug_stage="noun_chunk_filter",
+        ):
             continue
 
         important_phrases.append((normalize_text(noun_chunk.text.strip()), start_char, end_char))
@@ -212,14 +328,22 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
 
     important_tokens = []
 
+    if debug_mode:
+        _debug_stage("token_filter")
+
     for token in doc:
-        if not _is_valid_token(token, debug_mode=debug_mode):
+        if not _is_valid_token(token, debug_mode=debug_mode, debug_stage="token_filter"):
             continue
 
         # 排除纯数字
         if re.fullmatch(r"\d+(\.\d+)?", token.text):
             if debug_mode:
-                print(f"token {token} doesn't pass point2")
+                _debug_skip(
+                    "token",
+                    token,
+                    "token text is a pure integer or decimal number",
+                    stage="token_filter",
+                )
             continue
 
         # 只要包含数字就算型号
@@ -227,23 +351,43 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
 
         if token.pos_ not in ["NOUN", "PROPN", "ADJ"] and not is_model:
             if debug_mode:
-                print(f"token {token} doesn't pass point3")
+                _debug_skip(
+                    "token",
+                    token,
+                    f"POS={token.pos_} is not in {{NOUN, PROPN, ADJ}} and the token does not look like a model/code token",
+                    stage="token_filter",
+                )
             continue
 
         # 排除纯符号
         if all(not c.isalnum() for c in token.text):
             if debug_mode:
-                print(f"token {token} doesn't pass point4")
+                _debug_skip(
+                    "token",
+                    token,
+                    "token contains no alphanumeric characters",
+                    stage="token_filter",
+                )
             continue
 
         if len(token.text) < 2:
             if debug_mode:
-                print(f"token {token} doesn't pass point5")
+                _debug_skip(
+                    "token",
+                    token,
+                    "token length is shorter than 2 characters",
+                    stage="token_filter",
+                )
             continue
 
         if len(token.text) <= 2 and token.text.islower():
             if debug_mode:
-                print(f"token {token} doesn't pass point6")
+                _debug_skip(
+                    "token",
+                    token,
+                    "very short lowercase token is treated as low-signal noise",
+                    stage="token_filter",
+                )
             continue
 
         if remove_duplicate:
@@ -254,16 +398,31 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
 
             if inside_phrase:
                 if debug_mode:
-                    print(f"token {token} doesn't pass due to duplication")
+                    _debug_skip(
+                        "token",
+                        token,
+                        "token is inside an accepted entity or noun chunk span",
+                        stage="token_dedup",
+                    )
                 continue
 
         if debug_mode:
-            print(f"token {token} pass all test")
+            _debug_keep(
+                "token",
+                token,
+                "passed token filters and is not covered by a larger accepted span",
+                stage="token_output",
+            )
 
         start_char = token.idx
         end_char = token.idx + len(token.text)
 
         important_tokens.append((normalize_text(token.text), start_char, end_char))
+
+    if debug_mode:
+        _debug_stage("final_output")
+        _debug_dump_spans("important_phrases", important_phrases)
+        _debug_dump_spans("important_tokens", important_tokens)
 
     return important_phrases, important_tokens
 
@@ -295,7 +454,11 @@ def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
 
         if phrase_is_contained(phrase_token_spans,(start_char,end_char)):
             if debug_mode:
-                print(f"chunk {noun_chunk} doesn't pass due to duplication")
+                _debug_skip(
+                    "noun_chunk",
+                    noun_chunk,
+                    "its character span is already covered by an accepted entity",
+                )
             continue
 
         if not _is_valid_noun_chunk(noun_chunk, min_tokens=min_tokens, debug_mode=debug_mode):
@@ -313,13 +476,24 @@ def extract_important_tokens(chunk,nlp,debug_mode=False):
 
         if token.is_space or token.is_punct or token.is_stop:
             if debug_mode:
-                print(f"token {token} doesn't pass point1")
+                failed_checks = []
+                if token.is_space:
+                    failed_checks.append("space")
+                if token.is_punct:
+                    failed_checks.append("punctuation")
+                if token.is_stop:
+                    failed_checks.append("stop word")
+                _debug_skip(
+                    "token",
+                    token,
+                    f"filtered out because it is marked as {', '.join(failed_checks)}",
+                )
             continue
 
         # 排除纯数字
         if re.fullmatch(r"\d+(\.\d+)?", token.text):
             if debug_mode:
-                print(f"token {token} doesn't pass point2")
+                _debug_skip("token", token, "token text is a pure integer or decimal number")
             continue
 
         # 只要包含数字就算型号
@@ -327,23 +501,31 @@ def extract_important_tokens(chunk,nlp,debug_mode=False):
 
         if token.pos_ not in ["NOUN", "PROPN", "ADJ"] and not is_model:
             if debug_mode:
-                print(f"token {token} doesn't pass point3")
+                _debug_skip(
+                    "token",
+                    token,
+                    f"POS={token.pos_} is not in {{NOUN, PROPN, ADJ}} and the token does not look like a model/code token",
+                )
             continue
 
         # 排除纯符号
         if all(not c.isalnum() for c in token.text):
             if debug_mode:
-                print(f"token {token} doesn't pass point4")
+                _debug_skip("token", token, "token contains no alphanumeric characters")
             continue
 
         if len(token.text) < 2:
             if debug_mode:
-                print(f"token {token} doesn't pass point5")
+                _debug_skip("token", token, "token length is shorter than 2 characters")
             continue
 
         if len(token.text) <= 2 and token.text.islower():
             if debug_mode:
-                print(f"token {token} doesn't pass point6")
+                _debug_skip(
+                    "token",
+                    token,
+                    "very short lowercase token is treated as low-signal noise",
+                )
             continue
 
 
@@ -527,7 +709,7 @@ def count_words(text: str) -> int:
     return len(words)
 
 def all_words_are_digits(s: str) -> bool:
-    # 去掉首尾空白并按任意空白分词（空格/Tab/换行都会处理）
+
     words = s.split()
     if not words:  # 空字符串或全空白
         return False

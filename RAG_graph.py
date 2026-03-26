@@ -1,4 +1,4 @@
-import json
+import json #dsafasfasrfaas
 import math
 import pickle
 import time
@@ -296,7 +296,7 @@ class ProtoGraphRAG:
         self._load_nlp()
         self.json_path = "index_documents.json"
         self.reranker = None
-        #self.load_reranker()
+        self.load_reranker()
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
 
@@ -453,6 +453,36 @@ class ProtoGraphRAG:
 
     def query_token_node(self, text):
         return self.token_node_query.get(text, None)
+
+    def debug_extract_important_spans(
+        self,
+        chunk,
+        min_tokens=2,
+        remove_duplicate=None,
+        discard_no_word=None,
+        debug_mode=True,
+        clean_input=False,
+    ):
+        if self.nlp is None:
+            self._load_nlp()
+
+        if remove_duplicate is None:
+            remove_duplicate = self.remove_duplicate_token
+
+        if discard_no_word is None:
+            discard_no_word = self.discard_no_word
+
+        if clean_input:
+            chunk = clean_text(chunk)
+
+        return extract_important_spans(
+            chunk,
+            self.nlp,
+            min_tokens=min_tokens,
+            remove_duplicate=remove_duplicate,
+            discard_no_word=discard_no_word,
+            debug_mode=debug_mode,
+        )
 
     def build_query_database(self):
         embeds_list = [prototype.embed for prototype in self.proto_nodes]
