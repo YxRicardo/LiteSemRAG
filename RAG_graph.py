@@ -454,6 +454,12 @@ class ProtoGraphRAG:
     def query_token_node(self, text):
         return self.token_node_query.get(text, None)
 
+    def _ensure_backward_compatible_attrs(self):
+        if not hasattr(self, "remove_duplicate_token"):
+            self.remove_duplicate_token = True
+        if not hasattr(self, "discard_no_word"):
+            self.discard_no_word = False
+
     def debug_extract_important_spans(
         self,
         chunk,
@@ -463,14 +469,16 @@ class ProtoGraphRAG:
         debug_mode=True,
         clean_input=False,
     ):
+        self._ensure_backward_compatible_attrs()
+
         if self.nlp is None:
             self._load_nlp()
 
         if remove_duplicate is None:
-            remove_duplicate = self.remove_duplicate_token
+            remove_duplicate = getattr(self, "remove_duplicate_token", True)
 
         if discard_no_word is None:
-            discard_no_word = self.discard_no_word
+            discard_no_word = getattr(self, "discard_no_word", False)
 
         if clean_input:
             chunk = clean_text(chunk)
@@ -1482,8 +1490,10 @@ class ProtoGraphRAG:
         self.executor = None
         self.nlp = None
         self.reranker = None
+        self._ensure_backward_compatible_attrs()
 
     def _restore_runtime_components(self, load_nlp=True, load_reranker=False):
+        self._ensure_backward_compatible_attrs()
         if self.text_encoder is None or self.tokenizer is None:
             self._load_text_encoder()
         self.save_doc_to_json()
