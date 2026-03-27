@@ -147,6 +147,45 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_
     return entity_spans, token_intervals, char_intervals
 
 
+def _drop_contained_phrases(phrases, debug_mode=False, debug_stage=None):
+    """
+    Remove phrases whose character span is fully contained by another phrase span.
+    Keep outer/longer phrases, and keep original output order for survivors.
+    """
+    if len(phrases) <= 1:
+        return phrases
+
+    indexed_phrases = list(enumerate(phrases))
+    indexed_phrases.sort(
+        key=lambda item: (
+            -(item[1][2] - item[1][1]),  # longer span first
+            item[1][1],                  # then earlier start
+            item[0],                     # then original order
+        )
+    )
+
+    kept = []  # tuples: (orig_idx, (text, start_char, end_char))
+    for orig_idx, phrase in indexed_phrases:
+        _, start_char, end_char = phrase
+        is_contained = any(
+            kept_start <= start_char and end_char <= kept_end
+            for _, (_, kept_start, kept_end) in kept
+        )
+        if is_contained:
+            if debug_mode:
+                _debug_skip(
+                    "phrase",
+                    phrase[0],
+                    "its span is fully contained by a longer accepted phrase",
+                    stage=debug_stage,
+                )
+            continue
+        kept.append((orig_idx, phrase))
+
+    kept_indices = {orig_idx for orig_idx, _ in kept}
+    return [phrase for idx, phrase in enumerate(phrases) if idx in kept_indices]
+
+
 def _is_valid_noun_chunk(noun_chunk, min_tokens=2, debug_mode=False, debug_stage=None):
     if all(token.is_stop or token.is_punct for token in noun_chunk):
         if debug_mode:
@@ -325,6 +364,14 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         important_phrases.append((normalize_text(noun_chunk.text.strip()), start_char, end_char))
         phrase_token_spans.append((start_token, end_token))
 
+    if debug_mode:
+        _debug_stage("phrase_dedup")
+
+    important_phrases = _drop_contained_phrases(
+        important_phrases,
+        debug_mode=debug_mode,
+        debug_stage="phrase_dedup" if debug_mode else None,
+    )
 
     important_tokens = []
 
