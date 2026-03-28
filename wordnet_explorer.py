@@ -77,6 +77,29 @@ class WordNetExplorer:
             raise ValueError("Please provide a non-empty word string.")
         return word.strip()
 
+    @classmethod
+    def _wordnet_lookup_candidates(cls, word: str) -> list[str]:
+        validated_word = cls._validate_word(word)
+        space_normalized = " ".join(validated_word.split())
+        lowered_word = space_normalized.lower()
+
+        candidates: list[str] = []
+
+        def add(candidate: str) -> None:
+            candidate = candidate.strip()
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        for base in (space_normalized, lowered_word):
+            add(base)
+            add(base.replace("_", " "))
+            add(base.replace("-", " "))
+            add(base.replace(" ", "_"))
+            add(base.replace("-", "_"))
+            add(base.replace("-", " ").replace(" ", "_"))
+
+        return candidates
+
     def _synset_items(self, synsets) -> list[str]:
         items = []
         for synset in synsets:
@@ -135,12 +158,21 @@ class WordNetExplorer:
         return filtered_synsets
 
     def _get_raw_synsets(self, word: str, pos: Optional[str] = None):
-        normalized_word = self._validate_word(word)
         normalized_pos = self._normalize_pos(pos)
         wn_pos = self.pos_map[normalized_pos]
-        if wn_pos:
-            return self.wn.synsets(normalized_word, pos=wn_pos)
-        return self.wn.synsets(normalized_word)
+        synsets = []
+        seen_synset_names = set()
+
+        for candidate in self._wordnet_lookup_candidates(word):
+            current_synsets = self.wn.synsets(candidate, pos=wn_pos) if wn_pos else self.wn.synsets(candidate)
+            for synset in current_synsets:
+                synset_name = synset.name()
+                if synset_name in seen_synset_names:
+                    continue
+                seen_synset_names.add(synset_name)
+                synsets.append(synset)
+
+        return synsets
 
     def get_synset_details(
         self,
