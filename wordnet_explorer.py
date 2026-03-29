@@ -64,6 +64,44 @@ class WordNetExplorer:
             return empty_text
         return ", ".join(values)
 
+    @staticmethod
+    def _format_synset_name(name: str) -> str:
+        return name.split(".", 1)[0].replace("_", " ")
+
+    @staticmethod
+    def _ensure_sentence(text: str) -> str:
+        text = text.strip()
+        if not text:
+            return ""
+        if text[-1] not in ".!?":
+            text += "."
+        return text
+
+    @staticmethod
+    def _looks_like_plural_noun(text: str) -> bool:
+        token = text.strip().split()[-1].lower() if text.strip() else ""
+        if not token:
+            return False
+        if token in {"news"}:
+            return False
+        return token.endswith("s") and not token.endswith(("ss", "us", "is"))
+
+    @staticmethod
+    def _looks_like_proper_noun(text: str) -> bool:
+        letters = [ch for ch in text if ch.isalpha()]
+        return any(ch.isupper() for ch in letters) and text != text.lower()
+
+    @staticmethod
+    def _indefinite_article(text: str) -> str:
+        token = text.strip().split()[0].lower() if text.strip() else ""
+        if not token:
+            return "A"
+        if token.startswith(("honest", "honor", "hour", "heir")):
+            return "An"
+        if token.startswith(("one", "uni", "use", "user", "euro", "ufo")):
+            return "A"
+        return "An" if token[0] in "aeiou" else "A"
+
     def _normalize_pos(self, pos: Optional[str]) -> Optional[str]:
         normalized_pos = pos.lower().strip() if isinstance(pos, str) else None
         if normalized_pos not in self.pos_map:
@@ -104,7 +142,9 @@ class WordNetExplorer:
         items = []
         for synset in synsets:
             try:
-                items.append(f"{synset.name()} - {synset.definition()}")
+                label = self._format_synset_name(synset.name())
+                definition = synset.definition()
+                items.append(f"{label} - {definition}" if definition else label)
             except Exception:
                 items.append(str(synset))
         return items
@@ -120,7 +160,7 @@ class WordNetExplorer:
 
     @staticmethod
     def _synset_head_word(synset) -> str:
-        return synset.name().split(".", 1)[0].replace("_", " ")
+        return WordNetExplorer._format_synset_name(synset.name())
 
     def _filter_synsets(
         self,
@@ -142,20 +182,78 @@ class WordNetExplorer:
             if noun_only_words and synset.pos() != self.wn.NOUN:
                 continue
 
-            if exact_match_only and self._normalize_lookup(self._synset_head_word(synset)) != normalized_word:
-                continue
+            lemma_names = [lemma.name().replace("_", " ") for lemma in synset.lemmas()]
+            normalized_lemmas = {self._normalize_lookup(lemma.name()) for lemma in synset.lemmas()}
 
-            matched_lemmas = []
-            for lemma in synset.lemmas():
-                lemma_name = lemma.name()
-                if exact_match_only and self._normalize_lookup(lemma_name) != normalized_word:
+            if exact_match_only:
+                if self._normalize_lookup(self._synset_head_word(synset)) != normalized_word:
                     continue
-                matched_lemmas.append(lemma_name.replace("_", " "))
+                if normalized_word not in normalized_lemmas:
+                    continue
 
-            if matched_lemmas:
-                filtered_synsets.append((synset, matched_lemmas))
+            if lemma_names:
+                filtered_synsets.append((synset, lemma_names))
 
         return filtered_synsets
+
+    def _definition_subject(self, word: str, pos: str) -> tuple[str, str]:
+        word_text = word.strip()
+        if pos == "verb":
+            return f"To {word_text}", "is to"
+        if pos != "noun":
+            return word_text, "means"
+        if self._looks_like_plural_noun(word_text):
+            return word_text, "are"
+        if self._looks_like_proper_noun(word_text):
+            return word_text, "is"
+        return f"{self._indefinite_article(word_text)} {word_text}", "is"
+
+    def _definition_sentence(self, word: str, pos: str, definition: str) -> str:
+        definition_text = (definition or "(none)").strip()
+        subject, linking_verb = self._definition_subject(word, pos)
+        if not definition_text or definition_text == "(none)":
+            return self._ensure_sentence(f"{subject} has no WordNet definition")
+        return self._ensure_sentence(f"{subject} {linking_verb} {definition_text}")
+
+    @staticmethod
+    def _section_sentence(label: str, values: list[str]) -> Optional[str]:
+        cleaned_values = [
+            value.strip()
+            for value in values
+            if isinstance(value, str) and value.strip() and value.strip() != "(none)"
+        ]
+        if not cleaned_values:
+            return None
+
+        joiner = ", " if label == "Lemma names" else "; "
+        if label == "Example sentences":
+            return WordNetExplorer._ensure_sentence(f"{label} include {joiner.join(cleaned_values)}")
+        return WordNetExplorer._ensure_sentence(f"{label} are {joiner.join(cleaned_values)}")
+
+    def _collect_synset_summary(self, word: str, item: dict[str, Any]) -> str:
+        sentences = [
+            self._definition_sentence(word, item["pos"], item["definition"]),
+        ]
+        sections = [
+            ("Example sentences", item["examples"]),
+            ("Lemma names", item["lemmas"]),
+            ("Hypernyms", item["hypernyms"]),
+            ("Hyponyms", item["hyponyms"]),
+            ("Member holonyms", item["member_holonyms"]),
+            ("Part holonyms", item["part_holonyms"]),
+            ("Substance holonyms", item["substance_holonyms"]),
+            ("Member meronyms", item["member_meronyms"]),
+            ("Part meronyms", item["part_meronyms"]),
+            ("Substance meronyms", item["substance_meronyms"]),
+            ("Attributes", item["attributes"]),
+            ("Entailments", item["entailments"]),
+            ("Similar tos", item["similar_tos"]),
+        ]
+        for label, values in sections:
+            sentence = self._section_sentence(label, values)
+            if sentence:
+                sentences.append(sentence)
+        return " ".join(sentences)
 
     def _get_raw_synsets(self, word: str, pos: Optional[str] = None):
         normalized_pos = self._normalize_pos(pos)
@@ -223,15 +321,14 @@ class WordNetExplorer:
         noun_only_words: bool = True,
         exact_match_only: bool = True,
     ) -> list[str]:
-        return [
-            item["definition"]
-            for item in self.get_synset_details(
-                word,
-                pos=pos,
-                noun_only_words=noun_only_words,
-                exact_match_only=exact_match_only,
-            )
-        ]
+        normalized_word = self._validate_word(word)
+        details = self.get_synset_details(
+            normalized_word,
+            pos=pos,
+            noun_only_words=noun_only_words,
+            exact_match_only=exact_match_only,
+        )
+        return [self._collect_synset_summary(normalized_word, item) for item in details]
 
     def inspect_wordnet(
         self,
