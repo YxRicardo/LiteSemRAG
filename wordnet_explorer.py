@@ -230,9 +230,10 @@ class WordNetExplorer:
             return WordNetExplorer._ensure_sentence(f"{label} include {joiner.join(cleaned_values)}")
         return WordNetExplorer._ensure_sentence(f"{label} are {joiner.join(cleaned_values)}")
 
-    def _collect_synset_summary(self, word: str, item: dict[str, Any]) -> str:
+    def _collect_synset_summary(self, item: dict[str, Any]) -> str:
+        subject_word = self._format_synset_name(item["synset_name"])
         sentences = [
-            self._definition_sentence(word, item["pos"], item["definition"]),
+            self._definition_sentence(subject_word, item["pos"], item["definition"]),
         ]
         sections = [
             ("Example sentences", item["examples"]),
@@ -328,7 +329,7 @@ class WordNetExplorer:
             noun_only_words=noun_only_words,
             exact_match_only=exact_match_only,
         )
-        return [self._collect_synset_summary(normalized_word, item) for item in details]
+        return [self._collect_synset_summary(item) for item in details]
 
     def inspect_wordnet(
         self,
