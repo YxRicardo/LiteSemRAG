@@ -127,6 +127,16 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_
                 _debug_skip("entity", ent, "every word in the entity is numeric", stage=debug_stage)
             continue
 
+        if _is_single_word_quantifier_span(ent):
+            if debug_mode:
+                _debug_skip(
+                    "entity",
+                    ent,
+                    "single-word entity is a quantifier-like cardinal or ordinal token",
+                    stage=debug_stage,
+                )
+            continue
+
         if discard_no_word and re.search(r"[a-zA-Z]", ent.text) is None:
             if debug_mode:
                 _debug_skip(
@@ -184,6 +194,46 @@ def _drop_contained_phrases(phrases, debug_mode=False, debug_stage=None):
 
     kept_indices = {orig_idx for orig_idx, _ in kept}
     return [phrase for idx, phrase in enumerate(phrases) if idx in kept_indices]
+
+
+_QUANTIFIER_WORDS = {
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+    "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million",
+    "billion", "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+    "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth",
+    "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth",
+    "twentieth",
+}
+
+def _is_quantifier_like(token):
+    token_text = token.text.lower()
+    token_lemma = token.lemma_.lower() if token.lemma_ else token_text
+    num_types = {value.lower() for value in token.morph.get("NumType")}
+
+    if re.fullmatch(r"\d+(st|nd|rd|th)", token_text):
+        return True
+
+    if token.pos_ == "NUM" or token.tag_ == "CD":
+        return True
+
+    if "card" in num_types or "ord" in num_types:
+        return True
+
+    if token_text in _QUANTIFIER_WORDS or token_lemma in _QUANTIFIER_WORDS:
+        return True
+
+    return False
+
+
+def _is_single_word_quantifier_span(span):
+    meaningful_tokens = [token for token in span if not token.is_space and not token.is_punct]
+    if len(meaningful_tokens) != 1:
+        return False
+
+    token = meaningful_tokens[0]
+    return _is_quantifier_like(token) or re.fullmatch(r"\d+(\.\d+)?", token.text)
 
 
 def _is_valid_noun_chunk(noun_chunk, min_tokens=2, debug_mode=False, debug_stage=None):
@@ -262,6 +312,16 @@ def _is_valid_token(token, debug_mode=False, debug_stage=None):
                 "token",
                 token,
                 f"filtered out because it is marked as {', '.join(failed_checks)}",
+                stage=debug_stage,
+            )
+        return False
+
+    if _is_quantifier_like(token):
+        if debug_mode:
+            _debug_skip(
+                "token",
+                token,
+                "token is a quantifier-like cardinal or ordinal term",
                 stage=debug_stage,
             )
         return False
@@ -382,61 +442,6 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         if not _is_valid_token(token, debug_mode=debug_mode, debug_stage="token_filter"):
             continue
 
-        # 排除纯数字
-        if re.fullmatch(r"\d+(\.\d+)?", token.text):
-            if debug_mode:
-                _debug_skip(
-                    "token",
-                    token,
-                    "token text is a pure integer or decimal number",
-                    stage="token_filter",
-                )
-            continue
-
-        # 只要包含数字就算型号
-        is_model = any(c.isdigit() for c in token.text)
-
-        if token.pos_ not in ["NOUN", "PROPN", "ADJ"] and not is_model:
-            if debug_mode:
-                _debug_skip(
-                    "token",
-                    token,
-                    f"POS={token.pos_} is not in {{NOUN, PROPN, ADJ}} and the token does not look like a model/code token",
-                    stage="token_filter",
-                )
-            continue
-
-        # 排除纯符号
-        if all(not c.isalnum() for c in token.text):
-            if debug_mode:
-                _debug_skip(
-                    "token",
-                    token,
-                    "token contains no alphanumeric characters",
-                    stage="token_filter",
-                )
-            continue
-
-        if len(token.text) < 2:
-            if debug_mode:
-                _debug_skip(
-                    "token",
-                    token,
-                    "token length is shorter than 2 characters",
-                    stage="token_filter",
-                )
-            continue
-
-        if len(token.text) <= 2 and token.text.islower():
-            if debug_mode:
-                _debug_skip(
-                    "token",
-                    token,
-                    "very short lowercase token is treated as low-signal noise",
-                    stage="token_filter",
-                )
-            continue
-
         if remove_duplicate:
             inside_phrase = any(
                 token.i >= start and token.i < end
@@ -508,7 +513,11 @@ def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
                 )
             continue
 
-        if not _is_valid_noun_chunk(noun_chunk, min_tokens=min_tokens, debug_mode=debug_mode):
+        if not _is_valid_noun_chunk(
+            noun_chunk,
+            min_tokens=min_tokens,
+            debug_mode=debug_mode,
+        ):
             continue
         important_phrases.append(
             (normalize_text(noun_chunk.text.strip()), noun_chunk.start_char, noun_chunk.end_char)
@@ -520,59 +529,7 @@ def extract_important_tokens(chunk,nlp,debug_mode=False):
     doc = nlp(chunk)
     spans = []
     for token in doc:
-
-        if token.is_space or token.is_punct or token.is_stop:
-            if debug_mode:
-                failed_checks = []
-                if token.is_space:
-                    failed_checks.append("space")
-                if token.is_punct:
-                    failed_checks.append("punctuation")
-                if token.is_stop:
-                    failed_checks.append("stop word")
-                _debug_skip(
-                    "token",
-                    token,
-                    f"filtered out because it is marked as {', '.join(failed_checks)}",
-                )
-            continue
-
-        # 排除纯数字
-        if re.fullmatch(r"\d+(\.\d+)?", token.text):
-            if debug_mode:
-                _debug_skip("token", token, "token text is a pure integer or decimal number")
-            continue
-
-        # 只要包含数字就算型号
-        is_model = any(c.isdigit() for c in token.text)
-
-        if token.pos_ not in ["NOUN", "PROPN", "ADJ"] and not is_model:
-            if debug_mode:
-                _debug_skip(
-                    "token",
-                    token,
-                    f"POS={token.pos_} is not in {{NOUN, PROPN, ADJ}} and the token does not look like a model/code token",
-                )
-            continue
-
-        # 排除纯符号
-        if all(not c.isalnum() for c in token.text):
-            if debug_mode:
-                _debug_skip("token", token, "token contains no alphanumeric characters")
-            continue
-
-        if len(token.text) < 2:
-            if debug_mode:
-                _debug_skip("token", token, "token length is shorter than 2 characters")
-            continue
-
-        if len(token.text) <= 2 and token.text.islower():
-            if debug_mode:
-                _debug_skip(
-                    "token",
-                    token,
-                    "very short lowercase token is treated as low-signal noise",
-                )
+        if not _is_valid_token(token, debug_mode=debug_mode):
             continue
 
 
