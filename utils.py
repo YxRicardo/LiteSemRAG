@@ -2,6 +2,7 @@ from __future__ import annotations
 import numpy as np
 import hdbscan
 from collections import defaultdict
+from functools import lru_cache
 import torch, os
 from sklearn.preprocessing import normalize
 from sklearn.decomposition import PCA
@@ -11,6 +12,7 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from pympler import asizeof
 import math
+import re
 from typing import Sequence, Optional, Set
 
 def mrr_for_one_query_titles(
@@ -47,6 +49,356 @@ def mrr_for_one_query_titles(
     return 0.0
 
 time_stamp = datetime.now().strftime("%m-%d-%H-%M")
+WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
+DEFAULT_WIKIDATA_HEADERS = {
+    "User-Agent": "LiteSemRAG/1.0 (https://www.wikidata.org/)"
+}
+
+
+def _import_wikidata_deps():
+    import pandas as pd
+    import requests
+
+    return requests, pd
+
+
+def _safe_get_json(url, params=None, headers=None, timeout=30):
+    """Safely call an HTTP JSON endpoint and return parsed JSON (or empty dict on failure)."""
+    requests, _ = _import_wikidata_deps()
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers or DEFAULT_WIKIDATA_HEADERS,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        print(f"Request failed: {exc}")
+        return {}
+    except ValueError as exc:
+        print(f"Invalid JSON response: {exc}")
+        return {}
+
+
+def _coerce_aliases_for_search(value):
+    """Convert aliases from wbsearchentities result into a clean comma-separated string."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value if v is not None)
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def extract_best_wikipedia_title(entity, language="en"):
+    """Return the best Wikipedia title from a Wikidata entity's sitelinks."""
+    if not isinstance(entity, dict):
+        return ""
+
+    sitelinks = entity.get("sitelinks", {})
+    if not isinstance(sitelinks, dict) or not sitelinks:
+        return ""
+
+    preferred_site = f"{language}wiki"
+    preferred = sitelinks.get(preferred_site)
+    if isinstance(preferred, dict):
+        return preferred.get("title", "") or ""
+
+    for site_name, site_info in sitelinks.items():
+        if not site_name.endswith("wiki") or not isinstance(site_info, dict):
+            continue
+        title = site_info.get("title", "")
+        if title:
+            return title
+
+    return ""
+
+
+def _truncate_to_sentences(text, sentences):
+    if not text or sentences is None or sentences <= 0:
+        return text or ""
+
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    parts = [part for part in parts if part]
+    if not parts:
+        return ""
+    return " ".join(parts[:sentences])
+
+
+def fetch_wikipedia_intro(title, language="en", headers=None, timeout=30, sentences=3):
+    """Fetch a short introductory summary for a Wikipedia title."""
+    if not isinstance(title, str) or not title.strip():
+        return ""
+
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "extracts",
+        "explaintext": 1,
+        "exintro": 1,
+        "redirects": 1,
+        "titles": title.strip(),
+    }
+    if sentences is not None:
+        params["exsentences"] = int(sentences)
+
+    url = f"https://{language}.wikipedia.org/w/api.php"
+    data = _safe_get_json(url, params=params, headers=headers, timeout=timeout)
+    pages = data.get("query", {}).get("pages", {}) if isinstance(data, dict) else {}
+    if not isinstance(pages, dict):
+        return ""
+
+    for page in pages.values():
+        if not isinstance(page, dict):
+            continue
+        extract = page.get("extract", "")
+        if extract:
+            return _truncate_to_sentences(extract, sentences)
+
+    return ""
+
+
+def fetch_detailed_descriptions_for_entities(
+    entity_ids,
+    language="en",
+    headers=None,
+    timeout=30,
+    sentences=3,
+):
+    """Fetch Wikipedia-backed detailed descriptions keyed by Wikidata entity ID."""
+    if not entity_ids:
+        return {}
+
+    params = {
+        "action": "wbgetentities",
+        "format": "json",
+        "ids": "|".join(str(entity_id).strip() for entity_id in entity_ids if str(entity_id).strip()),
+        "languages": language,
+        "props": "sitelinks",
+    }
+    if not params["ids"]:
+        return {}
+
+    data = _safe_get_json(WIKIDATA_API_URL, params=params, headers=headers, timeout=timeout)
+    entities = data.get("entities", {}) if isinstance(data, dict) else {}
+    if not isinstance(entities, dict):
+        return {}
+
+    detailed_descriptions = {}
+    for entity_id, entity in entities.items():
+        wikipedia_title = extract_best_wikipedia_title(entity, language=language)
+        if not wikipedia_title:
+            detailed_descriptions[entity_id] = ""
+            continue
+        detailed_descriptions[entity_id] = fetch_wikipedia_intro(
+            wikipedia_title,
+            language=language,
+            headers=headers,
+            timeout=timeout,
+            sentences=sentences,
+        )
+    return detailed_descriptions
+
+
+def search_wikidata(
+    term,
+    language="en",
+    limit=10,
+    exact_match_text=False,
+    include_detailed_description=False,
+    drop_missing_detailed_description=False,
+    detailed_description_sentences=3,
+):
+    """
+    Search Wikidata entities using the same interface as explore_wikidata.ipynb.
+    """
+    _, pd = _import_wikidata_deps()
+
+    if not isinstance(term, str) or not term.strip():
+        print("Please provide a non-empty search term.")
+        columns = ["id", "label", "description", "match_text", "aliases", "concepturi"]
+        if include_detailed_description:
+            columns.insert(3, "detailed_description")
+        return pd.DataFrame(columns=columns)
+
+    normalized_term = term.strip()
+    params = {
+        "action": "wbsearchentities",
+        "format": "json",
+        "language": language,
+        "uselang": language,
+        "search": normalized_term,
+        "limit": int(limit),
+    }
+
+    data = _safe_get_json(WIKIDATA_API_URL, params=params)
+    items = data.get("search", []) if isinstance(data, dict) else []
+
+    rows = []
+    for item in items:
+        match = item.get("match") if isinstance(item, dict) else None
+        match_text = ""
+        if isinstance(match, dict):
+            match_text = match.get("text", "")
+
+        rows.append(
+            {
+                "id": item.get("id", ""),
+                "label": item.get("label", ""),
+                "description": item.get("description", ""),
+                "match_text": match_text,
+                "aliases": _coerce_aliases_for_search(item.get("aliases")),
+                "concepturi": item.get("concepturi", ""),
+            }
+        )
+
+    df = pd.DataFrame(
+        rows,
+        columns=["id", "label", "description", "match_text", "aliases", "concepturi"],
+    )
+
+    if exact_match_text and not df.empty:
+        df = df[
+            df["match_text"].fillna("").str.casefold() == normalized_term.casefold()
+        ].reset_index(drop=True)
+
+    if include_detailed_description:
+        detailed_descriptions = {}
+        if not df.empty:
+            detailed_descriptions = fetch_detailed_descriptions_for_entities(
+                df["id"].tolist(),
+                language=language,
+                headers=DEFAULT_WIKIDATA_HEADERS,
+                timeout=30,
+                sentences=detailed_description_sentences,
+            )
+        df.insert(
+            df.columns.get_loc("description") + 1,
+            "detailed_description",
+            [detailed_descriptions.get(entity_id, "") for entity_id in df["id"]],
+        )
+        if drop_missing_detailed_description:
+            df = df[df["detailed_description"].fillna("").str.strip() != ""].reset_index(drop=True)
+
+    if df.empty:
+        print(f"No search results for: {term!r}")
+    return df
+
+
+def load_wikidata_definition_candidates(
+    query_text: str,
+    use_detailed_description: bool = True,
+    exact_match_text: bool = False,
+    limit: int = 5,
+):
+    _, pd = _import_wikidata_deps()
+
+    candidates_df = search_wikidata(
+        query_text,
+        limit=limit,
+        exact_match_text=exact_match_text,
+        include_detailed_description=use_detailed_description,
+        detailed_description_sentences=3,
+        drop_missing_detailed_description=use_detailed_description,
+    )
+
+    if candidates_df.empty:
+        if use_detailed_description:
+            raise ValueError(
+                f"search_wikidata returned no detailed_description candidates for span={query_text!r}."
+            )
+        raise ValueError(
+            f"search_wikidata returned no description candidates for span={query_text!r}."
+        )
+
+    definition_column = "detailed_description" if use_detailed_description else "description"
+    candidates_df = candidates_df[candidates_df[definition_column].fillna("").str.strip() != ""].copy()
+    candidates_df = candidates_df.drop_duplicates(subset=["id", definition_column]).reset_index(drop=True)
+    if candidates_df.empty:
+        raise ValueError(
+            f"No usable {definition_column} candidates remained for span={query_text!r}."
+        )
+
+    return candidates_df, definition_column
+
+
+def definition_to_hypothesis(definition: str) -> str:
+    cleaned_definition = definition.strip()
+    if cleaned_definition.endswith((".", "!", "?")):
+        cleaned_definition = cleaned_definition[:-1]
+    return f"It refers to {cleaned_definition}."
+
+
+def extract_cross_encoder_scores(raw_scores, model) -> np.ndarray:
+    score_array = np.asarray(raw_scores)
+    if score_array.ndim == 1:
+        return score_array.astype(float)
+
+    id2label = getattr(model.model.config, "id2label", {}) or {}
+    entailment_index = None
+    for label_index, label_name in id2label.items():
+        if str(label_name).lower() == "entailment":
+            entailment_index = int(label_index)
+            break
+
+    if entailment_index is None:
+        entailment_index = score_array.shape[1] - 1
+
+    return score_array[:, entailment_index].astype(float)
+
+
+def build_wikidata_candidate_bank(candidates_df, definition_column: str) -> list[dict]:
+    candidate_bank = []
+    for row in candidates_df.itertuples(index=False):
+        definition = str(getattr(row, definition_column)).strip()
+        candidate_bank.append(
+            {
+                "entity_id": row.id,
+                "label": row.label,
+                "description": row.description,
+                "definition_source": definition_column,
+                "definition": definition,
+                "hypothesis": definition_to_hypothesis(definition),
+            }
+        )
+    return candidate_bank
+
+
+@lru_cache(maxsize=4096)
+def get_wikidata_term_info(term, language="en"):
+    """Return exact-match Wikidata row count plus the corresponding description list."""
+    try:
+        results = search_wikidata(
+            term,
+            language=language,
+            exact_match_text=True,
+            include_detailed_description=True,
+            drop_missing_detailed_description=True,
+        )
+    except Exception as exc:
+        print(f"Wikidata lookup failed for {term!r}: {exc}")
+        return 0, ("an entity",)
+
+    row_count = len(results.index)
+    if row_count == 0:
+        return 0, ("an entity",)
+
+    descriptions = []
+    for description in results["description"].tolist():
+        normalized_description = str(description).strip() if description is not None else ""
+        descriptions.append(normalized_description or "an entity")
+
+    return row_count, tuple(descriptions)
+
+
+@lru_cache(maxsize=4096)
+def is_multi_semantic_by_wikidata(term, language="en"):
+    """Return True when a term resolves to more than one detailed exact-match Wikidata entity."""
+    row_count, _ = get_wikidata_term_info(term, language=language)
+    return row_count > 1
 
 def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     n = np.linalg.norm(x)

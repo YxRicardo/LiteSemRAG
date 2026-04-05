@@ -1,6 +1,8 @@
 import json
 import math
 import pickle
+import random
+import re
 import time
 import traceback
 from html import escape
@@ -36,10 +38,14 @@ from text_processing import (
 )
 from utils import (
     average_embeds,
+    build_wikidata_candidate_bank,
+    extract_cross_encoder_scores,
     get_anomaly_threshold,
     get_s_mean,
+    get_wikidata_term_info,
     hdbscan_cluster,
     inspect_prototypes,
+    load_wikidata_definition_candidates,
     plot_embeddings,
     print_size_mb,
     proto_embed_sim,
@@ -206,7 +212,8 @@ class TokenNode:
     token_text: str
     token_node_id: int
     node_type: str
-    is_semantic: bool = field(init=False)
+    is_multi_semantic: bool = field(init=False)
+    descriptions: list = field(init=False)
     has_prototype: bool = False
     proto_node_list: list = field(default_factory=list)
     embeds_buffer: list = field(default_factory=list)
@@ -215,7 +222,9 @@ class TokenNode:
     anomaly_section: list = field(default_factory=list)
 
     def __post_init__(self):
-        self.is_semantic = self.node_type == "phrase"
+        row_count, descriptions = get_wikidata_term_info(self.token_text)
+        self.is_multi_semantic = row_count > 1
+        self.descriptions = list(descriptions)
 
 
 @dataclass
@@ -228,6 +237,7 @@ class TextEmbedding:
 class Prototype:
     proto_node_id: int
     token_node: TokenNode
+    description: str | None = None
     chunk_node_list: list = field(default_factory=list)
     chunk_node_embed: list = field(default_factory=list)
     chunk_edge_weight: list = field(default_factory=list)
@@ -347,9 +357,17 @@ class ProtoGraphRAG:
 
     def create_proto_node(self, token_node):
         new_proto_node = Prototype(self._new_node_id("proto"), token_node)
+        new_proto_node.description = self._get_initial_proto_description(token_node)
         self.proto_nodes.append(new_proto_node)
         token_node.has_prototype = True
         return new_proto_node
+
+    def _get_initial_proto_description(self, token_node):
+        if token_node.is_multi_semantic:
+            return None
+        if getattr(token_node, "descriptions", None):
+            return token_node.descriptions[0]
+        return "an entity"
 
     def create_basic_proto_node(self, token_node):
         new_proto_node = self.create_proto_node(token_node)
@@ -389,7 +407,6 @@ class ProtoGraphRAG:
                     for idx in anomaly_idx:
                         max_val, max_idx = inspect_prototypes(token_node.embeds_buffer[idx].embed, token_node.proto_node_list)
                         token_node.anomaly_section.append((token_node.embeds_buffer[idx].embed, token_node.embeds_buffer[idx].chunk_node, max_val, max_idx))
-                token_node.is_semantic = True
             else:
                 self.create_basic_proto_node(token_node)
         token_node.embeds_buffer.clear()
@@ -446,6 +463,8 @@ class ProtoGraphRAG:
         token_node.idf = math.log((N + 1) / (token_node.df + 1)) + 1.0
 
     def semantic_type_cls(self, token_node):
+        if not token_node.is_multi_semantic:
+            return False
         if token_node.df > len(self.chunk_nodes) * self.df_ratio:
             return False
         s_mean = get_s_mean([i.embed for i in token_node.embeds_buffer])
@@ -464,6 +483,11 @@ class ProtoGraphRAG:
             self.discard_no_word = False
         if not hasattr(self, "plot_embeds"):
             self.plot_embeds = False
+        for token_node in getattr(self, "token_nodes", []):
+            if not hasattr(token_node, "is_multi_semantic") or not hasattr(token_node, "descriptions"):
+                row_count, descriptions = get_wikidata_term_info(token_node.token_text)
+                token_node.is_multi_semantic = row_count > 1
+                token_node.descriptions = list(descriptions)
 
     def debug_extract_important_spans(
         self,
@@ -723,6 +747,9 @@ class ProtoGraphRAG:
                     token_node.proto_node_list[max_idx].chunk_edge_weight.append(max_val)
                 token_node.anomaly_section.clear()
             token_node.embeds_buffer.clear()
+        self.populate_missing_proto_descriptions()
+        self.merge_duplicate_description_proto_nodes()
+        for token_node in self.token_nodes:
             self.assign_idf(token_node)
         self.get_proto_BM25()
         self.build_query_database()
@@ -730,6 +757,247 @@ class ProtoGraphRAG:
         self.build_chunk2proto_edge()
         self.save_doc_to_json()
         self.log_time("Finalizing completed.")
+
+    def _sample_proto_chunk_nodes(self, proto_node, max_samples=10):
+        unique_chunk_nodes = []
+        seen_chunk_ids = set()
+        for chunk_node in proto_node.chunk_node_list:
+            if chunk_node.chunk_node_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(chunk_node.chunk_node_id)
+            unique_chunk_nodes.append(chunk_node)
+        if len(unique_chunk_nodes) <= max_samples:
+            return unique_chunk_nodes
+        return random.sample(unique_chunk_nodes, max_samples)
+
+    def _extract_sentence_context_for_description(self, chunk_text, token_text):
+        normalized_token = token_text.strip()
+        if not normalized_token:
+            return None
+
+        pattern = re.compile(rf"(?<!\w){re.escape(normalized_token)}(?!\w)", flags=re.IGNORECASE)
+        match = pattern.search(chunk_text)
+        if match is None:
+            lowered_text = chunk_text.casefold()
+            lowered_token = normalized_token.casefold()
+            match_start = lowered_text.find(lowered_token)
+            if match_start < 0:
+                return None
+            match_end = match_start + len(lowered_token)
+        else:
+            match_start, match_end = match.span()
+        left_boundary = max(
+            chunk_text.rfind(".", 0, match_start),
+            chunk_text.rfind("!", 0, match_start),
+            chunk_text.rfind("?", 0, match_start),
+        )
+        right_candidates = [
+            chunk_text.find(".", match_end),
+            chunk_text.find("!", match_end),
+            chunk_text.find("?", match_end),
+        ]
+        right_candidates = [idx for idx in right_candidates if idx != -1]
+
+        context_start = 0 if left_boundary == -1 else left_boundary + 1
+        context_end = len(chunk_text) if not right_candidates else min(right_candidates) + 1
+        context_raw = chunk_text[context_start:context_end]
+
+        if not context_raw.strip():
+            context_start = max(0, match_start - 120)
+            context_end = min(len(chunk_text), match_end + 120)
+            context_raw = chunk_text[context_start:context_end]
+
+        left_trim = len(context_raw) - len(context_raw.lstrip())
+        context_text = context_raw.strip()
+        local_start = match_start - context_start - left_trim
+        local_end = match_end - context_start - left_trim
+        local_start = max(0, min(local_start, len(context_text)))
+        local_end = max(local_start, min(local_end, len(context_text)))
+
+        return {
+            "context_text": context_text,
+            "matched_text": context_text[local_start:local_end],
+            "local_span": (local_start, local_end),
+        }
+
+    def _build_proto_description_prompt(self, chunk_text, token_text):
+        context_info = self._extract_sentence_context_for_description(chunk_text, token_text)
+        if context_info is None:
+            return None
+
+        prompt_text = (
+            f"Sentence: {context_info['context_text']}\n"
+            f"Target word: {token_text.strip()}\n\n"
+            f'Question: What does "{token_text.strip()}" mean in this sentence?'
+        )
+        return {
+            **context_info,
+            "prompt_text": prompt_text,
+        }
+
+    def _predict_proto_description_from_samples(self, proto_node, model, candidate_bank_cache):
+        token_text = proto_node.token_node.token_text
+        candidate_bank = candidate_bank_cache.get(token_text)
+        if candidate_bank is None:
+            try:
+                candidates_df, definition_column = load_wikidata_definition_candidates(
+                    token_text,
+                    use_detailed_description=False,
+                    exact_match_text=True,
+                    limit=5,
+                )
+            except ValueError:
+                candidate_bank_cache[token_text] = []
+                return None
+            candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column=definition_column)
+            candidate_bank_cache[token_text] = candidate_bank
+
+        if not candidate_bank:
+            return None
+
+        predicted_descriptions = []
+        sample_chunk_nodes = self._sample_proto_chunk_nodes(proto_node, max_samples=10)
+        for chunk_node in sample_chunk_nodes:
+            prompt_info = self._build_proto_description_prompt(chunk_node.chunk_text, token_text)
+            if prompt_info is None:
+                continue
+
+            pairs = [(prompt_info["prompt_text"], candidate["hypothesis"]) for candidate in candidate_bank]
+            raw_scores = model.predict(pairs, batch_size=min(32, len(pairs)), show_progress_bar=False)
+            scores = extract_cross_encoder_scores(raw_scores, model)
+            ranked_candidates = sorted(
+                [
+                    {
+                        **candidate,
+                        "score": float(score),
+                    }
+                    for candidate, score in zip(candidate_bank, scores)
+                ],
+                key=lambda item: item["score"],
+                reverse=True,
+            )
+            if ranked_candidates:
+                predicted_descriptions.append(ranked_candidates[0]["description"])
+
+        if not predicted_descriptions:
+            return None
+        return Counter(predicted_descriptions).most_common(1)[0][0]
+
+    def populate_missing_proto_descriptions(self):
+        target_proto_nodes = [
+            proto_node
+            for proto_node in self.proto_nodes
+            if proto_node.description is None
+        ]
+        if not target_proto_nodes:
+            return
+
+        try:
+            from sentence_transformers import CrossEncoder
+            model = CrossEncoder("cross-encoder/nli-deberta-v3-base")
+        except Exception as exc:
+            print(f"Skipping proto description extraction: {exc}")
+            return
+
+        candidate_bank_cache = {}
+        for proto_node in target_proto_nodes:
+            predicted_description = self._predict_proto_description_from_samples(
+                proto_node,
+                model=model,
+                candidate_bank_cache=candidate_bank_cache,
+            )
+            if predicted_description is not None:
+                proto_node.description = predicted_description
+
+    def _merge_proto_node_group(self, proto_group):
+        primary_proto = proto_group[0]
+        merged_chunk_nodes = []
+        merged_chunk_edge_weights = []
+        merged_embeds = []
+
+        for proto_node in proto_group:
+            merged_chunk_nodes.extend(proto_node.chunk_node_list)
+            merged_chunk_edge_weights.extend(proto_node.chunk_edge_weight)
+            if proto_node.embed is not None:
+                merged_embeds.append(proto_node.embed)
+
+        primary_proto.chunk_node_list = merged_chunk_nodes
+        primary_proto.chunk_edge_weight = merged_chunk_edge_weights
+        primary_proto.chunk_node_embed = []
+        if merged_embeds:
+            primary_proto.embed = torch.stack(merged_embeds).mean(dim=0)
+        if primary_proto.chunk_edge_weight:
+            primary_proto.anomaly_threshold = get_anomaly_threshold(
+                primary_proto.chunk_edge_weight,
+                self.anomaly_threshold_percentile,
+            )
+        else:
+            primary_proto.anomaly_threshold = None
+        primary_proto.tf_dict_by_chunk_id = None
+        primary_proto.chunk_len_dict_by_id = None
+        primary_proto.BM25 = None
+        primary_proto.df = 0
+        primary_proto.idf = 0
+        return primary_proto
+
+    def merge_duplicate_description_proto_nodes(self):
+        redundant_proto_ids = set()
+
+        for token_node in self.token_nodes:
+            if len(token_node.proto_node_list) <= 1:
+                continue
+
+            description_groups = defaultdict(list)
+            ordered_proto_list = []
+            seen_proto_ids = set()
+            for proto_node in token_node.proto_node_list:
+                proto_id = id(proto_node)
+                if proto_id in seen_proto_ids:
+                    continue
+                seen_proto_ids.add(proto_id)
+                ordered_proto_list.append(proto_node)
+                if proto_node.description:
+                    description_groups[proto_node.description].append(proto_node)
+
+            merged_proto_map = {}
+            for description, proto_group in description_groups.items():
+                if len(proto_group) < 2:
+                    continue
+                merged_proto = self._merge_proto_node_group(proto_group)
+                merged_proto_map[description] = merged_proto
+                for redundant_proto in proto_group[1:]:
+                    redundant_proto_ids.add(id(redundant_proto))
+
+            if not merged_proto_map:
+                token_node.proto_node_list = ordered_proto_list
+                token_node.has_prototype = len(token_node.proto_node_list) > 0
+                continue
+
+            new_proto_list = []
+            added_proto_ids = set()
+            for proto_node in ordered_proto_list:
+                if id(proto_node) in redundant_proto_ids:
+                    continue
+                target_proto = merged_proto_map.get(proto_node.description, proto_node)
+                target_proto_id = id(target_proto)
+                if target_proto_id in added_proto_ids:
+                    continue
+                added_proto_ids.add(target_proto_id)
+                new_proto_list.append(target_proto)
+
+            token_node.proto_node_list = new_proto_list
+            token_node.has_prototype = len(token_node.proto_node_list) > 0
+
+        if not redundant_proto_ids:
+            return
+
+        self.proto_nodes = [
+            proto_node for proto_node in self.proto_nodes
+            if id(proto_node) not in redundant_proto_ids
+        ]
+        for index, proto_node in enumerate(self.proto_nodes):
+            proto_node.proto_node_id = index
+        self.next_proto_node_id = len(self.proto_nodes)
 
     def get_proto_BM25(self):
         for proto_node in self.proto_nodes:
@@ -1633,6 +1901,8 @@ class ProtoGraphRAG:
         for proto_node in self.proto_nodes:
             proto_node.chunk_node_list = [self.chunk_nodes[idx] for idx in proto_node.chunk_node_list]
             proto_node.token_node = self.token_nodes[proto_node.token_node]
+            if not hasattr(proto_node, "description"):
+                proto_node.description = self._get_initial_proto_description(proto_node.token_node)
         for token_node in self.token_nodes:
             token_node.proto_node_list = [self.proto_nodes[idx] for idx in token_node.proto_node_list]
 
