@@ -214,6 +214,7 @@ class TokenNode:
     node_type: str
     is_multi_semantic: bool = field(init=False)
     descriptions: list = field(init=False)
+    wikidata_info_loaded: bool = field(init=False)
     has_prototype: bool = False
     proto_node_list: list = field(default_factory=list)
     embeds_buffer: list = field(default_factory=list)
@@ -222,9 +223,9 @@ class TokenNode:
     anomaly_section: list = field(default_factory=list)
 
     def __post_init__(self):
-        row_count, descriptions = get_wikidata_term_info(self.token_text)
-        self.is_multi_semantic = row_count > 1
-        self.descriptions = list(descriptions)
+        self.is_multi_semantic = False
+        self.descriptions = ["an entity"]
+        self.wikidata_info_loaded = False
 
 
 @dataclass
@@ -311,6 +312,8 @@ class ProtoGraphRAG:
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
         self.plot_embeds = plot_embeds
+        self.predicted_proto_description_logs = []
+        self.deleted_merged_proto_logs = []
 
     def load_reranker(self):
         #self.reranker = LocalJinaReranker()
@@ -334,6 +337,10 @@ class ProtoGraphRAG:
             self.next_proto_node_id += 1
         return pid
 
+    def _reset_proto_description_logs(self):
+        self.predicted_proto_description_logs = []
+        self.deleted_merged_proto_logs = []
+
     def create_doc_node(self, doc_name):
         new_doc_node = DocumentNode(doc_name, self._new_node_id("doc"))
         self.doc_nodes.append(new_doc_node)
@@ -356,6 +363,7 @@ class ProtoGraphRAG:
         return new_token_node
 
     def create_proto_node(self, token_node):
+        self._ensure_token_node_wikidata_info(token_node)
         new_proto_node = Prototype(self._new_node_id("proto"), token_node)
         new_proto_node.description = self._get_initial_proto_description(token_node)
         self.proto_nodes.append(new_proto_node)
@@ -462,7 +470,16 @@ class ProtoGraphRAG:
         token_node.df = len(token_chunk_ids)
         token_node.idf = math.log((N + 1) / (token_node.df + 1)) + 1.0
 
+    def _ensure_token_node_wikidata_info(self, token_node):
+        if getattr(token_node, "wikidata_info_loaded", False):
+            return
+        row_count, descriptions = get_wikidata_term_info(token_node.token_text)
+        token_node.is_multi_semantic = row_count > 1
+        token_node.descriptions = list(descriptions)
+        token_node.wikidata_info_loaded = True
+
     def semantic_type_cls(self, token_node):
+        self._ensure_token_node_wikidata_info(token_node)
         if not token_node.is_multi_semantic:
             return False
         if token_node.df > len(self.chunk_nodes) * self.df_ratio:
@@ -483,11 +500,19 @@ class ProtoGraphRAG:
             self.discard_no_word = False
         if not hasattr(self, "plot_embeds"):
             self.plot_embeds = False
+        if not hasattr(self, "predicted_proto_description_logs"):
+            self.predicted_proto_description_logs = []
+        if not hasattr(self, "deleted_merged_proto_logs"):
+            self.deleted_merged_proto_logs = []
         for token_node in getattr(self, "token_nodes", []):
-            if not hasattr(token_node, "is_multi_semantic") or not hasattr(token_node, "descriptions"):
-                row_count, descriptions = get_wikidata_term_info(token_node.token_text)
-                token_node.is_multi_semantic = row_count > 1
-                token_node.descriptions = list(descriptions)
+            has_is_multi_semantic = hasattr(token_node, "is_multi_semantic")
+            has_descriptions = hasattr(token_node, "descriptions")
+            if not has_is_multi_semantic:
+                token_node.is_multi_semantic = False
+            if not has_descriptions:
+                token_node.descriptions = ["an entity"]
+            if not hasattr(token_node, "wikidata_info_loaded"):
+                token_node.wikidata_info_loaded = has_is_multi_semantic and has_descriptions
 
     def debug_extract_important_spans(
         self,
@@ -737,7 +762,10 @@ class ProtoGraphRAG:
         return best_indices.tolist(), best_scores.tolist()
 
     def finalize(self):
+        self._reset_proto_description_logs()
+        self.log_time("Finalize started.")
         self.chunk_avg_len = sum([chunk_node.num_tokens for chunk_node in self.chunk_nodes])/len(self.chunk_nodes)
+        self.log_time("Computed average chunk length.")
         for token_node in self.token_nodes:
             if not token_node.has_prototype:
                 self.create_basic_proto_node(token_node)
@@ -747,14 +775,22 @@ class ProtoGraphRAG:
                     token_node.proto_node_list[max_idx].chunk_edge_weight.append(max_val)
                 token_node.anomaly_section.clear()
             token_node.embeds_buffer.clear()
+        self.log_time("Finished token node finalization.")
         self.populate_missing_proto_descriptions()
+        self.log_time("Finished populating missing proto descriptions.")
         self.merge_duplicate_description_proto_nodes()
+        self.log_time("Finished merging proto nodes by description.")
         for token_node in self.token_nodes:
             self.assign_idf(token_node)
+        self.log_time("Finished assigning token and proto IDF.")
         self.get_proto_BM25()
+        self.log_time("Finished computing proto BM25.")
         self.build_query_database()
+        self.log_time("Finished building query database.")
         self.build_phrase_query()
+        self.log_time("Finished building phrase query index.")
         self.build_chunk2proto_edge()
+        self.log_time("Finished building chunk-to-proto edges.")
         self.save_doc_to_json()
         self.log_time("Finalizing completed.")
 
@@ -908,6 +944,14 @@ class ProtoGraphRAG:
             )
             if predicted_description is not None:
                 proto_node.description = predicted_description
+                self.predicted_proto_description_logs.append(
+                    {
+                        "proto_node_id": proto_node.proto_node_id,
+                        "token_text": proto_node.token_node.token_text,
+                        "description": predicted_description,
+                        "chunk_count": len(proto_node.chunk_node_list),
+                    }
+                )
 
     def _merge_proto_node_group(self, proto_group):
         primary_proto = proto_group[0]
@@ -966,6 +1010,15 @@ class ProtoGraphRAG:
                 merged_proto = self._merge_proto_node_group(proto_group)
                 merged_proto_map[description] = merged_proto
                 for redundant_proto in proto_group[1:]:
+                    self.deleted_merged_proto_logs.append(
+                        {
+                            "deleted_proto_node_id": redundant_proto.proto_node_id,
+                            "kept_proto_node_id": merged_proto.proto_node_id,
+                            "token_text": token_node.token_text,
+                            "description": description,
+                            "deleted_chunk_count": len(redundant_proto.chunk_node_list),
+                        }
+                    )
                     redundant_proto_ids.add(id(redundant_proto))
 
             if not merged_proto_map:
@@ -998,6 +1051,34 @@ class ProtoGraphRAG:
         for index, proto_node in enumerate(self.proto_nodes):
             proto_node.proto_node_id = index
         self.next_proto_node_id = len(self.proto_nodes)
+
+    def print_proto_description_logs(self):
+        print("Proto nodes assigned predicted descriptions:")
+        if not self.predicted_proto_description_logs:
+            print("  (none)")
+        else:
+            for item in self.predicted_proto_description_logs:
+                print(
+                    "  "
+                    f"proto_node_id={item['proto_node_id']}, "
+                    f"token={item['token_text']!r}, "
+                    f"description={item['description']!r}, "
+                    f"chunk_count={item['chunk_count']}"
+                )
+
+        print("\nProto nodes deleted by description merge:")
+        if not self.deleted_merged_proto_logs:
+            print("  (none)")
+        else:
+            for item in self.deleted_merged_proto_logs:
+                print(
+                    "  "
+                    f"deleted_proto_node_id={item['deleted_proto_node_id']}, "
+                    f"kept_proto_node_id={item['kept_proto_node_id']}, "
+                    f"token={item['token_text']!r}, "
+                    f"description={item['description']!r}, "
+                    f"deleted_chunk_count={item['deleted_chunk_count']}"
+                )
 
     def get_proto_BM25(self):
         for proto_node in self.proto_nodes:
