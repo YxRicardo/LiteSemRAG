@@ -309,15 +309,25 @@ class ProtoGraphRAG:
         self.json_path = "index_documents.json"
         self.reranker = None
         self.load_reranker()
+        self.proto_description_model_name = "cross-encoder/nli-deberta-v3-base"
+        self.proto_description_model = None
+        self._load_proto_description_model()
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
         self.plot_embeds = plot_embeds
         self.predicted_proto_description_logs = []
         self.deleted_merged_proto_logs = []
+        self.wikidata_no_result_logs = []
+        self._wikidata_no_result_keys = set()
 
     def load_reranker(self):
         #self.reranker = LocalJinaReranker()
         self.reranker = None
+
+    def _load_proto_description_model(self):
+        from sentence_transformers import CrossEncoder
+
+        self.proto_description_model = CrossEncoder(self.proto_description_model_name)
 
     def shutdown(self):
         self.executor.shutdown()
@@ -340,6 +350,21 @@ class ProtoGraphRAG:
     def _reset_proto_description_logs(self):
         self.predicted_proto_description_logs = []
         self.deleted_merged_proto_logs = []
+        self.wikidata_no_result_logs = []
+        self._wikidata_no_result_keys = set()
+
+    def _log_wikidata_no_result(self, term, stage, reason):
+        log_key = (str(term), str(stage), str(reason))
+        if log_key in self._wikidata_no_result_keys:
+            return
+        self._wikidata_no_result_keys.add(log_key)
+        self.wikidata_no_result_logs.append(
+            {
+                "term": str(term),
+                "stage": str(stage),
+                "reason": str(reason),
+            }
+        )
 
     def create_doc_node(self, doc_name):
         new_doc_node = DocumentNode(doc_name, self._new_node_id("doc"))
@@ -477,6 +502,12 @@ class ProtoGraphRAG:
         token_node.is_multi_semantic = row_count > 1
         token_node.descriptions = list(descriptions)
         token_node.wikidata_info_loaded = True
+        if row_count == 0:
+            self._log_wikidata_no_result(
+                token_node.token_text,
+                "token_node",
+                "no_exact_match_with_wikipedia_sitelink",
+            )
 
     def semantic_type_cls(self, token_node):
         self._ensure_token_node_wikidata_info(token_node)
@@ -504,6 +535,14 @@ class ProtoGraphRAG:
             self.predicted_proto_description_logs = []
         if not hasattr(self, "deleted_merged_proto_logs"):
             self.deleted_merged_proto_logs = []
+        if not hasattr(self, "wikidata_no_result_logs"):
+            self.wikidata_no_result_logs = []
+        if not hasattr(self, "_wikidata_no_result_keys"):
+            self._wikidata_no_result_keys = set()
+        if not hasattr(self, "proto_description_model_name"):
+            self.proto_description_model_name = "cross-encoder/nli-deberta-v3-base"
+        if not hasattr(self, "proto_description_model"):
+            self.proto_description_model = None
         for token_node in getattr(self, "token_nodes", []):
             has_is_multi_semantic = hasattr(token_node, "is_multi_semantic")
             has_descriptions = hasattr(token_node, "descriptions")
@@ -766,15 +805,7 @@ class ProtoGraphRAG:
         self.log_time("Finalize started.")
         self.chunk_avg_len = sum([chunk_node.num_tokens for chunk_node in self.chunk_nodes])/len(self.chunk_nodes)
         self.log_time("Computed average chunk length.")
-        for token_node in self.token_nodes:
-            if not token_node.has_prototype:
-                self.create_basic_proto_node(token_node)
-            elif len(token_node.anomaly_section) > 0:
-                for embed, chunk_node, max_val, max_idx in token_node.anomaly_section:
-                    token_node.proto_node_list[max_idx].chunk_node_list.append(chunk_node)
-                    token_node.proto_node_list[max_idx].chunk_edge_weight.append(max_val)
-                token_node.anomaly_section.clear()
-            token_node.embeds_buffer.clear()
+        self.finalize_token_nodes()
         self.log_time("Finished token node finalization.")
         self.populate_missing_proto_descriptions()
         self.log_time("Finished populating missing proto descriptions.")
@@ -793,6 +824,32 @@ class ProtoGraphRAG:
         self.log_time("Finished building chunk-to-proto edges.")
         self.save_doc_to_json()
         self.log_time("Finalizing completed.")
+
+    def finalize_token_nodes(self):
+        total_token_nodes = len(self.token_nodes)
+        if total_token_nodes == 0:
+            return
+
+        print(
+            f"\rfinalize_token_nodes: 0/{total_token_nodes}",
+            end="",
+            flush=True,
+        )
+        for index, token_node in enumerate(self.token_nodes, start=1):
+            if not token_node.has_prototype:
+                self.create_basic_proto_node(token_node)
+            elif len(token_node.anomaly_section) > 0:
+                for embed, chunk_node, max_val, max_idx in token_node.anomaly_section:
+                    token_node.proto_node_list[max_idx].chunk_node_list.append(chunk_node)
+                    token_node.proto_node_list[max_idx].chunk_edge_weight.append(max_val)
+                token_node.anomaly_section.clear()
+            token_node.embeds_buffer.clear()
+            print(
+                f"\rfinalize_token_nodes: {index}/{total_token_nodes}",
+                end="",
+                flush=True,
+            )
+        print()
 
     def _sample_proto_chunk_nodes(self, proto_node, max_samples=10):
         unique_chunk_nodes = []
@@ -884,11 +941,21 @@ class ProtoGraphRAG:
                 )
             except ValueError:
                 candidate_bank_cache[token_text] = []
+                self._log_wikidata_no_result(
+                    token_text,
+                    "proto_description",
+                    "no_candidate_definitions",
+                )
                 return None
             candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column=definition_column)
             candidate_bank_cache[token_text] = candidate_bank
 
         if not candidate_bank:
+            self._log_wikidata_no_result(
+                token_text,
+                "proto_description",
+                "empty_candidate_bank",
+            )
             return None
 
         predicted_descriptions = []
@@ -927,19 +994,20 @@ class ProtoGraphRAG:
         ]
         if not target_proto_nodes:
             return
-
-        try:
-            from sentence_transformers import CrossEncoder
-            model = CrossEncoder("cross-encoder/nli-deberta-v3-base")
-        except Exception as exc:
-            print(f"Skipping proto description extraction: {exc}")
+        if self.proto_description_model is None:
             return
 
         candidate_bank_cache = {}
-        for proto_node in target_proto_nodes:
+        total_proto_nodes = len(target_proto_nodes)
+        print(
+            f"\rpopulate_missing_proto_descriptions: 0/{total_proto_nodes}",
+            end="",
+            flush=True,
+        )
+        for index, proto_node in enumerate(target_proto_nodes, start=1):
             predicted_description = self._predict_proto_description_from_samples(
                 proto_node,
-                model=model,
+                model=self.proto_description_model,
                 candidate_bank_cache=candidate_bank_cache,
             )
             if predicted_description is not None:
@@ -952,6 +1020,12 @@ class ProtoGraphRAG:
                         "chunk_count": len(proto_node.chunk_node_list),
                     }
                 )
+            print(
+                f"\rpopulate_missing_proto_descriptions: {index}/{total_proto_nodes}",
+                end="",
+                flush=True,
+            )
+        print()
 
     def _merge_proto_node_group(self, proto_group):
         primary_proto = proto_group[0]
@@ -986,11 +1060,19 @@ class ProtoGraphRAG:
 
     def merge_duplicate_description_proto_nodes(self):
         redundant_proto_ids = set()
+        target_token_nodes = [
+            token_node for token_node in self.token_nodes
+            if len(token_node.proto_node_list) > 1
+        ]
 
-        for token_node in self.token_nodes:
-            if len(token_node.proto_node_list) <= 1:
-                continue
-
+        total_token_nodes = len(target_token_nodes)
+        if total_token_nodes > 0:
+            print(
+                f"\rmerge_duplicate_description_proto_nodes: 0/{total_token_nodes}",
+                end="",
+                flush=True,
+            )
+        for index, token_node in enumerate(target_token_nodes, start=1):
             description_groups = defaultdict(list)
             ordered_proto_list = []
             seen_proto_ids = set()
@@ -1024,6 +1106,11 @@ class ProtoGraphRAG:
             if not merged_proto_map:
                 token_node.proto_node_list = ordered_proto_list
                 token_node.has_prototype = len(token_node.proto_node_list) > 0
+                print(
+                    f"\rmerge_duplicate_description_proto_nodes: {index}/{total_token_nodes}",
+                    end="",
+                    flush=True,
+                )
                 continue
 
             new_proto_list = []
@@ -1040,8 +1127,15 @@ class ProtoGraphRAG:
 
             token_node.proto_node_list = new_proto_list
             token_node.has_prototype = len(token_node.proto_node_list) > 0
+            print(
+                f"\rmerge_duplicate_description_proto_nodes: {index}/{total_token_nodes}",
+                end="",
+                flush=True,
+            )
 
         if not redundant_proto_ids:
+            if total_token_nodes > 0:
+                print()
             return
 
         self.proto_nodes = [
@@ -1051,6 +1145,8 @@ class ProtoGraphRAG:
         for index, proto_node in enumerate(self.proto_nodes):
             proto_node.proto_node_id = index
         self.next_proto_node_id = len(self.proto_nodes)
+        if total_token_nodes > 0:
+            print()
 
     def print_proto_description_logs(self):
         print("Proto nodes assigned predicted descriptions:")
@@ -1079,6 +1175,20 @@ class ProtoGraphRAG:
                     f"description={item['description']!r}, "
                     f"deleted_chunk_count={item['deleted_chunk_count']}"
                 )
+
+    def print_wikidata_no_result_logs(self):
+        print("Wikidata lookups with no usable results:")
+        if not self.wikidata_no_result_logs:
+            print("  (none)")
+            return
+
+        for item in self.wikidata_no_result_logs:
+            print(
+                "  "
+                f"term={item['term']!r}, "
+                f"stage={item['stage']}, "
+                f"reason={item['reason']}"
+            )
 
     def get_proto_BM25(self):
         for proto_node in self.proto_nodes:
@@ -1818,8 +1928,13 @@ class ProtoGraphRAG:
             self.text_encoder_addr,
             local_files_only=True,
             fix_mistral_regex=True,
-            use_fast=False,
+            use_fast=True,
         )
+        if not getattr(self.tokenizer, "is_fast", False):
+            raise RuntimeError(
+                "The text encoder tokenizer must be a fast tokenizer because "
+                "offset_mapping is required during indexing."
+            )
         self.text_encoder = AutoModel.from_pretrained(
             self.text_encoder_addr,
             local_files_only=True
@@ -1835,6 +1950,7 @@ class ProtoGraphRAG:
         state["executor"] = None
         state["nlp"] = None
         state["reranker"] = None
+        state["proto_description_model"] = None
         return state
 
     # ⭐ 反序列化后做什么
@@ -1845,6 +1961,7 @@ class ProtoGraphRAG:
         self.executor = None
         self.nlp = None
         self.reranker = None
+        self.proto_description_model = None
         self._ensure_backward_compatible_attrs()
 
     def _restore_runtime_components(self, load_nlp=True, load_reranker=False):
@@ -1858,6 +1975,8 @@ class ProtoGraphRAG:
             self._load_nlp()
         if load_reranker and self.reranker is None:
             self.load_reranker()
+        if self.proto_description_model is None:
+            self._load_proto_description_model()
 
     def save_data(self, path):
         with open(path, "wb") as f:
@@ -2010,14 +2129,18 @@ class ProtoGraphRAG:
         # 异常传递
         # =============================
         worker_errors = []
+        stop_event = threading.Event()
 
         def record_error(stage_name):
+            if worker_errors:
+                return
             worker_errors.append(
                 (
                     stage_name,
                     traceback.format_exc()
                 )
             )
+            stop_event.set()
 
         def get_progress_snapshot():
             with progress_lock:
@@ -2048,6 +2171,15 @@ class ProtoGraphRAG:
                 flush=True
             )
 
+        def safe_queue_put(target_queue, item):
+            while not stop_event.is_set():
+                try:
+                    target_queue.put(item, timeout=0.2)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
         # =============================
         # 阶段 1：CPU 预处理线程
         # 输出到 preprocess_queue:
@@ -2056,6 +2188,9 @@ class ProtoGraphRAG:
         def cpu_preprocess_worker():
             try:
                 for idx, chunk in enumerate(chunk_list):
+                    if stop_event.is_set():
+                        break
+
                     title = chunk["title"]
                     new_doc_node = doc_node_map.get(title)
                     if new_doc_node is None:
@@ -2073,7 +2208,8 @@ class ProtoGraphRAG:
                         discard_no_word=self.discard_no_word
                     )
 
-                    preprocess_queue.put(
+                    if not safe_queue_put(
+                        preprocess_queue,
                         (
                             idx,
                             new_chunk_node,
@@ -2081,16 +2217,17 @@ class ProtoGraphRAG:
                             tokens,
                             chunk["text"]
                         )
-                    )
+                    ):
+                        break
 
                     inc_preprocess_done(1)
+                    print_progress()
 
             except Exception:
                 record_error("cpu_preprocess_worker")
 
             finally:
-                # 无论成功还是失败，都要发结束信号，避免下游卡死
-                preprocess_queue.put(None)
+                safe_queue_put(preprocess_queue, None)
 
         # =============================
         # 阶段 2：GPU 线程
@@ -2110,7 +2247,7 @@ class ProtoGraphRAG:
         def gpu_worker():
             def flush_batch(batch_buffer):
                 if not batch_buffer:
-                    return
+                    return True
 
                 batch_texts = [item[4] for item in batch_buffer]
                 batch_items = [
@@ -2125,21 +2262,31 @@ class ProtoGraphRAG:
                     self.device
                 )
 
-                result_queue.put(
+                if not safe_queue_put(
+                    result_queue,
                     (
                         batch_items,
                         token_embeddings_batch,
                         offsets_batch
                     )
-                )
+                ):
+                    return False
 
                 inc_gpu_done(len(batch_buffer))
+                print_progress()
+                return True
 
             batch_buffer = []
 
             try:
                 while True:
-                    item = preprocess_queue.get()
+                    if stop_event.is_set() and preprocess_queue.empty():
+                        break
+
+                    try:
+                        item = preprocess_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
 
                     if item is None:
                         break
@@ -2147,7 +2294,8 @@ class ProtoGraphRAG:
                     batch_buffer.append(item)
 
                     if len(batch_buffer) >= batch_size:
-                        flush_batch(batch_buffer)
+                        if not flush_batch(batch_buffer):
+                            break
                         batch_buffer = []
 
                 # 刷掉最后不足一个 batch 的部分
@@ -2158,7 +2306,7 @@ class ProtoGraphRAG:
                 record_error("gpu_worker")
 
             finally:
-                result_queue.put(None)
+                safe_queue_put(result_queue, None)
 
         # =============================
         # 启动线程
@@ -2166,6 +2314,7 @@ class ProtoGraphRAG:
         preprocess_thread = threading.Thread(target=cpu_preprocess_worker)
         gpu_thread = threading.Thread(target=gpu_worker)
 
+        print_progress()
         preprocess_thread.start()
         gpu_thread.start()
 
@@ -2174,7 +2323,14 @@ class ProtoGraphRAG:
         # =============================
         try:
             while True:
-                item = result_queue.get()
+                if stop_event.is_set() and result_queue.empty() and not gpu_thread.is_alive():
+                    break
+
+                try:
+                    item = result_queue.get(timeout=0.2)
+                except queue.Empty:
+                    print_progress()
+                    continue
 
                 if item is None:
                     break
@@ -2196,8 +2352,9 @@ class ProtoGraphRAG:
                     print_progress()
 
         finally:
-            preprocess_thread.join()
-            gpu_thread.join()
+            stop_event.set()
+            preprocess_thread.join(timeout=1.0)
+            gpu_thread.join(timeout=1.0)
 
         print()
 

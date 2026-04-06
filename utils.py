@@ -53,6 +53,18 @@ WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 DEFAULT_WIKIDATA_HEADERS = {
     "User-Agent": "LiteSemRAG/1.0 (https://www.wikidata.org/)"
 }
+ENGLISH_NUMBER_WORDS = {
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+    "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million",
+    "billion", "trillion", "first", "second", "third", "fourth", "fifth", "sixth",
+    "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth",
+    "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth",
+    "nineteenth", "twentieth", "thirtieth", "fortieth", "fiftieth", "sixtieth",
+    "seventieth", "eightieth", "ninetieth", "hundredth", "thousandth", "millionth",
+    "billionth", "trillionth",
+}
 
 
 def _import_wikidata_deps():
@@ -91,6 +103,35 @@ def _coerce_aliases_for_search(value):
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _safe_string_series(series):
+    """Convert a pandas Series to a string-valued Series safe for .str accessors."""
+    return series.map(lambda value: "" if value is None else str(value))
+
+
+def _series_casefold_equals(series, target: str):
+    target_casefold = str(target).casefold()
+    return series.map(lambda value: ("" if value is None else str(value)).casefold() == target_casefold)
+
+
+def _series_non_empty_mask(series):
+    return series.map(lambda value: ("" if value is None else str(value)).strip() != "")
+
+
+def _should_skip_wikidata_term(term: str) -> bool:
+    normalized_term = str(term).strip()
+    if not normalized_term:
+        return True
+
+    if len(normalized_term.split()) >= 3:
+        return True
+
+    if re.search(r"\d", normalized_term):
+        return True
+
+    word_tokens = re.findall(r"[a-z]+", normalized_term.casefold())
+    return any(token in ENGLISH_NUMBER_WORDS for token in word_tokens)
 
 
 def extract_best_wikipedia_title(entity, language="en"):
@@ -203,6 +244,40 @@ def fetch_detailed_descriptions_for_entities(
     return detailed_descriptions
 
 
+def filter_entity_ids_with_wikipedia_sitelinks(entity_ids, language="en", headers=None, timeout=30):
+    """Return entity IDs that have a Wikipedia sitelink, preferring the requested language."""
+    if not entity_ids:
+        return set()
+
+    params = {
+        "action": "wbgetentities",
+        "format": "json",
+        "ids": "|".join(str(entity_id).strip() for entity_id in entity_ids if str(entity_id).strip()),
+        "languages": language,
+        "props": "sitelinks",
+    }
+    if not params["ids"]:
+        return set()
+
+    data = _safe_get_json(WIKIDATA_API_URL, params=params, headers=headers, timeout=timeout)
+    entities = data.get("entities", {}) if isinstance(data, dict) else {}
+    if not isinstance(entities, dict):
+        return set()
+
+    valid_entity_ids = set()
+    preferred_site = f"{language}wiki"
+    for entity_id, entity in entities.items():
+        if not isinstance(entity, dict):
+            continue
+        sitelinks = entity.get("sitelinks", {})
+        if not isinstance(sitelinks, dict) or not sitelinks:
+            continue
+        if preferred_site in sitelinks or any(site_name.endswith("wiki") for site_name in sitelinks):
+            valid_entity_ids.add(entity_id)
+
+    return valid_entity_ids
+
+
 def search_wikidata(
     term,
     language="en",
@@ -261,9 +336,7 @@ def search_wikidata(
     )
 
     if exact_match_text and not df.empty:
-        df = df[
-            df["match_text"].fillna("").str.casefold() == normalized_term.casefold()
-        ].reset_index(drop=True)
+        df = df[_series_casefold_equals(df["match_text"], normalized_term)].reset_index(drop=True)
 
     if include_detailed_description:
         detailed_descriptions = {}
@@ -281,10 +354,8 @@ def search_wikidata(
             [detailed_descriptions.get(entity_id, "") for entity_id in df["id"]],
         )
         if drop_missing_detailed_description:
-            df = df[df["detailed_description"].fillna("").str.strip() != ""].reset_index(drop=True)
+            df = df[_series_non_empty_mask(df["detailed_description"])].reset_index(drop=True)
 
-    if df.empty:
-        print(f"No search results for: {term!r}")
     return df
 
 
@@ -315,7 +386,7 @@ def load_wikidata_definition_candidates(
         )
 
     definition_column = "detailed_description" if use_detailed_description else "description"
-    candidates_df = candidates_df[candidates_df[definition_column].fillna("").str.strip() != ""].copy()
+    candidates_df = candidates_df[_series_non_empty_mask(candidates_df[definition_column])].copy()
     candidates_df = candidates_df.drop_duplicates(subset=["id", definition_column]).reset_index(drop=True)
     if candidates_df.empty:
         raise ValueError(
@@ -368,30 +439,56 @@ def build_wikidata_candidate_bank(candidates_df, definition_column: str) -> list
 
 
 @lru_cache(maxsize=4096)
-def get_wikidata_term_info(term, language="en"):
-    """Return exact-match Wikidata row count plus the corresponding description list."""
+def _get_wikidata_term_info_cached(term, language="en"):
+    """Return exact-match Wikidata row count plus description list using a lightweight lookup."""
+    if _should_skip_wikidata_term(term):
+        return 0, ("an entity",)
+
     try:
         results = search_wikidata(
             term,
             language=language,
             exact_match_text=True,
-            include_detailed_description=True,
-            drop_missing_detailed_description=True,
+            include_detailed_description=False,
+            drop_missing_detailed_description=False,
         )
     except Exception as exc:
         print(f"Wikidata lookup failed for {term!r}: {exc}")
         return 0, ("an entity",)
 
-    row_count = len(results.index)
+    if results.empty:
+        return 0, ("an entity",)
+
+    try:
+        valid_entity_ids = filter_entity_ids_with_wikipedia_sitelinks(
+            results["id"].tolist(),
+            language=language,
+            headers=DEFAULT_WIKIDATA_HEADERS,
+            timeout=30,
+        )
+    except Exception as exc:
+        print(f"Wikidata sitelink lookup failed for {term!r}: {exc}")
+        return 0, ("an entity",)
+
+    if not valid_entity_ids:
+        return 0, ("an entity",)
+
+    filtered_results = results[results["id"].isin(valid_entity_ids)].reset_index(drop=True)
+    row_count = len(filtered_results.index)
     if row_count == 0:
         return 0, ("an entity",)
 
     descriptions = []
-    for description in results["description"].tolist():
+    for description in filtered_results["description"].tolist():
         normalized_description = str(description).strip() if description is not None else ""
         descriptions.append(normalized_description or "an entity")
 
     return row_count, tuple(descriptions)
+
+
+def get_wikidata_term_info(term, language="en"):
+    normalized_term = " ".join(str(term).strip().split())
+    return _get_wikidata_term_info_cached(normalized_term, language=language)
 
 
 @lru_cache(maxsize=4096)
