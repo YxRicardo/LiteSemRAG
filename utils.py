@@ -119,6 +119,14 @@ def _series_non_empty_mask(series):
     return series.map(lambda value: ("" if value is None else str(value)).strip() != "")
 
 
+def _series_exclude_name_descriptions(series):
+    blocked_phrases = ("family name", "given name")
+    return series.map(
+        lambda value: not any(phrase in str(value).casefold() for phrase in blocked_phrases)
+        if value is not None else True
+    )
+
+
 def _should_skip_wikidata_term(term: str) -> bool:
     normalized_term = str(term).strip()
     if not normalized_term:
@@ -286,6 +294,7 @@ def search_wikidata(
     include_detailed_description=False,
     drop_missing_detailed_description=False,
     detailed_description_sentences=3,
+    filter_name=True,
 ):
     """
     Search Wikidata entities using the same interface as explore_wikidata.ipynb.
@@ -335,6 +344,9 @@ def search_wikidata(
         columns=["id", "label", "description", "match_text", "aliases", "concepturi"],
     )
 
+    if filter_name and not df.empty:
+        df = df[_series_exclude_name_descriptions(df["description"])].reset_index(drop=True)
+
     if exact_match_text and not df.empty:
         df = df[_series_casefold_equals(df["match_text"], normalized_term)].reset_index(drop=True)
 
@@ -364,6 +376,7 @@ def load_wikidata_definition_candidates(
     use_detailed_description: bool = True,
     exact_match_text: bool = False,
     limit: int = 5,
+    filter_name: bool = True,
 ):
     _, pd = _import_wikidata_deps()
 
@@ -374,6 +387,7 @@ def load_wikidata_definition_candidates(
         include_detailed_description=use_detailed_description,
         detailed_description_sentences=3,
         drop_missing_detailed_description=use_detailed_description,
+        filter_name=filter_name,
     )
 
     if candidates_df.empty:
@@ -439,7 +453,7 @@ def build_wikidata_candidate_bank(candidates_df, definition_column: str) -> list
 
 
 @lru_cache(maxsize=4096)
-def _get_wikidata_term_info_cached(term, language="en"):
+def _get_wikidata_term_info_cached(term, language="en", filter_name=True):
     """Return exact-match Wikidata row count plus description list using a lightweight lookup."""
     if _should_skip_wikidata_term(term):
         return 0, ("an entity",)
@@ -451,6 +465,7 @@ def _get_wikidata_term_info_cached(term, language="en"):
             exact_match_text=True,
             include_detailed_description=False,
             drop_missing_detailed_description=False,
+            filter_name=filter_name,
         )
     except Exception as exc:
         print(f"Wikidata lookup failed for {term!r}: {exc}")
@@ -486,15 +501,15 @@ def _get_wikidata_term_info_cached(term, language="en"):
     return row_count, tuple(descriptions)
 
 
-def get_wikidata_term_info(term, language="en"):
+def get_wikidata_term_info(term, language="en", filter_name=True):
     normalized_term = " ".join(str(term).strip().split())
-    return _get_wikidata_term_info_cached(normalized_term, language=language)
+    return _get_wikidata_term_info_cached(normalized_term, language=language, filter_name=filter_name)
 
 
 @lru_cache(maxsize=4096)
-def is_multi_semantic_by_wikidata(term, language="en"):
+def is_multi_semantic_by_wikidata(term, language="en", filter_name=True):
     """Return True when a term resolves to more than one detailed exact-match Wikidata entity."""
-    row_count, _ = get_wikidata_term_info(term, language=language)
+    row_count, _ = get_wikidata_term_info(term, language=language, filter_name=filter_name)
     return row_count > 1
 
 def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:

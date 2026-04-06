@@ -921,6 +921,7 @@ class ProtoGraphRAG:
                     use_detailed_description=False,
                     exact_match_text=True,
                     limit=5,
+                    filter_name=True,
                 )
             except ValueError:
                 candidate_bank_cache[token_text] = []
