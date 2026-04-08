@@ -604,7 +604,8 @@ def hdbscan_cluster(
     # =========================
     # 4️⃣ PCA
     # =========================
-    pca = PCA(n_components=min(50, X_norm.shape[1]))
+    pca_n_components = min(50, X_norm.shape[0], X_norm.shape[1])
+    pca = PCA(n_components=pca_n_components)
     X_reduced = pca.fit_transform(X_norm)
 
     # =========================

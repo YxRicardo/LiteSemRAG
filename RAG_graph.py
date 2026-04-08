@@ -270,7 +270,7 @@ class ProtoGraphRAG:
     def __init__(self, text_embed_dim, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
                  anomaly_section_size=50,query_token_percentile=0.8,
                  retrieve_top_k=5, chunk_size=300, remove_duplicate_token=True, device="cuda",
-                 discard_no_word=False, plot_embeds=False):
+                 discard_no_word=False, plot_embeds=False, exhaustive_proto_description_evaluation=False):
         self.text_embed_dim = text_embed_dim
         self.df_ratio = df_ratio
         self.doc_nodes = []
@@ -314,6 +314,7 @@ class ProtoGraphRAG:
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
         self.plot_embeds = plot_embeds
+        self.exhaustive_proto_description_evaluation = exhaustive_proto_description_evaluation
         self.predicted_proto_description_logs = []
         self.deleted_merged_proto_logs = []
         self.wikidata_no_result_logs = []
@@ -524,6 +525,8 @@ class ProtoGraphRAG:
             self.discard_no_word = False
         if not hasattr(self, "plot_embeds"):
             self.plot_embeds = False
+        if not hasattr(self, "exhaustive_proto_description_evaluation"):
+            self.exhaustive_proto_description_evaluation = False
         if not hasattr(self, "predicted_proto_description_logs"):
             self.predicted_proto_description_logs = []
         if not hasattr(self, "deleted_merged_proto_logs"):
@@ -842,6 +845,8 @@ class ProtoGraphRAG:
                 continue
             seen_chunk_ids.add(chunk_node.chunk_node_id)
             unique_chunk_nodes.append(chunk_node)
+        if max_samples is None or max_samples <= 0:
+            return unique_chunk_nodes
         if len(unique_chunk_nodes) <= max_samples:
             return unique_chunk_nodes
         return random.sample(unique_chunk_nodes, max_samples)
@@ -943,7 +948,8 @@ class ProtoGraphRAG:
 
         predicted_descriptions = []
         sample_prediction_logs = []
-        sample_chunk_nodes = self._sample_proto_chunk_nodes(proto_node, max_samples=10)
+        max_samples = None if self.exhaustive_proto_description_evaluation else 10
+        sample_chunk_nodes = self._sample_proto_chunk_nodes(proto_node, max_samples=max_samples)
         for sample_index, chunk_node in enumerate(sample_chunk_nodes, start=1):
             prompt_info = self._build_proto_description_prompt(chunk_node.chunk_text, token_text)
             if prompt_info is None:
