@@ -921,7 +921,6 @@ class ProtoGraphRAG:
                     use_detailed_description=False,
                     exact_match_text=True,
                     limit=5,
-                    filter_name=True,
                 )
             except ValueError:
                 candidate_bank_cache[token_text] = []
@@ -943,8 +942,9 @@ class ProtoGraphRAG:
             return None
 
         predicted_descriptions = []
+        sample_prediction_logs = []
         sample_chunk_nodes = self._sample_proto_chunk_nodes(proto_node, max_samples=10)
-        for chunk_node in sample_chunk_nodes:
+        for sample_index, chunk_node in enumerate(sample_chunk_nodes, start=1):
             prompt_info = self._build_proto_description_prompt(chunk_node.chunk_text, token_text)
             if prompt_info is None:
                 continue
@@ -964,11 +964,28 @@ class ProtoGraphRAG:
                 reverse=True,
             )
             if ranked_candidates:
-                predicted_descriptions.append(ranked_candidates[0]["description"])
+                top_candidate = ranked_candidates[0]
+                predicted_descriptions.append(top_candidate["description"])
+                sample_prediction_logs.append(
+                    {
+                        "sample_index": sample_index,
+                        "chunk_node_id": chunk_node.chunk_node_id,
+                        "context_text": prompt_info["context_text"],
+                        "matched_text": prompt_info["matched_text"],
+                        "predicted_entity_id": top_candidate["entity_id"],
+                        "predicted_label": top_candidate["label"],
+                        "predicted_description": top_candidate["description"],
+                        "predicted_definition": top_candidate["definition"],
+                        "prediction_score": top_candidate["score"],
+                    }
+                )
 
         if not predicted_descriptions:
             return None
-        return Counter(predicted_descriptions).most_common(1)[0][0]
+        return {
+            "description": Counter(predicted_descriptions).most_common(1)[0][0],
+            "sample_predictions": sample_prediction_logs,
+        }
 
     def _merge_proto_node_group(self, proto_group):
         primary_proto = proto_group[0]
@@ -1027,12 +1044,13 @@ class ProtoGraphRAG:
                 seen_proto_ids.add(proto_id)
                 ordered_proto_list.append(proto_node)
                 if proto_node.description is None and self.proto_description_model is not None:
-                    predicted_description = self._predict_proto_description_from_samples(
+                    prediction_result = self._predict_proto_description_from_samples(
                         proto_node,
                         model=self.proto_description_model,
                         candidate_bank_cache=candidate_bank_cache,
                     )
-                    if predicted_description is not None:
+                    if prediction_result is not None:
+                        predicted_description = prediction_result["description"]
                         proto_node.description = predicted_description
                         self.predicted_proto_description_logs.append(
                             {
@@ -1040,6 +1058,7 @@ class ProtoGraphRAG:
                                 "token_text": proto_node.token_node.token_text,
                                 "description": predicted_description,
                                 "chunk_count": len(proto_node.chunk_node_list),
+                                "sample_predictions": prediction_result["sample_predictions"],
                             }
                         )
                 if proto_node.description:
@@ -1115,6 +1134,21 @@ class ProtoGraphRAG:
                     f"description={item['description']!r}, "
                     f"chunk_count={item['chunk_count']}"
                 )
+                sample_predictions = item.get("sample_predictions", [])
+                if not sample_predictions:
+                    print("    sample_predictions: (none)")
+                    continue
+                for sample in sample_predictions:
+                    print(
+                        "    "
+                        f"sample_index={sample['sample_index']}, "
+                        f"chunk_node_id={sample['chunk_node_id']}, "
+                        f"predicted_description={sample['predicted_description']!r}, "
+                        f"predicted_label={sample['predicted_label']!r}, "
+                        f"score={sample['prediction_score']:.4f}"
+                    )
+                    print(f"      matched_text={sample['matched_text']!r}")
+                    print(f"      context_text={sample['context_text']!r}")
 
         print("\nProto nodes deleted by description merge:")
         if not self.deleted_merged_proto_logs:
@@ -1129,6 +1163,157 @@ class ProtoGraphRAG:
                     f"description={item['description']!r}, "
                     f"deleted_chunk_count={item['deleted_chunk_count']}"
                 )
+
+    def _format_proto_description_logs_text(self):
+        lines = []
+
+        lines.append("Proto nodes assigned predicted descriptions:")
+        if not self.predicted_proto_description_logs:
+            lines.append("  (none)")
+        else:
+            for item in self.predicted_proto_description_logs:
+                lines.append(
+                    "[Proto] proto_node_id={} | token={!r} | description={!r} | chunk_count={}".format(
+                        item["proto_node_id"],
+                        item["token_text"],
+                        item["description"],
+                        item["chunk_count"],
+                    )
+                )
+                sample_predictions = item.get("sample_predictions", [])
+                if not sample_predictions:
+                    lines.append("  sample_predictions: (none)")
+                    lines.append("")
+                    continue
+                for sample in sample_predictions:
+                    lines.append(
+                        "  (sample {}) chunk_node_id={} | predicted_description={!r} | predicted_label={!r} | score={:.4f}".format(
+                            sample["sample_index"],
+                            sample["chunk_node_id"],
+                            sample["predicted_description"],
+                            sample["predicted_label"],
+                            sample["prediction_score"],
+                        )
+                    )
+                    lines.append("    matched_text={!r}".format(sample["matched_text"]))
+                    lines.append("    context_text={!r}".format(sample["context_text"]))
+                lines.append("")
+
+        lines.append("Proto nodes deleted by description merge:")
+        if not self.deleted_merged_proto_logs:
+            lines.append("  (none)")
+        else:
+            for item in self.deleted_merged_proto_logs:
+                lines.append(
+                    "  deleted_proto_node_id={} | kept_proto_node_id={} | token={!r} | description={!r} | deleted_chunk_count={}".format(
+                        item["deleted_proto_node_id"],
+                        item["kept_proto_node_id"],
+                        item["token_text"],
+                        item["description"],
+                        item["deleted_chunk_count"],
+                    )
+                )
+
+        return "\n".join(lines)
+
+    def _build_proto_description_logs_html(self, open_details=False):
+        html_parts = [
+            "<div style=\"font-family:Arial, sans-serif; line-height:1.5;\">"
+        ]
+        html_parts.append(
+            "<div style=\"margin-bottom:12px; padding:10px 12px; background:#f3f6f9; border:1px solid #d8e0e8; border-radius:8px;\">"
+            + f"<strong>Predicted proto descriptions:</strong> {len(self.predicted_proto_description_logs)}"
+            + "</div>"
+        )
+
+        if not self.predicted_proto_description_logs:
+            html_parts.append("<div style=\"margin-bottom:12px;\">(none)</div>")
+        else:
+            for item in self.predicted_proto_description_logs:
+                summary = "proto_node_id={} | token={} | description={} | chunk_count={}".format(
+                    item["proto_node_id"],
+                    item["token_text"],
+                    item["description"],
+                    item["chunk_count"],
+                )
+                html_parts.append(
+                    "<details style=\"margin:10px 0; border:1px solid #ddd; border-radius:8px; padding:8px 12px; background:#fafafa;\" {}>".format(
+                        "open" if open_details else ""
+                    )
+                    + "<summary style=\"cursor:pointer; font-weight:700;\">{}</summary>".format(escape(summary))
+                )
+                sample_predictions = item.get("sample_predictions", [])
+                if not sample_predictions:
+                    html_parts.append("<div style=\"margin:8px 0 0 8px;\">(none)</div>")
+                else:
+                    for sample in sample_predictions:
+                        sample_summary = "sample={} | chunk_node_id={} | predicted_description={} | predicted_label={} | score={:.4f}".format(
+                            sample["sample_index"],
+                            sample["chunk_node_id"],
+                            sample["predicted_description"],
+                            sample["predicted_label"],
+                            sample["prediction_score"],
+                        )
+                        html_parts.append(
+                            "<details style=\"margin:8px 0 8px 16px; border:1px solid #e1e5ea; border-radius:6px; padding:6px 10px; background:#fff;\" {}>".format(
+                                "open" if open_details else ""
+                            )
+                            + "<summary style=\"cursor:pointer; font-weight:600;\">{}</summary>".format(escape(sample_summary))
+                            + "<div style=\"margin-top:6px; font-size:12px; color:#666;\">matched_text</div>"
+                            + "<div style=\"white-space:pre-wrap; margin:2px 0 8px 0;\">{}</div>".format(escape(sample["matched_text"]))
+                            + "<div style=\"font-size:12px; color:#666;\">context_text</div>"
+                            + "<div style=\"white-space:pre-wrap;\">{}</div>".format(escape(sample["context_text"]))
+                            + "</details>"
+                        )
+                html_parts.append("</details>")
+
+        html_parts.append(
+            "<div style=\"margin:14px 0 8px 0; padding:10px 12px; background:#f8f8f8; border:1px solid #e0e0e0; border-radius:8px;\">"
+            + f"<strong>Merged-away proto nodes:</strong> {len(self.deleted_merged_proto_logs)}"
+            + "</div>"
+        )
+        if not self.deleted_merged_proto_logs:
+            html_parts.append("<div>(none)</div>")
+        else:
+            html_parts.append("<div style=\"margin-left:4px;\">")
+            for item in self.deleted_merged_proto_logs:
+                merged_text = "deleted_proto_node_id={} | kept_proto_node_id={} | token={} | description={} | deleted_chunk_count={}".format(
+                    item["deleted_proto_node_id"],
+                    item["kept_proto_node_id"],
+                    item["token_text"],
+                    item["description"],
+                    item["deleted_chunk_count"],
+                )
+                html_parts.append(
+                    "<div style=\"margin:6px 0; padding:6px 8px; border-left:4px solid #c44e52; background:#fff;\">{}</div>".format(
+                        escape(merged_text)
+                    )
+                )
+            html_parts.append("</div>")
+
+        html_parts.append("</div>")
+        return "".join(html_parts)
+
+    def show_proto_description_logs(self, as_html=True, open_details=False):
+        if not self.predicted_proto_description_logs and not self.deleted_merged_proto_logs:
+            empty_text = "No proto description logs are available."
+            if as_html:
+                try:
+                    from IPython.display import HTML
+                    return HTML("<div>{}</div>".format(escape(empty_text)))
+                except ImportError:
+                    return empty_text
+            return empty_text
+
+        if as_html:
+            try:
+                from IPython.display import HTML
+                return HTML(self._build_proto_description_logs_html(open_details=open_details))
+            except ImportError:
+                pass
+
+        return self._format_proto_description_logs_text()
+
 
     def print_wikidata_no_result_logs(self):
         print("Wikidata lookups with no usable results:")

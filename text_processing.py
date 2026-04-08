@@ -469,7 +469,7 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         start_char = token.idx
         end_char = token.idx + len(token.text)
 
-        important_tokens.append((normalize_text(token.text), start_char, end_char))
+        important_tokens.append((_normalize_token_text(token), start_char, end_char))
 
     if debug_mode:
         _debug_stage("final_output")
@@ -494,6 +494,16 @@ def normalize_text(text: str) -> str:
         words = words[1:]
 
     return ' '.join(process_word(word) for word in words)
+
+
+def _normalize_token_text(token) -> str:
+    token_text = token.text
+    token_numbers = set(token.morph.get("Number"))
+    if token.pos_ == "NOUN" and "Plur" in token_numbers:
+        lemma_text = str(getattr(token, "lemma_", "")).strip()
+        if lemma_text:
+            token_text = lemma_text
+    return normalize_text(token_text)
 
 def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
     doc = nlp(chunk)
@@ -535,7 +545,7 @@ def extract_important_tokens(chunk,nlp,debug_mode=False):
 
         start_char = token.idx
         end_char = token.idx + len(token.text)
-        spans.append((normalize_text(token.text),start_char, end_char))
+        spans.append((_normalize_token_text(token),start_char, end_char))
 
     return spans
 
