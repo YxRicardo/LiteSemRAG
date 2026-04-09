@@ -217,6 +217,7 @@ class TokenNode:
     has_prototype: bool = False
     proto_node_list: list = field(default_factory=list)
     embeds_buffer: list = field(default_factory=list)
+    span_occurrences: list = field(default_factory=list)
     idf: float = 0
     df: int = 0
     anomaly_section: list = field(default_factory=list)
@@ -231,6 +232,44 @@ class TokenNode:
 class TextEmbedding:
     embed: object
     chunk_node: ChunkNode
+    span_start: int | None = None
+    span_end: int | None = None
+    span_text: str | None = None
+
+    def to_span_occurrence(self):
+        span_text = self.span_text
+        if (
+            span_text is None
+            and self.span_start is not None
+            and self.span_end is not None
+        ):
+            span_text = self.chunk_node.chunk_text[self.span_start:self.span_end]
+        return SpanOccurrence(
+            chunk_node=self.chunk_node,
+            span_start=self.span_start,
+            span_end=self.span_end,
+            span_text=span_text,
+        )
+
+
+@dataclass
+class SpanOccurrence:
+    chunk_node: ChunkNode
+    span_start: int | None = None
+    span_end: int | None = None
+    span_text: str | None = None
+
+    def get_span_tuple(self):
+        if self.span_start is None or self.span_end is None:
+            return None
+        return self.span_start, self.span_end
+
+
+@dataclass
+class AnomalyTextEmbedding:
+    text_embedding: TextEmbedding
+    max_val: float
+    max_idx: int
 
 
 @dataclass
@@ -239,6 +278,7 @@ class Prototype:
     token_node: TokenNode
     description: str | None = None
     chunk_node_list: list = field(default_factory=list)
+    span_occurrences: list = field(default_factory=list)
     chunk_node_embed: list = field(default_factory=list)
     chunk_edge_weight: list = field(default_factory=list)
     embed: object = None
@@ -312,6 +352,12 @@ class ProtoGraphRAG:
         self.proto_description_model_name = "cross-encoder/nli-deberta-v3-large"
         self.proto_description_model = None
         self._load_proto_description_model()
+        self.proto_description_candidate_limit = 5
+        self.proto_description_batch_size = 32
+        self.proto_description_use_detailed_description = False
+        self.proto_description_require_detailed_description = True
+        self.proto_description_exact_match_text = True
+        self.proto_description_exact_match_first = False
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
         self.plot_embeds = plot_embeds
@@ -407,6 +453,27 @@ class ProtoGraphRAG:
         token_node.has_prototype = True
         return new_proto_node
 
+    def _make_text_embedding(self, embed, chunk_node, span_start=None, span_end=None):
+        span_text = None
+        if span_start is not None and span_end is not None:
+            span_text = chunk_node.chunk_text[span_start:span_end]
+        return TextEmbedding(
+            embed=embed,
+            chunk_node=chunk_node,
+            span_start=span_start,
+            span_end=span_end,
+            span_text=span_text,
+        )
+
+    def _append_token_occurrence(self, token_node, text_embedding):
+        token_node.span_occurrences.append(text_embedding.to_span_occurrence())
+
+    def _append_proto_occurrence(self, proto_node, text_embedding, edge_weight=None):
+        proto_node.chunk_node_list.append(text_embedding.chunk_node)
+        proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
+        if edge_weight is not None:
+            proto_node.chunk_edge_weight.append(edge_weight)
+
     def _get_initial_proto_description(self, token_node):
         return None
 
@@ -415,6 +482,7 @@ class ProtoGraphRAG:
         new_proto_node.chunk_node_embed = ([i.embed for i in token_node.embeds_buffer])
         new_proto_node.embed = average_embeds(new_proto_node.chunk_node_embed)
         new_proto_node.chunk_node_list = [k.chunk_node for k in token_node.embeds_buffer]
+        new_proto_node.span_occurrences = [k.to_span_occurrence() for k in token_node.embeds_buffer]
         new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
         new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
                                                                  self.anomaly_threshold_percentile)
@@ -437,8 +505,10 @@ class ProtoGraphRAG:
                     new_proto_node = self.create_proto_node(token_node)
                     new_proto_node.embed = torch.from_numpy(cluster_centers[clusters_label])
                     for idx in clusters[clusters_label]:
-                        new_proto_node.chunk_node_list.append(token_node.embeds_buffer[idx].chunk_node)
-                        new_proto_node.chunk_node_embed.append(token_node.embeds_buffer[idx].embed)
+                        text_embedding = token_node.embeds_buffer[idx]
+                        new_proto_node.chunk_node_list.append(text_embedding.chunk_node)
+                        new_proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
+                        new_proto_node.chunk_node_embed.append(text_embedding.embed)
                     new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
                     new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
                                                                              self.anomaly_threshold_percentile)
@@ -447,8 +517,15 @@ class ProtoGraphRAG:
                 anomaly_idx = clusters.get(-1)
                 if anomaly_idx is not None:
                     for idx in anomaly_idx:
-                        max_val, max_idx = inspect_prototypes(token_node.embeds_buffer[idx].embed, token_node.proto_node_list)
-                        token_node.anomaly_section.append((token_node.embeds_buffer[idx].embed, token_node.embeds_buffer[idx].chunk_node, max_val, max_idx))
+                        text_embedding = token_node.embeds_buffer[idx]
+                        max_val, max_idx = inspect_prototypes(text_embedding.embed, token_node.proto_node_list)
+                        token_node.anomaly_section.append(
+                            AnomalyTextEmbedding(
+                                text_embedding=text_embedding,
+                                max_val=max_val,
+                                max_idx=max_idx,
+                            )
+                        )
             else:
                 self.create_basic_proto_node(token_node)
         token_node.embeds_buffer.clear()
@@ -461,7 +538,13 @@ class ProtoGraphRAG:
     def solve_anomaly(self):
         for token_node in self.anomaly_waitlist:
             n_clusters, clusters, cluster_centers = hdbscan_cluster(
-                [(embed.cpu(), chunk_node) for embed, chunk_node, _, _ in token_node.anomaly_section],
+                [
+                    (
+                        item.text_embedding.embed.cpu(),
+                        item.text_embedding.chunk_node,
+                    )
+                    for item in token_node.anomaly_section
+                ],
                 min_cluster_size=10, percentile=self.anomaly_threshold_percentile)
             self._record_hdbscan_attempt(n_clusters)
             if n_clusters >= 1:
@@ -469,8 +552,10 @@ class ProtoGraphRAG:
                     new_proto_node = self.create_proto_node(token_node)
                     new_proto_node.embed = torch.from_numpy(cluster_centers[clusters_label]).to(self.device)
                     for idx in clusters[clusters_label]:
-                        new_proto_node.chunk_node_list.append(token_node.anomaly_section[idx][1])
-                        new_proto_node.chunk_node_embed.append(token_node.anomaly_section[idx][0])
+                        text_embedding = token_node.anomaly_section[idx].text_embedding
+                        new_proto_node.chunk_node_list.append(text_embedding.chunk_node)
+                        new_proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
+                        new_proto_node.chunk_node_embed.append(text_embedding.embed)
                     new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
                     new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
                                                                              self.anomaly_threshold_percentile)
@@ -481,9 +566,12 @@ class ProtoGraphRAG:
                 else:
                     token_node.anomaly_section = [token_node.anomaly_section[i] for i in anomaly_idx]
             else:
-                for embed, chunk_node, max_val, max_idx in token_node.anomaly_section:
-                    token_node.proto_node_list[max_idx].chunk_node_list.append(chunk_node)
-                    token_node.proto_node_list[max_idx].chunk_edge_weight.append(max_val)
+                for item in token_node.anomaly_section:
+                    self._append_proto_occurrence(
+                        token_node.proto_node_list[item.max_idx],
+                        item.text_embedding,
+                        edge_weight=item.max_val,
+                    )
         self.anomaly_waitlist = []
 
     # def assign_edge_weight(self, proto_node):
@@ -544,6 +632,18 @@ class ProtoGraphRAG:
             self.exhaustive_proto_description_evaluation = False
         if not hasattr(self, "proto_description_prompt_context_mode"):
             self.proto_description_prompt_context_mode = "sentence_neighbors"
+        if not hasattr(self, "proto_description_candidate_limit"):
+            self.proto_description_candidate_limit = 5
+        if not hasattr(self, "proto_description_batch_size"):
+            self.proto_description_batch_size = 32
+        if not hasattr(self, "proto_description_use_detailed_description"):
+            self.proto_description_use_detailed_description = False
+        if not hasattr(self, "proto_description_require_detailed_description"):
+            self.proto_description_require_detailed_description = True
+        if not hasattr(self, "proto_description_exact_match_text"):
+            self.proto_description_exact_match_text = True
+        if not hasattr(self, "proto_description_exact_match_first"):
+            self.proto_description_exact_match_first = False
         if not hasattr(self, "predicted_proto_description_logs"):
             self.predicted_proto_description_logs = []
         if not hasattr(self, "deleted_merged_proto_logs"):
@@ -553,7 +653,7 @@ class ProtoGraphRAG:
         if not hasattr(self, "_wikidata_no_result_keys"):
             self._wikidata_no_result_keys = set()
         if not hasattr(self, "proto_description_model_name"):
-            self.proto_description_model_name = "cross-encoder/nli-deberta-v3-base"
+            self.proto_description_model_name = "cross-encoder/nli-deberta-v3-large"
         if not hasattr(self, "proto_description_model"):
             self.proto_description_model = None
         for token_node in getattr(self, "token_nodes", []):
@@ -563,6 +663,41 @@ class ProtoGraphRAG:
                 token_node.descriptions = None
             if not hasattr(token_node, "wikidata_info_loaded"):
                 token_node.wikidata_info_loaded = None
+            if not hasattr(token_node, "span_occurrences"):
+                token_node.span_occurrences = []
+            for text_embedding in getattr(token_node, "embeds_buffer", []):
+                if not hasattr(text_embedding, "span_start"):
+                    text_embedding.span_start = None
+                if not hasattr(text_embedding, "span_end"):
+                    text_embedding.span_end = None
+                if not hasattr(text_embedding, "span_text"):
+                    text_embedding.span_text = None
+            upgraded_anomaly_section = []
+            for item in getattr(token_node, "anomaly_section", []):
+                if isinstance(item, AnomalyTextEmbedding):
+                    if not hasattr(item.text_embedding, "span_start"):
+                        item.text_embedding.span_start = None
+                    if not hasattr(item.text_embedding, "span_end"):
+                        item.text_embedding.span_end = None
+                    if not hasattr(item.text_embedding, "span_text"):
+                        item.text_embedding.span_text = None
+                    upgraded_anomaly_section.append(item)
+                    continue
+                if isinstance(item, tuple) and len(item) == 4:
+                    embed, chunk_node, max_val, max_idx = item
+                    upgraded_anomaly_section.append(
+                        AnomalyTextEmbedding(
+                            text_embedding=TextEmbedding(embed=embed, chunk_node=chunk_node),
+                            max_val=max_val,
+                            max_idx=max_idx,
+                        )
+                    )
+                    continue
+                upgraded_anomaly_section.append(item)
+            token_node.anomaly_section = upgraded_anomaly_section
+        for proto_node in getattr(self, "proto_nodes", []):
+            if not hasattr(proto_node, "span_occurrences"):
+                proto_node.span_occurrences = []
 
     def debug_extract_important_spans(
         self,
@@ -845,9 +980,12 @@ class ProtoGraphRAG:
             if not token_node.has_prototype:
                 self.create_basic_proto_node(token_node)
             elif len(token_node.anomaly_section) > 0:
-                for embed, chunk_node, max_val, max_idx in token_node.anomaly_section:
-                    token_node.proto_node_list[max_idx].chunk_node_list.append(chunk_node)
-                    token_node.proto_node_list[max_idx].chunk_edge_weight.append(max_val)
+                for item in token_node.anomaly_section:
+                    self._append_proto_occurrence(
+                        token_node.proto_node_list[item.max_idx],
+                        item.text_embedding,
+                        edge_weight=item.max_val,
+                    )
                 token_node.anomaly_section.clear()
             token_node.embeds_buffer.clear()
             progress_update(index)
@@ -867,6 +1005,18 @@ class ProtoGraphRAG:
         if len(unique_chunk_nodes) <= max_samples:
             return unique_chunk_nodes
         return random.sample(unique_chunk_nodes, max_samples)
+
+    def _sample_proto_span_occurrences(self, proto_node, max_samples=10):
+        span_occurrences = list(getattr(proto_node, "span_occurrences", []))
+        if span_occurrences:
+            if max_samples is None or max_samples <= 0:
+                return span_occurrences
+            if len(span_occurrences) <= max_samples:
+                return span_occurrences
+            return random.sample(span_occurrences, max_samples)
+
+        fallback_chunk_nodes = self._sample_proto_chunk_nodes(proto_node, max_samples=max_samples)
+        return [SpanOccurrence(chunk_node=chunk_node) for chunk_node in fallback_chunk_nodes]
 
     def _find_left_boundary_for_description(self, text, index):
         return max(
@@ -924,8 +1074,9 @@ class ProtoGraphRAG:
             match_start, match_end = match.span()
         return match_start, match_end
 
-    def _extract_sentence_context_for_description(self, chunk_text, token_text):
-        match_span = self._find_description_match_span(chunk_text, token_text)
+    def _extract_sentence_context_for_description(self, chunk_text, token_text, match_span=None):
+        if match_span is None:
+            match_span = self._find_description_match_span(chunk_text, token_text)
         if match_span is None:
             return None
         match_start, match_end = match_span
@@ -939,8 +1090,9 @@ class ProtoGraphRAG:
             context_end,
         )
 
-    def _extract_neighbor_sentence_context_for_description(self, chunk_text, token_text):
-        match_span = self._find_description_match_span(chunk_text, token_text)
+    def _extract_neighbor_sentence_context_for_description(self, chunk_text, token_text, match_span=None):
+        if match_span is None:
+            match_span = self._find_description_match_span(chunk_text, token_text)
         if match_span is None:
             return None
         match_start, match_end = match_span
@@ -962,8 +1114,9 @@ class ProtoGraphRAG:
             context_end,
         )
 
-    def _extract_full_context_for_description(self, chunk_text, token_text):
-        match_span = self._find_description_match_span(chunk_text, token_text)
+    def _extract_full_context_for_description(self, chunk_text, token_text, match_span=None):
+        if match_span is None:
+            match_span = self._find_description_match_span(chunk_text, token_text)
         if match_span is None:
             return None
         return self._build_description_context_from_bounds(
@@ -973,21 +1126,25 @@ class ProtoGraphRAG:
             len(chunk_text),
         )
 
-    def _extract_prompt_context_for_description(self, chunk_text, token_text):
+    def _extract_prompt_context_for_description(self, chunk_text, token_text, match_span=None):
         mode = self.proto_description_prompt_context_mode
         if mode == "sentence":
-            return self._extract_sentence_context_for_description(chunk_text, token_text)
+            return self._extract_sentence_context_for_description(chunk_text, token_text, match_span=match_span)
         if mode == "sentence_neighbors":
-            return self._extract_neighbor_sentence_context_for_description(chunk_text, token_text)
+            return self._extract_neighbor_sentence_context_for_description(chunk_text, token_text, match_span=match_span)
         if mode == "full_text":
-            return self._extract_full_context_for_description(chunk_text, token_text)
+            return self._extract_full_context_for_description(chunk_text, token_text, match_span=match_span)
         raise ValueError(
             f"Unsupported proto_description_prompt_context_mode={mode!r}. "
             "Use 'sentence', 'sentence_neighbors', or 'full_text'."
         )
 
-    def _build_proto_description_prompt(self, chunk_text, token_text):
-        context_info = self._extract_prompt_context_for_description(chunk_text, token_text)
+    def _build_proto_description_prompt(self, chunk_text, token_text, match_span=None):
+        context_info = self._extract_prompt_context_for_description(
+            chunk_text,
+            token_text,
+            match_span=match_span,
+        )
         if context_info is None:
             return None
 
@@ -1005,15 +1162,14 @@ class ProtoGraphRAG:
         token_text = proto_node.token_node.token_text
         candidate_bank = candidate_bank_cache.get(token_text)
         if candidate_bank is None:
-            candidate_limit = max(1, len(proto_node.token_node.proto_node_list) + 1)
             try:
                 candidates_df, definition_column = load_wikidata_definition_candidates(
                     token_text,
-                    use_detailed_description=False,
-                    exact_match_text=False,
-                    exact_match_first=True,
-                    limit=candidate_limit,
-                    require_detailed_description=True,
+                    use_detailed_description=self.proto_description_use_detailed_description,
+                    exact_match_text=self.proto_description_exact_match_text,
+                    exact_match_first=self.proto_description_exact_match_first,
+                    limit=self.proto_description_candidate_limit,
+                    require_detailed_description=self.proto_description_require_detailed_description,
                 )
             except ValueError:
                 candidate_bank_cache[token_text] = []
@@ -1034,17 +1190,26 @@ class ProtoGraphRAG:
             )
             return None
 
-        predicted_descriptions = []
+        candidate_score_map = {}
         sample_prediction_logs = []
         max_samples = None if self.exhaustive_proto_description_evaluation else 10
-        sample_chunk_nodes = self._sample_proto_chunk_nodes(proto_node, max_samples=max_samples)
-        for sample_index, chunk_node in enumerate(sample_chunk_nodes, start=1):
-            prompt_info = self._build_proto_description_prompt(chunk_node.chunk_text, token_text)
+        sample_span_occurrences = self._sample_proto_span_occurrences(proto_node, max_samples=max_samples)
+        for sample_index, span_occurrence in enumerate(sample_span_occurrences, start=1):
+            chunk_node = span_occurrence.chunk_node
+            prompt_info = self._build_proto_description_prompt(
+                chunk_node.chunk_text,
+                token_text,
+                match_span=span_occurrence.get_span_tuple(),
+            )
             if prompt_info is None:
                 continue
 
             pairs = [(prompt_info["prompt_text"], candidate["hypothesis"]) for candidate in candidate_bank]
-            raw_scores = model.predict(pairs, batch_size=min(32, len(pairs)), show_progress_bar=False)
+            raw_scores = model.predict(
+                pairs,
+                batch_size=min(self.proto_description_batch_size, len(pairs)),
+                show_progress_bar=False,
+            )
             scores = extract_cross_encoder_scores(raw_scores, model)
             ranked_candidates = sorted(
                 [
@@ -1057,13 +1222,26 @@ class ProtoGraphRAG:
                 key=lambda item: item["score"],
                 reverse=True,
             )
+            for ranked_candidate in ranked_candidates:
+                entity_id = ranked_candidate["entity_id"]
+                state = candidate_score_map.setdefault(
+                    entity_id,
+                    {
+                        "candidate": ranked_candidate,
+                        "score_sum": 0.0,
+                        "score_count": 0,
+                    },
+                )
+                state["score_sum"] += ranked_candidate["score"]
+                state["score_count"] += 1
             if ranked_candidates:
                 top_candidate = ranked_candidates[0]
-                predicted_descriptions.append(top_candidate["description"])
                 sample_prediction_logs.append(
                     {
                         "sample_index": sample_index,
                         "chunk_node_id": chunk_node.chunk_node_id,
+                        "span_start": span_occurrence.span_start,
+                        "span_end": span_occurrence.span_end,
                         "context_text": prompt_info["context_text"],
                         "matched_text": prompt_info["matched_text"],
                         "predicted_entity_id": top_candidate["entity_id"],
@@ -1074,10 +1252,31 @@ class ProtoGraphRAG:
                     }
                 )
 
-        if not predicted_descriptions:
+        if not sample_prediction_logs or not candidate_score_map:
             return None
+        aggregated_candidates = sorted(
+            [
+                {
+                    **state["candidate"],
+                    "score_sum": float(state["score_sum"]),
+                    "score_count": int(state["score_count"]),
+                    "score_mean": float(state["score_sum"] / state["score_count"]),
+                }
+                for state in candidate_score_map.values()
+                if state["score_count"] > 0
+            ],
+            key=lambda item: (item["score_mean"], item["score_sum"]),
+            reverse=True,
+        )
+        if not aggregated_candidates:
+            return None
+        top_aggregated_candidate = aggregated_candidates[0]
         return {
-            "description": Counter(predicted_descriptions).most_common(1)[0][0],
+            "description": top_aggregated_candidate["description"],
+            "predicted_entity_id": top_aggregated_candidate["entity_id"],
+            "predicted_label": top_aggregated_candidate["label"],
+            "predicted_definition": top_aggregated_candidate["definition"],
+            "prediction_score_mean": top_aggregated_candidate["score_mean"],
             "sample_predictions": sample_prediction_logs,
         }
 
@@ -1085,16 +1284,19 @@ class ProtoGraphRAG:
         primary_proto = proto_group[0]
         merged_chunk_nodes = []
         merged_chunk_edge_weights = []
+        merged_span_occurrences = []
         merged_embeds = []
 
         for proto_node in proto_group:
             merged_chunk_nodes.extend(proto_node.chunk_node_list)
             merged_chunk_edge_weights.extend(proto_node.chunk_edge_weight)
+            merged_span_occurrences.extend(getattr(proto_node, "span_occurrences", []))
             if proto_node.embed is not None:
                 merged_embeds.append(proto_node.embed)
 
         primary_proto.chunk_node_list = merged_chunk_nodes
         primary_proto.chunk_edge_weight = merged_chunk_edge_weights
+        primary_proto.span_occurrences = merged_span_occurrences
         primary_proto.chunk_node_embed = []
         if merged_embeds:
             primary_proto.embed = torch.stack(merged_embeds).mean(dim=0)
@@ -1151,6 +1353,10 @@ class ProtoGraphRAG:
                                 "proto_node_id": proto_node.proto_node_id,
                                 "token_text": proto_node.token_node.token_text,
                                 "description": predicted_description,
+                                "predicted_entity_id": prediction_result.get("predicted_entity_id"),
+                                "predicted_label": prediction_result.get("predicted_label"),
+                                "predicted_definition": prediction_result.get("predicted_definition"),
+                                "prediction_score_mean": prediction_result.get("prediction_score_mean"),
                                 "chunk_count": len(proto_node.chunk_node_list),
                                 "sample_predictions": prediction_result["sample_predictions"],
                             }
@@ -1428,21 +1634,37 @@ class ProtoGraphRAG:
             proto_node.get_BM25(self.chunk_avg_len)
 
     def process_embeds(self, new_chunk_node, phrase_embs, token_embs):
-        for text, embed in phrase_embs + token_embs:
+        for text, embed, span_start, span_end in phrase_embs + token_embs:
+            text_embedding = self._make_text_embedding(
+                embed,
+                new_chunk_node,
+                span_start=span_start,
+                span_end=span_end,
+            )
             token_node = self.query_token_node(text)
             if token_node is None:
                 token_node = self.create_token_node(text)
-                token_node.embeds_buffer.append(TextEmbedding(embed, new_chunk_node))
+                token_node.embeds_buffer.append(text_embedding)
             else:
                 if token_node.has_prototype:
                     max_val, max_idx = inspect_prototypes(embed, token_node.proto_node_list)
                     if max_val >= token_node.proto_node_list[max_idx].anomaly_threshold:
-                        token_node.proto_node_list[max_idx].chunk_node_list.append(new_chunk_node)
-                        token_node.proto_node_list[max_idx].chunk_edge_weight.append(max_val)
+                        self._append_proto_occurrence(
+                            token_node.proto_node_list[max_idx],
+                            text_embedding,
+                            edge_weight=max_val,
+                        )
                     else:
-                        token_node.anomaly_section.append((embed, new_chunk_node, max_val, max_idx))
+                        token_node.anomaly_section.append(
+                            AnomalyTextEmbedding(
+                                text_embedding=text_embedding,
+                                max_val=max_val,
+                                max_idx=max_idx,
+                            )
+                        )
                 else:
-                    token_node.embeds_buffer.append(TextEmbedding(embed, new_chunk_node))
+                    token_node.embeds_buffer.append(text_embedding)
+            self._append_token_occurrence(token_node, text_embedding)
             if len(token_node.embeds_buffer) == self.buffer_size:
                 self.build_proto_waitlist.append(token_node)
 
@@ -1598,6 +1820,10 @@ class ProtoGraphRAG:
                 if id(chunk_node) in valid_chunk_ids
             ]
             proto_node.chunk_node_list = [proto_node.chunk_node_list[i] for i in keep_indices]
+            proto_node.span_occurrences = [
+                proto_node.span_occurrences[i]
+                for i in keep_indices
+            ] if getattr(proto_node, "span_occurrences", None) else []
             proto_node.chunk_edge_weight = [proto_node.chunk_edge_weight[i] for i in keep_indices]
             if proto_node.chunk_node_list:
                 valid_proto_nodes.append(proto_node)
@@ -1620,7 +1846,11 @@ class ProtoGraphRAG:
             token_node.has_prototype = len(token_node.proto_node_list) > 0
             token_node.anomaly_section = [
                 item for item in token_node.anomaly_section
-                if id(item[1]) in valid_chunk_ids
+                if id(item.text_embedding.chunk_node) in valid_chunk_ids
+            ]
+            token_node.span_occurrences = [
+                item for item in token_node.span_occurrences
+                if id(item.chunk_node) in valid_chunk_ids
             ]
             if token_node.has_prototype or token_node.embeds_buffer or token_node.anomaly_section:
                 valid_token_nodes.append(token_node)
@@ -2123,6 +2353,11 @@ class ProtoGraphRAG:
                     index_to_delete.append(index)
             index_to_delete = set(index_to_delete)
             node.chunk_node_list = [x for i, x in enumerate(node.chunk_node_list) if i not in index_to_delete]
+            if getattr(node, "span_occurrences", None):
+                node.span_occurrences = [
+                    x for i, x in enumerate(node.span_occurrences)
+                    if i not in index_to_delete
+                ]
             node.chunk_edge_weight = [x for i, x in enumerate(node.chunk_edge_weight) if i not in index_to_delete]
         self.chunk_nodes.remove(chunk_node_to_delete)
 
@@ -2336,6 +2571,13 @@ class ProtoGraphRAG:
             proto_node.token_node = self.token_nodes[proto_node.token_node]
             if not hasattr(proto_node, "description"):
                 proto_node.description = self._get_initial_proto_description(proto_node.token_node)
+            if not hasattr(proto_node, "span_occurrences") or proto_node.span_occurrences is None:
+                proto_node.span_occurrences = []
+            if not proto_node.span_occurrences and proto_node.chunk_node_list:
+                proto_node.span_occurrences = [
+                    SpanOccurrence(chunk_node=chunk_node)
+                    for chunk_node in proto_node.chunk_node_list
+                ]
         for token_node in self.token_nodes:
             token_node.proto_node_list = [self.proto_nodes[idx] for idx in token_node.proto_node_list]
 
@@ -2441,7 +2683,7 @@ class ProtoGraphRAG:
                     )
 
                     phrases, tokens = extract_important_spans(
-                        clean_text(chunk["text"]),
+                        chunk["text"],
                         self.nlp,
                         min_tokens=2,
                         remove_duplicate=self.remove_duplicate_token,
