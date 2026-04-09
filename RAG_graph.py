@@ -270,7 +270,8 @@ class ProtoGraphRAG:
     def __init__(self, text_embed_dim, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
                  anomaly_section_size=50,query_token_percentile=0.8,
                  retrieve_top_k=5, chunk_size=300, remove_duplicate_token=True, device="cuda",
-                 discard_no_word=False, plot_embeds=False, exhaustive_proto_description_evaluation=False):
+                 discard_no_word=False, plot_embeds=False, exhaustive_proto_description_evaluation=False,
+                 proto_description_prompt_context_mode="sentence_neighbors"):
         self.text_embed_dim = text_embed_dim
         self.df_ratio = df_ratio
         self.doc_nodes = []
@@ -315,6 +316,7 @@ class ProtoGraphRAG:
         self.discard_no_word = discard_no_word
         self.plot_embeds = plot_embeds
         self.exhaustive_proto_description_evaluation = exhaustive_proto_description_evaluation
+        self.proto_description_prompt_context_mode = proto_description_prompt_context_mode
         self.predicted_proto_description_logs = []
         self.deleted_merged_proto_logs = []
         self.wikidata_no_result_logs = []
@@ -540,6 +542,8 @@ class ProtoGraphRAG:
             self.plot_embeds = False
         if not hasattr(self, "exhaustive_proto_description_evaluation"):
             self.exhaustive_proto_description_evaluation = False
+        if not hasattr(self, "proto_description_prompt_context_mode"):
+            self.proto_description_prompt_context_mode = "sentence_neighbors"
         if not hasattr(self, "predicted_proto_description_logs"):
             self.predicted_proto_description_logs = []
         if not hasattr(self, "deleted_merged_proto_logs"):
@@ -864,36 +868,24 @@ class ProtoGraphRAG:
             return unique_chunk_nodes
         return random.sample(unique_chunk_nodes, max_samples)
 
-    def _extract_sentence_context_for_description(self, chunk_text, token_text):
-        normalized_token = token_text.strip()
-        if not normalized_token:
-            return None
-
-        pattern = re.compile(rf"(?<!\w){re.escape(normalized_token)}(?!\w)", flags=re.IGNORECASE)
-        match = pattern.search(chunk_text)
-        if match is None:
-            lowered_text = chunk_text.casefold()
-            lowered_token = normalized_token.casefold()
-            match_start = lowered_text.find(lowered_token)
-            if match_start < 0:
-                return None
-            match_end = match_start + len(lowered_token)
-        else:
-            match_start, match_end = match.span()
-        left_boundary = max(
-            chunk_text.rfind(".", 0, match_start),
-            chunk_text.rfind("!", 0, match_start),
-            chunk_text.rfind("?", 0, match_start),
+    def _find_left_boundary_for_description(self, text, index):
+        return max(
+            text.rfind(".", 0, index),
+            text.rfind("!", 0, index),
+            text.rfind("?", 0, index),
         )
+
+    def _find_right_boundary_for_description(self, text, index):
         right_candidates = [
-            chunk_text.find(".", match_end),
-            chunk_text.find("!", match_end),
-            chunk_text.find("?", match_end),
+            text.find(".", index),
+            text.find("!", index),
+            text.find("?", index),
         ]
         right_candidates = [idx for idx in right_candidates if idx != -1]
+        return len(text) if not right_candidates else min(right_candidates) + 1
 
-        context_start = 0 if left_boundary == -1 else left_boundary + 1
-        context_end = len(chunk_text) if not right_candidates else min(right_candidates) + 1
+    def _build_description_context_from_bounds(self, chunk_text, match_span, context_start, context_end):
+        match_start, match_end = match_span
         context_raw = chunk_text[context_start:context_end]
 
         if not context_raw.strip():
@@ -914,15 +906,95 @@ class ProtoGraphRAG:
             "local_span": (local_start, local_end),
         }
 
+    def _find_description_match_span(self, chunk_text, token_text):
+        normalized_token = token_text.strip()
+        if not normalized_token:
+            return None
+
+        pattern = re.compile(rf"(?<!\w){re.escape(normalized_token)}(?!\w)", flags=re.IGNORECASE)
+        match = pattern.search(chunk_text)
+        if match is None:
+            lowered_text = chunk_text.casefold()
+            lowered_token = normalized_token.casefold()
+            match_start = lowered_text.find(lowered_token)
+            if match_start < 0:
+                return None
+            match_end = match_start + len(lowered_token)
+        else:
+            match_start, match_end = match.span()
+        return match_start, match_end
+
+    def _extract_sentence_context_for_description(self, chunk_text, token_text):
+        match_span = self._find_description_match_span(chunk_text, token_text)
+        if match_span is None:
+            return None
+        match_start, match_end = match_span
+        left_boundary = self._find_left_boundary_for_description(chunk_text, match_start)
+        context_start = 0 if left_boundary == -1 else left_boundary + 1
+        context_end = self._find_right_boundary_for_description(chunk_text, match_end)
+        return self._build_description_context_from_bounds(
+            chunk_text,
+            match_span,
+            context_start,
+            context_end,
+        )
+
+    def _extract_neighbor_sentence_context_for_description(self, chunk_text, token_text):
+        match_span = self._find_description_match_span(chunk_text, token_text)
+        if match_span is None:
+            return None
+        match_start, match_end = match_span
+        left_boundary = self._find_left_boundary_for_description(chunk_text, match_start)
+        context_start = 0 if left_boundary == -1 else left_boundary + 1
+        context_end = self._find_right_boundary_for_description(chunk_text, match_end)
+
+        if context_start > 0:
+            previous_boundary = self._find_left_boundary_for_description(chunk_text, max(0, context_start - 1))
+            context_start = 0 if previous_boundary == -1 else previous_boundary + 1
+
+        if context_end < len(chunk_text):
+            context_end = self._find_right_boundary_for_description(chunk_text, context_end)
+
+        return self._build_description_context_from_bounds(
+            chunk_text,
+            match_span,
+            context_start,
+            context_end,
+        )
+
+    def _extract_full_context_for_description(self, chunk_text, token_text):
+        match_span = self._find_description_match_span(chunk_text, token_text)
+        if match_span is None:
+            return None
+        return self._build_description_context_from_bounds(
+            chunk_text,
+            match_span,
+            0,
+            len(chunk_text),
+        )
+
+    def _extract_prompt_context_for_description(self, chunk_text, token_text):
+        mode = self.proto_description_prompt_context_mode
+        if mode == "sentence":
+            return self._extract_sentence_context_for_description(chunk_text, token_text)
+        if mode == "sentence_neighbors":
+            return self._extract_neighbor_sentence_context_for_description(chunk_text, token_text)
+        if mode == "full_text":
+            return self._extract_full_context_for_description(chunk_text, token_text)
+        raise ValueError(
+            f"Unsupported proto_description_prompt_context_mode={mode!r}. "
+            "Use 'sentence', 'sentence_neighbors', or 'full_text'."
+        )
+
     def _build_proto_description_prompt(self, chunk_text, token_text):
-        context_info = self._extract_sentence_context_for_description(chunk_text, token_text)
+        context_info = self._extract_prompt_context_for_description(chunk_text, token_text)
         if context_info is None:
             return None
 
         prompt_text = (
-            f"Sentence: {context_info['context_text']}\n"
+            f"Context: {context_info['context_text']}\n"
             f"Target word: {token_text.strip()}\n\n"
-            f'Question: What does "{token_text.strip()}" mean in this sentence?'
+            f'Question: What does "{token_text.strip()}" mean in this context?'
         )
         return {
             **context_info,

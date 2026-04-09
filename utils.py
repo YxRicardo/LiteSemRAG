@@ -127,6 +127,12 @@ def _series_casefold_equals(series, target: str):
     return series.map(lambda value: ("" if value is None else str(value)).casefold() == target_casefold)
 
 
+def _series_startswith_lowercase(series):
+    return series.map(
+        lambda value: (str(value)[0].islower() if value is not None and str(value) else False)
+    )
+
+
 def _series_non_empty_mask(series):
     return series.map(lambda value: ("" if value is None else str(value)).strip() != "")
 
@@ -364,10 +370,18 @@ def search_wikidata(
 
     if exact_match_first and not df.empty:
         exact_match_mask = _series_casefold_equals(df["match_text"], normalized_term)
-        df = df.assign(_exact_match_rank=exact_match_mask.astype(int))
+        lowercase_initial_mask = _series_startswith_lowercase(df["match_text"])
+        df = df.assign(
+            _exact_match_rank=exact_match_mask.astype(int),
+            _lowercase_initial_rank=lowercase_initial_mask.astype(int),
+        )
         df = (
-            df.sort_values("_exact_match_rank", ascending=False, kind="stable")
-            .drop(columns=["_exact_match_rank"])
+            df.sort_values(
+                ["_exact_match_rank", "_lowercase_initial_rank"],
+                ascending=[False, False],
+                kind="stable",
+            )
+            .drop(columns=["_exact_match_rank", "_lowercase_initial_rank"])
             .reset_index(drop=True)
         )
 
