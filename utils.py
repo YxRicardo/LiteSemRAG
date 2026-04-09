@@ -66,6 +66,18 @@ ENGLISH_NUMBER_WORDS = {
     "billionth", "trillionth",
 }
 
+NON_WIKIPEDIA_SITELINK_SITES = {
+    "commonswiki",
+    "foundationwiki",
+    "incubatorwiki",
+    "mediawikiwiki",
+    "metawiki",
+    "outreachwiki",
+    "specieswiki",
+    "wikidatawiki",
+    "wikimaniawiki",
+}
+
 
 def _import_wikidata_deps():
     import pandas as pd
@@ -158,6 +170,8 @@ def extract_best_wikipedia_title(entity, language="en"):
 
     for site_name, site_info in sitelinks.items():
         if not site_name.endswith("wiki") or not isinstance(site_info, dict):
+            continue
+        if site_name in NON_WIKIPEDIA_SITELINK_SITES:
             continue
         title = site_info.get("title", "")
         if title:
@@ -291,6 +305,7 @@ def search_wikidata(
     language="en",
     limit=10,
     exact_match_text=False,
+    exact_match_first=False,
     include_detailed_description=False,
     drop_missing_detailed_description=False,
     detailed_description_sentences=3,
@@ -347,6 +362,15 @@ def search_wikidata(
     if filter_name and not df.empty:
         df = df[_series_exclude_name_descriptions(df["description"])].reset_index(drop=True)
 
+    if exact_match_first and not df.empty:
+        exact_match_mask = _series_casefold_equals(df["match_text"], normalized_term)
+        df = df.assign(_exact_match_rank=exact_match_mask.astype(int))
+        df = (
+            df.sort_values("_exact_match_rank", ascending=False, kind="stable")
+            .drop(columns=["_exact_match_rank"])
+            .reset_index(drop=True)
+        )
+
     if exact_match_text and not df.empty:
         df = df[_series_casefold_equals(df["match_text"], normalized_term)].reset_index(drop=True)
 
@@ -375,23 +399,27 @@ def load_wikidata_definition_candidates(
     query_text: str,
     use_detailed_description: bool = True,
     exact_match_text: bool = False,
+    exact_match_first: bool = False,
     limit: int = 5,
     filter_name: bool = True,
+    require_detailed_description: bool = False,
 ):
     _, pd = _import_wikidata_deps()
 
+    include_detailed_description = use_detailed_description or require_detailed_description
     candidates_df = search_wikidata(
         query_text,
         limit=limit,
         exact_match_text=exact_match_text,
-        include_detailed_description=use_detailed_description,
+        exact_match_first=exact_match_first,
+        include_detailed_description=include_detailed_description,
         detailed_description_sentences=3,
-        drop_missing_detailed_description=use_detailed_description,
+        drop_missing_detailed_description=include_detailed_description,
         filter_name=filter_name,
     )
 
     if candidates_df.empty:
-        if use_detailed_description:
+        if include_detailed_description:
             raise ValueError(
                 f"search_wikidata returned no detailed_description candidates for span={query_text!r}."
             )

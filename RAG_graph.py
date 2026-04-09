@@ -308,7 +308,7 @@ class ProtoGraphRAG:
         self.json_path = "index_documents.json"
         self.reranker = None
         self.load_reranker()
-        self.proto_description_model_name = "cross-encoder/nli-deberta-v3-base"
+        self.proto_description_model_name = "cross-encoder/nli-deberta-v3-large"
         self.proto_description_model = None
         self._load_proto_description_model()
         self.chunk_avg_len = None
@@ -319,6 +319,8 @@ class ProtoGraphRAG:
         self.deleted_merged_proto_logs = []
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
+        self.hdbscan_attempt_count = 0
+        self.hdbscan_success_count = 0
 
     def load_reranker(self):
         #self.reranker = LocalJinaReranker()
@@ -365,6 +367,15 @@ class ProtoGraphRAG:
                 "reason": str(reason),
             }
         )
+
+    def _reset_hdbscan_stats(self):
+        self.hdbscan_attempt_count = 0
+        self.hdbscan_success_count = 0
+
+    def _record_hdbscan_attempt(self, n_clusters):
+        self.hdbscan_attempt_count += 1
+        if n_clusters >= 1:
+            self.hdbscan_success_count += 1
 
     def create_doc_node(self, doc_name):
         new_doc_node = DocumentNode(doc_name, self._new_node_id("doc"))
@@ -416,6 +427,7 @@ class ProtoGraphRAG:
             n_clusters, clusters, cluster_centers = hdbscan_cluster([(k.embed.cpu(),k.chunk_node) for k in token_node.embeds_buffer],
                                                                     min_cluster_size=int(len(token_node.embeds_buffer)/20),
                                                                     percentile=self.anomaly_threshold_percentile, merge_chunks=False)
+            self._record_hdbscan_attempt(n_clusters)
             if n_clusters >= 1:
                 if self.plot_embeds:
                     self.plot_embed_distribution(token_node, clusters)
@@ -449,6 +461,7 @@ class ProtoGraphRAG:
             n_clusters, clusters, cluster_centers = hdbscan_cluster(
                 [(embed.cpu(), chunk_node) for embed, chunk_node, _, _ in token_node.anomaly_section],
                 min_cluster_size=10, percentile=self.anomaly_threshold_percentile)
+            self._record_hdbscan_attempt(n_clusters)
             if n_clusters >= 1:
                 for clusters_label in range(n_clusters):
                     new_proto_node = self.create_proto_node(token_node)
@@ -920,12 +933,15 @@ class ProtoGraphRAG:
         token_text = proto_node.token_node.token_text
         candidate_bank = candidate_bank_cache.get(token_text)
         if candidate_bank is None:
+            candidate_limit = max(1, len(proto_node.token_node.proto_node_list) + 1)
             try:
                 candidates_df, definition_column = load_wikidata_definition_candidates(
                     token_text,
                     use_detailed_description=False,
-                    exact_match_text=True,
-                    limit=5,
+                    exact_match_text=False,
+                    exact_match_first=True,
+                    limit=candidate_limit,
+                    require_detailed_description=True,
                 )
             except ValueError:
                 candidate_bank_cache[token_text] = []
@@ -2253,6 +2269,7 @@ class ProtoGraphRAG:
 
     def index_json(self, chunk_list, batch_size=8, queue_size=4):
         self.start_time = time.perf_counter()
+        self._reset_hdbscan_stats()
         total_chunks = len(chunk_list)
         doc_node_map = {}
 
@@ -2523,6 +2540,11 @@ class ProtoGraphRAG:
 
         self.solve_proto()
         self.solve_anomaly()
+        print(
+            "HDBSCAN attempts: "
+            f"{self.hdbscan_attempt_count}, "
+            f"successes (n_clusters >= 1): {self.hdbscan_success_count}"
+        )
 
 class ListBatchExtractor:
     def __init__(self, list_of_lists, k, mode="round", exclude_list=None):
@@ -2644,5 +2666,3 @@ class ListBatchExtractor:
         self.seq_outer_idx = 0
         self.seq_inner_idx = 0
         self.finished = False
-
-
