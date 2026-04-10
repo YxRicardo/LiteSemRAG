@@ -280,6 +280,9 @@ class Prototype:
     chunk_node_list: list = field(default_factory=list)
     span_occurrences: list = field(default_factory=list)
     chunk_node_embed: list = field(default_factory=list)
+    retained_text_embeddings: list = field(default_factory=list)
+    retained_text_embedding_source_count: int = 0
+    pending_embed_rebuild: bool = False
     chunk_edge_weight: list = field(default_factory=list)
     embed: object = None
     anomaly_threshold: float | None = None
@@ -310,7 +313,7 @@ class ProtoGraphRAG:
     def __init__(self, text_embed_dim, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
                  anomaly_section_size=50,query_token_percentile=0.8,
                  retrieve_top_k=5, chunk_size=300, remove_duplicate_token=True, device="cuda",
-                 discard_no_word=False, plot_embeds=False, exhaustive_proto_description_evaluation=False,
+                 discard_no_word=False, plot_embeds=False,
                  proto_description_prompt_context_mode="sentence_neighbors"):
         self.text_embed_dim = text_embed_dim
         self.df_ratio = df_ratio
@@ -358,13 +361,15 @@ class ProtoGraphRAG:
         self.proto_description_require_detailed_description = True
         self.proto_description_exact_match_text = True
         self.proto_description_exact_match_first = False
+        self.proto_retained_embed_limit = 10
+        self.proto_description_log_path = "proto_description_logs.txt"
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
         self.plot_embeds = plot_embeds
-        self.exhaustive_proto_description_evaluation = exhaustive_proto_description_evaluation
         self.proto_description_prompt_context_mode = proto_description_prompt_context_mode
         self.predicted_proto_description_logs = []
         self.deleted_merged_proto_logs = []
+        self.proto_description_operation_logs = []
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
         self.hdbscan_attempt_count = 0
@@ -400,8 +405,17 @@ class ProtoGraphRAG:
     def _reset_proto_description_logs(self):
         self.predicted_proto_description_logs = []
         self.deleted_merged_proto_logs = []
+        self.proto_description_operation_logs = []
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
+
+    def _log_proto_description_operation(self, event_type, **payload):
+        self.proto_description_operation_logs.append(
+            {
+                "event_type": event_type,
+                **payload,
+            }
+        )
 
     def _log_wikidata_no_result(self, term, stage, reason):
         log_key = (str(term), str(stage), str(reason))
@@ -468,9 +482,74 @@ class ProtoGraphRAG:
     def _append_token_occurrence(self, token_node, text_embedding):
         token_node.span_occurrences.append(text_embedding.to_span_occurrence())
 
+    def _clone_text_embedding(self, text_embedding):
+        return TextEmbedding(
+            embed=text_embedding.embed.clone() if torch.is_tensor(text_embedding.embed) else text_embedding.embed,
+            chunk_node=text_embedding.chunk_node,
+            span_start=text_embedding.span_start,
+            span_end=text_embedding.span_end,
+            span_text=text_embedding.span_text,
+        )
+
+    def _sample_text_embeddings(self, text_embeddings, max_samples=None):
+        text_embeddings = list(text_embeddings)
+        if max_samples is not None and max_samples > 0 and len(text_embeddings) > max_samples:
+            text_embeddings = random.sample(text_embeddings, max_samples)
+        return [self._clone_text_embedding(text_embedding) for text_embedding in text_embeddings]
+
+    def _initialize_proto_retained_text_embeddings(self, proto_node, text_embeddings):
+        text_embeddings = list(text_embeddings)
+        proto_node.retained_text_embeddings = self._sample_text_embeddings(
+            text_embeddings,
+            max_samples=self.proto_retained_embed_limit,
+        )
+        proto_node.retained_text_embedding_source_count = len(text_embeddings)
+
+    def _retain_text_embedding_for_proto(self, proto_node, text_embedding):
+        if text_embedding is None or text_embedding.embed is None:
+            return
+        if not hasattr(proto_node, "retained_text_embeddings") or proto_node.retained_text_embeddings is None:
+            proto_node.retained_text_embeddings = []
+        if not hasattr(proto_node, "retained_text_embedding_source_count"):
+            proto_node.retained_text_embedding_source_count = 0
+
+        proto_node.retained_text_embedding_source_count += 1
+        cloned_text_embedding = self._clone_text_embedding(text_embedding)
+        if len(proto_node.retained_text_embeddings) < self.proto_retained_embed_limit:
+            proto_node.retained_text_embeddings.append(cloned_text_embedding)
+            return
+
+        replace_index = random.randint(0, proto_node.retained_text_embedding_source_count - 1)
+        if replace_index < self.proto_retained_embed_limit:
+            proto_node.retained_text_embeddings[replace_index] = cloned_text_embedding
+
     def _append_proto_occurrence(self, proto_node, text_embedding, edge_weight=None):
         proto_node.chunk_node_list.append(text_embedding.chunk_node)
         proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
+        self._retain_text_embedding_for_proto(proto_node, text_embedding)
+        if edge_weight is not None:
+            proto_node.chunk_edge_weight.append(edge_weight)
+
+    def _append_span_occurrence_to_proto(
+        self,
+        proto_node,
+        span_occurrence,
+        edge_weight=None,
+        retained_text_embedding=None,
+    ):
+        proto_node.chunk_node_list.append(span_occurrence.chunk_node)
+        proto_node.span_occurrences.append(
+            SpanOccurrence(
+                chunk_node=span_occurrence.chunk_node,
+                span_start=span_occurrence.span_start,
+                span_end=span_occurrence.span_end,
+                span_text=span_occurrence.span_text,
+            )
+        )
+        if retained_text_embedding is not None:
+            self._retain_text_embedding_for_proto(proto_node, retained_text_embedding)
+            if getattr(proto_node, "pending_embed_rebuild", False):
+                proto_node.chunk_node_embed.append(retained_text_embedding.embed)
         if edge_weight is not None:
             proto_node.chunk_edge_weight.append(edge_weight)
 
@@ -483,6 +562,7 @@ class ProtoGraphRAG:
         new_proto_node.embed = average_embeds(new_proto_node.chunk_node_embed)
         new_proto_node.chunk_node_list = [k.chunk_node for k in token_node.embeds_buffer]
         new_proto_node.span_occurrences = [k.to_span_occurrence() for k in token_node.embeds_buffer]
+        self._initialize_proto_retained_text_embeddings(new_proto_node, token_node.embeds_buffer)
         new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
         new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
                                                                  self.anomaly_threshold_percentile)
@@ -504,11 +584,14 @@ class ProtoGraphRAG:
                 for clusters_label in range(n_clusters):
                     new_proto_node = self.create_proto_node(token_node)
                     new_proto_node.embed = torch.from_numpy(cluster_centers[clusters_label])
+                    cluster_text_embeddings = []
                     for idx in clusters[clusters_label]:
                         text_embedding = token_node.embeds_buffer[idx]
                         new_proto_node.chunk_node_list.append(text_embedding.chunk_node)
                         new_proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
                         new_proto_node.chunk_node_embed.append(text_embedding.embed)
+                        cluster_text_embeddings.append(text_embedding)
+                    self._initialize_proto_retained_text_embeddings(new_proto_node, cluster_text_embeddings)
                     new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
                     new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
                                                                              self.anomaly_threshold_percentile)
@@ -551,11 +634,14 @@ class ProtoGraphRAG:
                 for clusters_label in range(n_clusters):
                     new_proto_node = self.create_proto_node(token_node)
                     new_proto_node.embed = torch.from_numpy(cluster_centers[clusters_label]).to(self.device)
+                    cluster_text_embeddings = []
                     for idx in clusters[clusters_label]:
                         text_embedding = token_node.anomaly_section[idx].text_embedding
                         new_proto_node.chunk_node_list.append(text_embedding.chunk_node)
                         new_proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
                         new_proto_node.chunk_node_embed.append(text_embedding.embed)
+                        cluster_text_embeddings.append(text_embedding)
+                    self._initialize_proto_retained_text_embeddings(new_proto_node, cluster_text_embeddings)
                     new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
                     new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
                                                                              self.anomaly_threshold_percentile)
@@ -628,8 +714,6 @@ class ProtoGraphRAG:
             self.discard_no_word = False
         if not hasattr(self, "plot_embeds"):
             self.plot_embeds = False
-        if not hasattr(self, "exhaustive_proto_description_evaluation"):
-            self.exhaustive_proto_description_evaluation = False
         if not hasattr(self, "proto_description_prompt_context_mode"):
             self.proto_description_prompt_context_mode = "sentence_neighbors"
         if not hasattr(self, "proto_description_candidate_limit"):
@@ -648,6 +732,10 @@ class ProtoGraphRAG:
             self.predicted_proto_description_logs = []
         if not hasattr(self, "deleted_merged_proto_logs"):
             self.deleted_merged_proto_logs = []
+        if not hasattr(self, "proto_description_operation_logs"):
+            self.proto_description_operation_logs = []
+        if not hasattr(self, "proto_description_log_path"):
+            self.proto_description_log_path = "proto_description_logs.txt"
         if not hasattr(self, "wikidata_no_result_logs"):
             self.wikidata_no_result_logs = []
         if not hasattr(self, "_wikidata_no_result_keys"):
@@ -698,6 +786,19 @@ class ProtoGraphRAG:
         for proto_node in getattr(self, "proto_nodes", []):
             if not hasattr(proto_node, "span_occurrences"):
                 proto_node.span_occurrences = []
+            if not hasattr(proto_node, "retained_text_embeddings") or proto_node.retained_text_embeddings is None:
+                proto_node.retained_text_embeddings = []
+            if not hasattr(proto_node, "retained_text_embedding_source_count"):
+                proto_node.retained_text_embedding_source_count = len(proto_node.retained_text_embeddings)
+            if not hasattr(proto_node, "pending_embed_rebuild"):
+                proto_node.pending_embed_rebuild = False
+            for text_embedding in proto_node.retained_text_embeddings:
+                if not hasattr(text_embedding, "span_start"):
+                    text_embedding.span_start = None
+                if not hasattr(text_embedding, "span_end"):
+                    text_embedding.span_end = None
+                if not hasattr(text_embedding, "span_text"):
+                    text_embedding.span_text = None
 
     def debug_extract_important_spans(
         self,
@@ -1158,7 +1259,29 @@ class ProtoGraphRAG:
             "prompt_text": prompt_text,
         }
 
-    def _predict_proto_description_from_samples(self, proto_node, model, candidate_bank_cache):
+    def _build_fallback_proto_description_prompt(self, chunk_text, token_text):
+        context_text = chunk_text.strip()
+        if not context_text:
+            return None
+        prompt_text = (
+            f"Context: {context_text}\n"
+            f"Target word: {token_text.strip()}\n\n"
+            f'Question: What does "{token_text.strip()}" mean in this context?'
+        )
+        return {
+            "context_text": context_text,
+            "matched_text": token_text.strip(),
+            "local_span": None,
+            "prompt_text": prompt_text,
+        }
+
+    def _predict_proto_description_from_samples(
+        self,
+        proto_node,
+        model,
+        candidate_bank_cache,
+        max_samples=10,
+    ):
         token_text = proto_node.token_node.token_text
         candidate_bank = candidate_bank_cache.get(token_text)
         if candidate_bank is None:
@@ -1190,9 +1313,8 @@ class ProtoGraphRAG:
             )
             return None
 
-        candidate_score_map = {}
-        sample_prediction_logs = []
-        max_samples = None if self.exhaustive_proto_description_evaluation else 10
+        description_vote_map = {}
+        sample_prediction_records = []
         sample_span_occurrences = self._sample_proto_span_occurrences(proto_node, max_samples=max_samples)
         for sample_index, span_occurrence in enumerate(sample_span_occurrences, start=1):
             chunk_node = span_occurrence.chunk_node
@@ -1201,6 +1323,11 @@ class ProtoGraphRAG:
                 token_text,
                 match_span=span_occurrence.get_span_tuple(),
             )
+            if prompt_info is None:
+                prompt_info = self._build_fallback_proto_description_prompt(
+                    chunk_node.chunk_text,
+                    token_text,
+                )
             if prompt_info is None:
                 continue
 
@@ -1222,22 +1349,25 @@ class ProtoGraphRAG:
                 key=lambda item: item["score"],
                 reverse=True,
             )
-            for ranked_candidate in ranked_candidates:
-                entity_id = ranked_candidate["entity_id"]
-                state = candidate_score_map.setdefault(
-                    entity_id,
+            if ranked_candidates:
+                top_candidate = ranked_candidates[0]
+                description = top_candidate["description"]
+                state = description_vote_map.setdefault(
+                    description,
                     {
-                        "candidate": ranked_candidate,
+                        "candidate": top_candidate,
+                        "description": description,
+                        "count": 0,
                         "score_sum": 0.0,
                         "score_count": 0,
                     },
                 )
-                state["score_sum"] += ranked_candidate["score"]
+                state["count"] += 1
+                state["score_sum"] += top_candidate["score"]
                 state["score_count"] += 1
-            if ranked_candidates:
-                top_candidate = ranked_candidates[0]
-                sample_prediction_logs.append(
+                sample_prediction_records.append(
                     {
+                        "span_occurrence": span_occurrence,
                         "sample_index": sample_index,
                         "chunk_node_id": chunk_node.chunk_node_id,
                         "span_start": span_occurrence.span_start,
@@ -1252,33 +1382,169 @@ class ProtoGraphRAG:
                     }
                 )
 
-        if not sample_prediction_logs or not candidate_score_map:
+        if not sample_prediction_records or not description_vote_map:
             return None
         aggregated_candidates = sorted(
-            [
+            (
                 {
                     **state["candidate"],
+                    "description": state["description"],
+                    "count": int(state["count"]),
                     "score_sum": float(state["score_sum"]),
                     "score_count": int(state["score_count"]),
                     "score_mean": float(state["score_sum"] / state["score_count"]),
                 }
-                for state in candidate_score_map.values()
+                for state in description_vote_map.values()
                 if state["score_count"] > 0
-            ],
-            key=lambda item: (item["score_mean"], item["score_sum"]),
+            ),
+            key=lambda item: (item["count"], item["score_mean"], item["score_sum"]),
             reverse=True,
         )
-        if not aggregated_candidates:
-            return None
         top_aggregated_candidate = aggregated_candidates[0]
+        public_sample_prediction_logs = [
+            {key: value for key, value in record.items() if key != "span_occurrence"}
+            for record in sample_prediction_records
+        ]
         return {
             "description": top_aggregated_candidate["description"],
             "predicted_entity_id": top_aggregated_candidate["entity_id"],
             "predicted_label": top_aggregated_candidate["label"],
             "predicted_definition": top_aggregated_candidate["definition"],
             "prediction_score_mean": top_aggregated_candidate["score_mean"],
-            "sample_predictions": sample_prediction_logs,
+            "sample_predictions": public_sample_prediction_logs,
+            "sample_prediction_records": sample_prediction_records,
+            "sample_count": len(sample_prediction_records),
+            "description_counts": {
+                item["description"]: item["count"]
+                for item in aggregated_candidates
+            },
+            "top_description_count": top_aggregated_candidate["count"],
+            "top_description_ratio": (
+                top_aggregated_candidate["count"] / len(sample_prediction_records)
+            ),
         }
+
+    def _get_span_occurrence_key(self, span_occurrence):
+        chunk_node = span_occurrence.chunk_node
+        return (
+            id(chunk_node),
+            span_occurrence.span_start,
+            span_occurrence.span_end,
+            span_occurrence.span_text,
+        )
+
+    def _build_retained_text_embedding_lookup(self, proto_node):
+        lookup = defaultdict(list)
+        for text_embedding in getattr(proto_node, "retained_text_embeddings", []):
+            lookup[self._get_span_occurrence_key(text_embedding.to_span_occurrence())].append(text_embedding)
+        return lookup
+
+    def _resolve_span_for_occurrence(self, token_text, span_occurrence):
+        match_span = span_occurrence.get_span_tuple()
+        if match_span is not None:
+            return match_span
+
+        chunk_text = span_occurrence.chunk_node.chunk_text
+        if span_occurrence.span_text:
+            lowered_text = chunk_text.casefold()
+            lowered_span_text = span_occurrence.span_text.casefold()
+            match_start = lowered_text.find(lowered_span_text)
+            if match_start >= 0:
+                return match_start, match_start + len(span_occurrence.span_text)
+
+        return self._find_description_match_span(chunk_text, token_text)
+
+    def _reencode_text_embedding_for_occurrence(self, token_node, span_occurrence):
+        match_span = self._resolve_span_for_occurrence(token_node.token_text, span_occurrence)
+        if match_span is None:
+            return None
+
+        chunk_text = span_occurrence.chunk_node.chunk_text
+        token_embeddings, offsets = encode_text(
+            chunk_text,
+            self.text_encoder,
+            self.tokenizer,
+            self.device,
+        )
+        span_text = chunk_text[match_span[0]:match_span[1]]
+        phrase_embs, _ = get_token_embeds(
+            token_embeddings,
+            offsets,
+            [(span_text, match_span[0], match_span[1])],
+            [],
+        )
+        if not phrase_embs:
+            return None
+
+        _, embed, start_char, end_char = phrase_embs[0]
+        return TextEmbedding(
+            embed=embed.detach().cpu(),
+            chunk_node=span_occurrence.chunk_node,
+            span_start=start_char,
+            span_end=end_char,
+            span_text=span_text,
+        )
+
+    def _finalize_split_proto_node_embed(self, proto_node):
+        available_embeds = list(proto_node.chunk_node_embed)
+        if available_embeds:
+            proto_node.embed = average_embeds(available_embeds)
+        else:
+            sample_occurrences = list(getattr(proto_node, "span_occurrences", []))
+            if sample_occurrences:
+                sample_size = min(len(sample_occurrences), self.proto_retained_embed_limit)
+                regenerated_text_embeddings = []
+                for span_occurrence in random.sample(sample_occurrences, sample_size):
+                    text_embedding = self._reencode_text_embedding_for_occurrence(
+                        proto_node.token_node,
+                        span_occurrence,
+                    )
+                    if text_embedding is not None:
+                        regenerated_text_embeddings.append(text_embedding)
+
+                if regenerated_text_embeddings:
+                    proto_node.embed = average_embeds(
+                        [text_embedding.embed for text_embedding in regenerated_text_embeddings]
+                    )
+                    self._initialize_proto_retained_text_embeddings(
+                        proto_node,
+                        regenerated_text_embeddings,
+                    )
+
+        if proto_node.embed is None:
+            raise ValueError(
+                f"Failed to rebuild embed for split proto node {proto_node.proto_node_id} "
+                f"({proto_node.token_node.token_text!r}, description={proto_node.description!r})."
+            )
+
+        if proto_node.chunk_edge_weight:
+            proto_node.anomaly_threshold = get_anomaly_threshold(
+                proto_node.chunk_edge_weight,
+                self.anomaly_threshold_percentile,
+            )
+        else:
+            proto_node.anomaly_threshold = None
+        proto_node.chunk_node_embed.clear()
+        proto_node.pending_embed_rebuild = False
+
+    def _create_split_proto_node(self, token_node, description):
+        new_proto_node = self.create_proto_node(token_node)
+        new_proto_node.description = description
+        new_proto_node.chunk_node_list = []
+        new_proto_node.span_occurrences = []
+        new_proto_node.chunk_node_embed = []
+        new_proto_node.retained_text_embeddings = []
+        new_proto_node.retained_text_embedding_source_count = 0
+        new_proto_node.pending_embed_rebuild = True
+        new_proto_node.chunk_edge_weight = []
+        new_proto_node.embed = None
+        new_proto_node.anomaly_threshold = None
+        new_proto_node.tf_dict_by_chunk_id = None
+        new_proto_node.chunk_len_dict_by_id = None
+        new_proto_node.BM25 = None
+        new_proto_node.df = 0
+        new_proto_node.idf = 0
+        return new_proto_node
 
     def _merge_proto_node_group(self, proto_group):
         primary_proto = proto_group[0]
@@ -1286,11 +1552,19 @@ class ProtoGraphRAG:
         merged_chunk_edge_weights = []
         merged_span_occurrences = []
         merged_embeds = []
+        merged_retained_text_embeddings = []
+        merged_retained_source_count = 0
 
         for proto_node in proto_group:
             merged_chunk_nodes.extend(proto_node.chunk_node_list)
             merged_chunk_edge_weights.extend(proto_node.chunk_edge_weight)
             merged_span_occurrences.extend(getattr(proto_node, "span_occurrences", []))
+            merged_retained_text_embeddings.extend(getattr(proto_node, "retained_text_embeddings", []))
+            merged_retained_source_count += getattr(
+                proto_node,
+                "retained_text_embedding_source_count",
+                len(getattr(proto_node, "retained_text_embeddings", [])),
+            )
             if proto_node.embed is not None:
                 merged_embeds.append(proto_node.embed)
 
@@ -1298,7 +1572,23 @@ class ProtoGraphRAG:
         primary_proto.chunk_edge_weight = merged_chunk_edge_weights
         primary_proto.span_occurrences = merged_span_occurrences
         primary_proto.chunk_node_embed = []
-        if merged_embeds:
+        primary_proto.retained_text_embeddings = self._sample_text_embeddings(
+            merged_retained_text_embeddings,
+            max_samples=self.proto_retained_embed_limit,
+        )
+        primary_proto.retained_text_embedding_source_count = max(
+            merged_retained_source_count,
+            len(merged_retained_text_embeddings),
+        )
+        primary_proto.pending_embed_rebuild = False
+        retained_embeds = [
+            text_embedding.embed
+            for text_embedding in merged_retained_text_embeddings
+            if text_embedding.embed is not None
+        ]
+        if retained_embeds:
+            primary_proto.embed = average_embeds(retained_embeds)
+        elif merged_embeds:
             primary_proto.embed = torch.stack(merged_embeds).mean(dim=0)
         if primary_proto.chunk_edge_weight:
             primary_proto.anomaly_threshold = get_anomaly_threshold(
@@ -1315,7 +1605,9 @@ class ProtoGraphRAG:
         return primary_proto
 
     def merge_duplicate_description_proto_nodes(self):
+        consensus_ratio_threshold = 0.8
         redundant_proto_ids = set()
+        proto_nodes_changed = False
         target_token_nodes = [
             token_node for token_node in self.token_nodes
             if len(token_node.proto_node_list) > 1
@@ -1330,7 +1622,6 @@ class ProtoGraphRAG:
         if progress_update is not None:
             progress_update(0, force=True)
         for index, token_node in enumerate(target_token_nodes, start=1):
-            description_groups = defaultdict(list)
             ordered_proto_list = []
             seen_proto_ids = set()
             for proto_node in token_node.proto_node_list:
@@ -1339,38 +1630,169 @@ class ProtoGraphRAG:
                     continue
                 seen_proto_ids.add(proto_id)
                 ordered_proto_list.append(proto_node)
-                if proto_node.description is None and self.proto_description_model is not None:
-                    prediction_result = self._predict_proto_description_from_samples(
-                        proto_node,
-                        model=self.proto_description_model,
-                        candidate_bank_cache=candidate_bank_cache,
-                    )
-                    if prediction_result is not None:
-                        predicted_description = prediction_result["description"]
-                        proto_node.description = predicted_description
-                        self.predicted_proto_description_logs.append(
-                            {
-                                "proto_node_id": proto_node.proto_node_id,
-                                "token_text": proto_node.token_node.token_text,
-                                "description": predicted_description,
-                                "predicted_entity_id": prediction_result.get("predicted_entity_id"),
-                                "predicted_label": prediction_result.get("predicted_label"),
-                                "predicted_definition": prediction_result.get("predicted_definition"),
-                                "prediction_score_mean": prediction_result.get("prediction_score_mean"),
-                                "chunk_count": len(proto_node.chunk_node_list),
-                                "sample_predictions": prediction_result["sample_predictions"],
-                            }
-                        )
+
+            new_proto_list = []
+            description_proto_map = defaultdict(list)
+            for proto_node in ordered_proto_list:
                 if proto_node.description:
-                    description_groups[proto_node.description].append(proto_node)
+                    new_proto_list.append(proto_node)
+                    description_proto_map[proto_node.description].append(proto_node)
+                    continue
+
+                if self.proto_description_model is None:
+                    new_proto_list.append(proto_node)
+                    continue
+
+                prediction_result = self._predict_proto_description_from_samples(
+                    proto_node,
+                    model=self.proto_description_model,
+                    candidate_bank_cache=candidate_bank_cache,
+                    max_samples=10,
+                )
+                if prediction_result is None:
+                    new_proto_list.append(proto_node)
+                    continue
+
+                if (
+                    prediction_result["sample_count"] > 0
+                    and prediction_result["top_description_ratio"] >= consensus_ratio_threshold
+                ):
+                    predicted_description = prediction_result["description"]
+                    proto_node.description = predicted_description
+                    new_proto_list.append(proto_node)
+                    description_proto_map[predicted_description].append(proto_node)
+                    self.predicted_proto_description_logs.append(
+                        {
+                            "proto_node_id": proto_node.proto_node_id,
+                            "token_text": proto_node.token_node.token_text,
+                            "description": predicted_description,
+                            "predicted_entity_id": prediction_result.get("predicted_entity_id"),
+                            "predicted_label": prediction_result.get("predicted_label"),
+                            "predicted_definition": prediction_result.get("predicted_definition"),
+                            "prediction_score_mean": prediction_result.get("prediction_score_mean"),
+                            "chunk_count": len(proto_node.chunk_node_list),
+                            "sample_count": prediction_result.get("sample_count"),
+                            "top_description_count": prediction_result.get("top_description_count"),
+                            "top_description_ratio": prediction_result.get("top_description_ratio"),
+                            "sample_predictions": prediction_result["sample_predictions"],
+                        }
+                    )
+                    self._log_proto_description_operation(
+                        "assign_description_by_consensus",
+                        token_text=token_node.token_text,
+                        proto_node_id=proto_node.proto_node_id,
+                        description=predicted_description,
+                        sample_count=prediction_result.get("sample_count"),
+                        top_description_count=prediction_result.get("top_description_count"),
+                        top_description_ratio=prediction_result.get("top_description_ratio"),
+                    )
+                    continue
+
+                exhaustive_prediction_result = self._predict_proto_description_from_samples(
+                    proto_node,
+                    model=self.proto_description_model,
+                    candidate_bank_cache=candidate_bank_cache,
+                    max_samples=None,
+                )
+                if exhaustive_prediction_result is None:
+                    new_proto_list.append(proto_node)
+                    continue
+
+                proto_nodes_changed = True
+                redundant_proto_ids.add(id(proto_node))
+                self._log_proto_description_operation(
+                    "split_proto_node_by_sample_labels",
+                    token_text=token_node.token_text,
+                    source_proto_node_id=proto_node.proto_node_id,
+                    source_chunk_count=len(proto_node.chunk_node_list),
+                    description_counts=exhaustive_prediction_result.get("description_counts", {}),
+                )
+                retained_text_embedding_lookup = self._build_retained_text_embedding_lookup(proto_node)
+                self.deleted_merged_proto_logs.append(
+                    {
+                        "deleted_proto_node_id": proto_node.proto_node_id,
+                        "kept_proto_node_id": None,
+                        "token_text": token_node.token_text,
+                        "description": "split_by_sample_label",
+                        "deleted_chunk_count": len(proto_node.chunk_node_list),
+                    }
+                )
+
+                for sample_prediction in exhaustive_prediction_result["sample_prediction_records"]:
+                    predicted_description = sample_prediction["predicted_description"]
+                    if not predicted_description:
+                        continue
+                    span_occurrence = sample_prediction["span_occurrence"]
+                    retained_candidates = retained_text_embedding_lookup.get(
+                        self._get_span_occurrence_key(span_occurrence),
+                    )
+                    retained_text_embedding = None if not retained_candidates else retained_candidates.pop()
+                    target_proto_group = description_proto_map.get(predicted_description)
+                    created_new_proto = False
+                    if target_proto_group:
+                        target_proto = target_proto_group[0]
+                    else:
+                        target_proto = self._create_split_proto_node(token_node, predicted_description)
+                        description_proto_map[predicted_description].append(target_proto)
+                        new_proto_list.append(target_proto)
+                        created_new_proto = True
+                        self._log_proto_description_operation(
+                            "create_split_proto_node",
+                            token_text=token_node.token_text,
+                            proto_node_id=target_proto.proto_node_id,
+                            description=predicted_description,
+                        )
+                    self._append_span_occurrence_to_proto(
+                        target_proto,
+                        span_occurrence,
+                        edge_weight=0.0,
+                        retained_text_embedding=retained_text_embedding,
+                    )
+                    self._log_proto_description_operation(
+                        "assign_sample_to_proto_node",
+                        token_text=token_node.token_text,
+                        source_proto_node_id=proto_node.proto_node_id,
+                        target_proto_node_id=target_proto.proto_node_id,
+                        description=predicted_description,
+                        chunk_node_id=span_occurrence.chunk_node.chunk_node_id,
+                        span_start=span_occurrence.span_start,
+                        span_end=span_occurrence.span_end,
+                        span_text=span_occurrence.span_text,
+                        used_retained_embedding=retained_text_embedding is not None,
+                        created_new_proto=created_new_proto,
+                    )
+
+            for proto_node in new_proto_list:
+                if getattr(proto_node, "pending_embed_rebuild", False):
+                    self._finalize_split_proto_node_embed(proto_node)
+                    self._log_proto_description_operation(
+                        "finalize_split_proto_node_embed",
+                        token_text=token_node.token_text,
+                        proto_node_id=proto_node.proto_node_id,
+                        description=proto_node.description,
+                        retained_embed_count=len(getattr(proto_node, "retained_text_embeddings", [])),
+                    )
 
             merged_proto_map = {}
-            for description, proto_group in description_groups.items():
+            for description, proto_group in defaultdict(list, {
+                description: [proto for proto in new_proto_list if proto.description == description]
+                for description in {proto.description for proto in new_proto_list if proto.description}
+            }).items():
                 if len(proto_group) < 2:
                     continue
                 merged_proto = self._merge_proto_node_group(proto_group)
                 merged_proto_map[description] = merged_proto
+                self._log_proto_description_operation(
+                    "merge_proto_nodes_with_same_description",
+                    token_text=token_node.token_text,
+                    description=description,
+                    kept_proto_node_id=merged_proto.proto_node_id,
+                    merged_proto_node_ids=[proto.proto_node_id for proto in proto_group],
+                    retained_embed_count=len(getattr(merged_proto, "retained_text_embeddings", [])),
+                )
                 for redundant_proto in proto_group[1:]:
+                    proto_nodes_changed = True
+                    redundant_proto_ids.add(id(redundant_proto))
                     self.deleted_merged_proto_logs.append(
                         {
                             "deleted_proto_node_id": redundant_proto.proto_node_id,
@@ -1380,31 +1802,26 @@ class ProtoGraphRAG:
                             "deleted_chunk_count": len(redundant_proto.chunk_node_list),
                         }
                     )
-                    redundant_proto_ids.add(id(redundant_proto))
 
-            if not merged_proto_map:
-                token_node.proto_node_list = ordered_proto_list
-                token_node.has_prototype = len(token_node.proto_node_list) > 0
-                progress_update(index)
-                continue
-
-            new_proto_list = []
-            added_proto_ids = set()
-            for proto_node in ordered_proto_list:
-                if id(proto_node) in redundant_proto_ids:
-                    continue
-                target_proto = merged_proto_map.get(proto_node.description, proto_node)
-                target_proto_id = id(target_proto)
-                if target_proto_id in added_proto_ids:
-                    continue
-                added_proto_ids.add(target_proto_id)
-                new_proto_list.append(target_proto)
+            if merged_proto_map:
+                deduped_proto_list = []
+                added_proto_ids = set()
+                for proto_node in new_proto_list:
+                    if id(proto_node) in redundant_proto_ids:
+                        continue
+                    target_proto = merged_proto_map.get(proto_node.description, proto_node)
+                    target_proto_id = id(target_proto)
+                    if target_proto_id in added_proto_ids:
+                        continue
+                    added_proto_ids.add(target_proto_id)
+                    deduped_proto_list.append(target_proto)
+                new_proto_list = deduped_proto_list
 
             token_node.proto_node_list = new_proto_list
             token_node.has_prototype = len(token_node.proto_node_list) > 0
             progress_update(index)
 
-        if not redundant_proto_ids:
+        if not redundant_proto_ids and not proto_nodes_changed:
             if total_token_nodes > 0:
                 progress_update(total_token_nodes, force=True)
                 print()
@@ -1421,52 +1838,23 @@ class ProtoGraphRAG:
             progress_update(total_token_nodes, force=True)
             print()
 
-    def print_proto_description_logs(self):
-        print("Proto nodes assigned predicted descriptions:")
-        if not self.predicted_proto_description_logs:
-            print("  (none)")
-        else:
-            for item in self.predicted_proto_description_logs:
-                print(
-                    "  "
-                    f"proto_node_id={item['proto_node_id']}, "
-                    f"token={item['token_text']!r}, "
-                    f"description={item['description']!r}, "
-                    f"chunk_count={item['chunk_count']}"
-                )
-                sample_predictions = item.get("sample_predictions", [])
-                if not sample_predictions:
-                    print("    sample_predictions: (none)")
-                    continue
-                for sample in sample_predictions:
-                    print(
-                        "    "
-                        f"sample_index={sample['sample_index']}, "
-                        f"chunk_node_id={sample['chunk_node_id']}, "
-                        f"predicted_description={sample['predicted_description']!r}, "
-                        f"predicted_label={sample['predicted_label']!r}, "
-                        f"score={sample['prediction_score']:.4f}"
-                    )
-                    print(f"      matched_text={sample['matched_text']!r}")
-                    print(f"      context_text={sample['context_text']!r}")
-
-        print("\nProto nodes deleted by description merge:")
-        if not self.deleted_merged_proto_logs:
-            print("  (none)")
-        else:
-            for item in self.deleted_merged_proto_logs:
-                print(
-                    "  "
-                    f"deleted_proto_node_id={item['deleted_proto_node_id']}, "
-                    f"kept_proto_node_id={item['kept_proto_node_id']}, "
-                    f"token={item['token_text']!r}, "
-                    f"description={item['description']!r}, "
-                    f"deleted_chunk_count={item['deleted_chunk_count']}"
-                )
-
     def _format_proto_description_logs_text(self):
         lines = []
 
+        lines.append("Proto description operations:")
+        if not self.proto_description_operation_logs:
+            lines.append("  (none)")
+        else:
+            for item in self.proto_description_operation_logs:
+                event_type = item.get("event_type", "unknown")
+                payload = ", ".join(
+                    f"{key}={value!r}"
+                    for key, value in item.items()
+                    if key != "event_type"
+                )
+                lines.append(f"  [{event_type}] {payload}")
+
+        lines.append("")
         lines.append("Proto nodes assigned predicted descriptions:")
         if not self.predicted_proto_description_logs:
             lines.append("  (none)")
@@ -1514,105 +1902,31 @@ class ProtoGraphRAG:
                     )
                 )
 
+        lines.append("")
+        lines.append("Wikidata lookups with no usable results:")
+        if not self.wikidata_no_result_logs:
+            lines.append("  (none)")
+        else:
+            for item in self.wikidata_no_result_logs:
+                lines.append(
+                    "  term={!r} | stage={} | reason={}".format(
+                        item["term"],
+                        item["stage"],
+                        item["reason"],
+                    )
+                )
+
         return "\n".join(lines)
 
-    def _build_proto_description_logs_html(self, open_details=False):
-        html_parts = [
-            "<div style=\"font-family:Arial, sans-serif; line-height:1.5;\">"
-        ]
-        html_parts.append(
-            "<div style=\"margin-bottom:12px; padding:10px 12px; background:#f3f6f9; border:1px solid #d8e0e8; border-radius:8px;\">"
-            + f"<strong>Predicted proto descriptions:</strong> {len(self.predicted_proto_description_logs)}"
-            + "</div>"
-        )
+    def print_proto_description_logs(self, output_path=None):
+        return self.show_proto_description_logs(output_path=output_path)
 
-        if not self.predicted_proto_description_logs:
-            html_parts.append("<div style=\"margin-bottom:12px;\">(none)</div>")
-        else:
-            for item in self.predicted_proto_description_logs:
-                summary = "proto_node_id={} | token={} | description={} | chunk_count={}".format(
-                    item["proto_node_id"],
-                    item["token_text"],
-                    item["description"],
-                    item["chunk_count"],
-                )
-                html_parts.append(
-                    "<details style=\"margin:10px 0; border:1px solid #ddd; border-radius:8px; padding:8px 12px; background:#fafafa;\" {}>".format(
-                        "open" if open_details else ""
-                    )
-                    + "<summary style=\"cursor:pointer; font-weight:700;\">{}</summary>".format(escape(summary))
-                )
-                sample_predictions = item.get("sample_predictions", [])
-                if not sample_predictions:
-                    html_parts.append("<div style=\"margin:8px 0 0 8px;\">(none)</div>")
-                else:
-                    for sample in sample_predictions:
-                        sample_summary = "sample={} | chunk_node_id={} | predicted_description={} | predicted_label={} | score={:.4f}".format(
-                            sample["sample_index"],
-                            sample["chunk_node_id"],
-                            sample["predicted_description"],
-                            sample["predicted_label"],
-                            sample["prediction_score"],
-                        )
-                        html_parts.append(
-                            "<details style=\"margin:8px 0 8px 16px; border:1px solid #e1e5ea; border-radius:6px; padding:6px 10px; background:#fff;\" {}>".format(
-                                "open" if open_details else ""
-                            )
-                            + "<summary style=\"cursor:pointer; font-weight:600;\">{}</summary>".format(escape(sample_summary))
-                            + "<div style=\"margin-top:6px; font-size:12px; color:#666;\">matched_text</div>"
-                            + "<div style=\"white-space:pre-wrap; margin:2px 0 8px 0;\">{}</div>".format(escape(sample["matched_text"]))
-                            + "<div style=\"font-size:12px; color:#666;\">context_text</div>"
-                            + "<div style=\"white-space:pre-wrap;\">{}</div>".format(escape(sample["context_text"]))
-                            + "</details>"
-                        )
-                html_parts.append("</details>")
-
-        html_parts.append(
-            "<div style=\"margin:14px 0 8px 0; padding:10px 12px; background:#f8f8f8; border:1px solid #e0e0e0; border-radius:8px;\">"
-            + f"<strong>Merged-away proto nodes:</strong> {len(self.deleted_merged_proto_logs)}"
-            + "</div>"
-        )
-        if not self.deleted_merged_proto_logs:
-            html_parts.append("<div>(none)</div>")
-        else:
-            html_parts.append("<div style=\"margin-left:4px;\">")
-            for item in self.deleted_merged_proto_logs:
-                merged_text = "deleted_proto_node_id={} | kept_proto_node_id={} | token={} | description={} | deleted_chunk_count={}".format(
-                    item["deleted_proto_node_id"],
-                    item["kept_proto_node_id"],
-                    item["token_text"],
-                    item["description"],
-                    item["deleted_chunk_count"],
-                )
-                html_parts.append(
-                    "<div style=\"margin:6px 0; padding:6px 8px; border-left:4px solid #c44e52; background:#fff;\">{}</div>".format(
-                        escape(merged_text)
-                    )
-                )
-            html_parts.append("</div>")
-
-        html_parts.append("</div>")
-        return "".join(html_parts)
-
-    def show_proto_description_logs(self, as_html=True, open_details=False):
-        if not self.predicted_proto_description_logs and not self.deleted_merged_proto_logs:
-            empty_text = "No proto description logs are available."
-            if as_html:
-                try:
-                    from IPython.display import HTML
-                    return HTML("<div>{}</div>".format(escape(empty_text)))
-                except ImportError:
-                    return empty_text
-            return empty_text
-
-        if as_html:
-            try:
-                from IPython.display import HTML
-                return HTML(self._build_proto_description_logs_html(open_details=open_details))
-            except ImportError:
-                pass
-
-        return self._format_proto_description_logs_text()
+    def show_proto_description_logs(self, as_html=True, open_details=False, output_path=None):
+        output_path = self.proto_description_log_path if output_path is None else output_path
+        log_text = self._format_proto_description_logs_text()
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(log_text)
+        return output_path
 
 
     def print_wikidata_no_result_logs(self):
@@ -1825,6 +2139,14 @@ class ProtoGraphRAG:
                 for i in keep_indices
             ] if getattr(proto_node, "span_occurrences", None) else []
             proto_node.chunk_edge_weight = [proto_node.chunk_edge_weight[i] for i in keep_indices]
+            proto_node.retained_text_embeddings = [
+                text_embedding for text_embedding in getattr(proto_node, "retained_text_embeddings", [])
+                if id(text_embedding.chunk_node) in valid_chunk_ids
+            ]
+            proto_node.retained_text_embedding_source_count = max(
+                proto_node.retained_text_embedding_source_count,
+                len(proto_node.retained_text_embeddings),
+            )
             if proto_node.chunk_node_list:
                 valid_proto_nodes.append(proto_node)
 
@@ -2359,6 +2681,15 @@ class ProtoGraphRAG:
                     if i not in index_to_delete
                 ]
             node.chunk_edge_weight = [x for i, x in enumerate(node.chunk_edge_weight) if i not in index_to_delete]
+            node.retained_text_embeddings = [
+                text_embedding
+                for text_embedding in getattr(node, "retained_text_embeddings", [])
+                if text_embedding.chunk_node is not chunk_node_to_delete
+            ]
+            node.retained_text_embedding_source_count = max(
+                node.retained_text_embedding_source_count,
+                len(node.retained_text_embeddings),
+            )
         self.chunk_nodes.remove(chunk_node_to_delete)
 
     def reset_chunk_node_id(self):
@@ -2477,16 +2808,43 @@ class ProtoGraphRAG:
                 (p.embed.detach().cpu() if p.embed is not None else None)
                 for p in self.proto_nodes
             ],
+            "proto_retained_text_embeddings": [
+                [
+                    {
+                        "embed": (
+                            text_embedding.embed.detach().cpu()
+                            if text_embedding.embed is not None else None
+                        ),
+                        "chunk_node": text_embedding.chunk_node,
+                        "span_start": text_embedding.span_start,
+                        "span_end": text_embedding.span_end,
+                        "span_text": text_embedding.span_text,
+                    }
+                    for text_embedding in getattr(p, "retained_text_embeddings", [])
+                ]
+                for p in self.proto_nodes
+            ],
         }
         torch.save(tensor_pack, pt_path)
 
         # 2) 临时把对象里的 tensor 清空，避免 pickle 遇到 torch.Storage
         qbak = self.query_database
         pbak = [p.embed for p in self.proto_nodes]
+        retained_bak = [p.retained_text_embeddings for p in self.proto_nodes]
 
         self.query_database = None
         for p in self.proto_nodes:
             p.embed = None
+            p.retained_text_embeddings = [
+                TextEmbedding(
+                    embed=None,
+                    chunk_node=text_embedding.chunk_node,
+                    span_start=text_embedding.span_start,
+                    span_end=text_embedding.span_end,
+                    span_text=text_embedding.span_text,
+                )
+                for text_embedding in getattr(p, "retained_text_embeddings", [])
+            ]
 
         # 3) 临时去掉运行态组件（你之前 __getstate__ 里就有这些）
         exec_bak = getattr(self, "executor", None)
@@ -2510,8 +2868,9 @@ class ProtoGraphRAG:
         finally:
             # 5) 恢复内存中的对象，保证系统继续可用
             self.query_database = qbak
-            for p, e in zip(self.proto_nodes, pbak):
+            for p, e, retained in zip(self.proto_nodes, pbak, retained_bak):
                 p.embed = e
+                p.retained_text_embeddings = retained
 
             if hasattr(self, "executor"): self.executor = exec_bak
             if hasattr(self, "text_encoder"): self.text_encoder = enc_bak
@@ -2535,10 +2894,29 @@ class ProtoGraphRAG:
         obj.query_database = query_database.to(obj.device) if query_database is not None else None
 
         proto_embeds = tensor_pack.get("proto_embeds", [])
+        proto_retained_text_embeddings = tensor_pack.get("proto_retained_text_embeddings", [])
         # 按索引回填
         for i, p in enumerate(obj.proto_nodes):
             embed = proto_embeds[i] if i < len(proto_embeds) else None
             p.embed = embed.to("cpu") if embed is not None else None
+            retained_pack = proto_retained_text_embeddings[i] if i < len(proto_retained_text_embeddings) else []
+            p.retained_text_embeddings = [
+                TextEmbedding(
+                    embed=(
+                        item["embed"].to("cpu")
+                        if item.get("embed") is not None else None
+                    ),
+                    chunk_node=item["chunk_node"],
+                    span_start=item.get("span_start"),
+                    span_end=item.get("span_end"),
+                    span_text=item.get("span_text"),
+                )
+                for item in retained_pack
+            ]
+            p.retained_text_embedding_source_count = max(
+                getattr(p, "retained_text_embedding_source_count", 0),
+                len(p.retained_text_embeddings),
+            )
 
         # 重建运行态（按你原逻辑）
         obj._restore_runtime_components(load_nlp=True, load_reranker=False)
@@ -2556,6 +2934,8 @@ class ProtoGraphRAG:
             doc_node.chunk_node_list = [chunk_node.chunk_node_id for chunk_node in doc_node.chunk_node_list]
         for proto_node in self.proto_nodes:
             proto_node.chunk_node_list = [chunk_node.chunk_node_id for chunk_node in proto_node.chunk_node_list]
+            for text_embedding in getattr(proto_node, "retained_text_embeddings", []):
+                text_embedding.chunk_node = text_embedding.chunk_node.chunk_node_id
             proto_node.token_node = proto_node.token_node.token_node_id
         for token_node in self.token_nodes:
             token_node.proto_node_list = [proto_node.proto_node_id for proto_node in token_node.proto_node_list]
@@ -2578,6 +2958,14 @@ class ProtoGraphRAG:
                     SpanOccurrence(chunk_node=chunk_node)
                     for chunk_node in proto_node.chunk_node_list
                 ]
+            if not hasattr(proto_node, "retained_text_embeddings") or proto_node.retained_text_embeddings is None:
+                proto_node.retained_text_embeddings = []
+            for text_embedding in proto_node.retained_text_embeddings:
+                text_embedding.chunk_node = self.chunk_nodes[text_embedding.chunk_node]
+            if not hasattr(proto_node, "retained_text_embedding_source_count"):
+                proto_node.retained_text_embedding_source_count = len(proto_node.retained_text_embeddings)
+            if not hasattr(proto_node, "pending_embed_rebuild"):
+                proto_node.pending_embed_rebuild = False
         for token_node in self.token_nodes:
             token_node.proto_node_list = [self.proto_nodes[idx] for idx in token_node.proto_node_list]
 
