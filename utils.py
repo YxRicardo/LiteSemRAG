@@ -127,6 +127,11 @@ def _series_casefold_equals(series, target: str):
     return series.map(lambda value: ("" if value is None else str(value)).casefold() == target_casefold)
 
 
+def _series_casefold_contains(series, target: str):
+    target_casefold = str(target).casefold()
+    return series.map(lambda value: target_casefold in ("" if value is None else str(value)).casefold())
+
+
 def _series_startswith_lowercase(series):
     return series.map(
         lambda value: (str(value)[0].islower() if value is not None and str(value) else False)
@@ -316,6 +321,7 @@ def search_wikidata(
     drop_missing_detailed_description=False,
     detailed_description_sentences=3,
     filter_name=True,
+    label_contains_text=True,
 ):
     """
     Search Wikidata entities using the same interface as explore_wikidata.ipynb.
@@ -368,6 +374,9 @@ def search_wikidata(
     if filter_name and not df.empty:
         df = df[_series_exclude_name_descriptions(df["description"])].reset_index(drop=True)
 
+    if label_contains_text and not df.empty:
+        df = df[_series_casefold_contains(df["label"], normalized_term)].reset_index(drop=True)
+
     if exact_match_first and not df.empty:
         exact_match_mask = _series_casefold_equals(df["match_text"], normalized_term)
         lowercase_initial_mask = _series_startswith_lowercase(df["match_text"])
@@ -417,6 +426,7 @@ def load_wikidata_definition_candidates(
     limit: int = 5,
     filter_name: bool = True,
     require_detailed_description: bool = False,
+    label_contains_text: bool = True,
 ):
     _, pd = _import_wikidata_deps()
 
@@ -430,6 +440,7 @@ def load_wikidata_definition_candidates(
         detailed_description_sentences=3,
         drop_missing_detailed_description=include_detailed_description,
         filter_name=filter_name,
+        label_contains_text=label_contains_text,
     )
 
     if candidates_df.empty:

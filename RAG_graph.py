@@ -360,6 +360,7 @@ class ProtoGraphRAG:
         self.proto_description_use_detailed_description = False
         self.proto_description_require_detailed_description = True
         self.proto_description_exact_match_text = True
+        self.proto_description_label_contains_text = True
         self.proto_description_exact_match_first = False
         self.proto_retained_embed_limit = 10
         self.proto_description_log_path = "proto_description_logs.txt"
@@ -726,6 +727,8 @@ class ProtoGraphRAG:
             self.proto_description_require_detailed_description = True
         if not hasattr(self, "proto_description_exact_match_text"):
             self.proto_description_exact_match_text = True
+        if not hasattr(self, "proto_description_label_contains_text"):
+            self.proto_description_label_contains_text = True
         if not hasattr(self, "proto_description_exact_match_first"):
             self.proto_description_exact_match_first = False
         if not hasattr(self, "predicted_proto_description_logs"):
@@ -1314,6 +1317,7 @@ class ProtoGraphRAG:
                     exact_match_first=self.proto_description_exact_match_first,
                     limit=self.proto_description_candidate_limit,
                     require_detailed_description=require_detailed_description,
+                    label_contains_text=self.proto_description_label_contains_text,
                 )
             except ValueError:
                 self._log_wikidata_no_result(
@@ -2489,6 +2493,37 @@ class ProtoGraphRAG:
 
         return result
 
+    def inspect_described_proto_token_nodes(self, max_sentences_per_proto=3):
+        result = {}
+
+        for token_node in self.token_nodes:
+            described_proto_nodes = [
+                proto_node for proto_node in token_node.proto_node_list
+                if getattr(proto_node, "description", None)
+            ]
+            if not described_proto_nodes:
+                continue
+
+            result[token_node.token_text] = {
+                "token_node_id": token_node.token_node_id,
+                "proto_count": len(described_proto_nodes),
+                "prototypes": [],
+            }
+
+            for proto_node in described_proto_nodes:
+                result[token_node.token_text]["prototypes"].append({
+                    "proto_node_id": proto_node.proto_node_id,
+                    "description": proto_node.description,
+                    "chunk_count": len(proto_node.chunk_node_list),
+                    "sentence_examples": self._collect_proto_sentence_examples(
+                        proto_node,
+                        token_node.token_text,
+                        max_sentences_per_proto=max_sentences_per_proto,
+                    ),
+                })
+
+        return result
+
     def _select_multi_proto_token_nodes(
             self,
             inspect_data,
@@ -2693,6 +2728,51 @@ class ProtoGraphRAG:
 
         if not inspect_data:
             empty_text = "No token nodes matched the multi-prototype condition."
+            if as_html:
+                try:
+                    from IPython.display import HTML
+                    return HTML(f"<div>{escape(empty_text)}</div>")
+                except ImportError:
+                    return empty_text
+            return empty_text
+
+        if as_html:
+            try:
+                from IPython.display import HTML
+                return HTML(self._build_multi_proto_token_nodes_html(inspect_data, open_details=open_details))
+            except ImportError:
+                pass
+
+        return self._format_multi_proto_token_nodes_text(inspect_data)
+
+    def show_described_proto_token_nodes(
+            self,
+            max_sentences_per_proto=3,
+            as_html=True,
+            token_contains=None,
+            sort_by="proto_count",
+            max_token_nodes=20,
+            max_protos_per_token=10,
+            max_examples_per_token=10,
+            open_details=False,
+    ):
+        inspect_data = self.inspect_described_proto_token_nodes(
+            max_sentences_per_proto=max_sentences_per_proto,
+        )
+        inspect_data = self._select_multi_proto_token_nodes(
+            inspect_data,
+            token_contains=token_contains,
+            sort_by=sort_by,
+            max_token_nodes=max_token_nodes,
+            max_protos_per_token=max_protos_per_token,
+        )
+        inspect_data = self._limit_proto_sentence_examples(
+            inspect_data,
+            max_examples_per_token=max_examples_per_token,
+        )
+
+        if not inspect_data:
+            empty_text = "No proto nodes with descriptions were found."
             if as_html:
                 try:
                     from IPython.display import HTML
