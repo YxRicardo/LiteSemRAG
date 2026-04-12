@@ -1275,6 +1275,77 @@ class ProtoGraphRAG:
             "prompt_text": prompt_text,
         }
 
+    def _load_proto_description_candidate_bank(self, token_text, candidate_bank_cache):
+        cached_candidate_bank = candidate_bank_cache.get(token_text)
+        if cached_candidate_bank is not None:
+            return cached_candidate_bank
+
+        lookup_attempts = [
+            (
+                "default",
+                self.proto_description_require_detailed_description,
+                self.proto_description_exact_match_text,
+            ),
+            (
+                "relax_require_detailed_description",
+                False,
+                self.proto_description_exact_match_text,
+            ),
+            (
+                "relax_exact_match_text",
+                False,
+                False,
+            ),
+        ]
+
+        seen_configs = set()
+        for attempt_name, require_detailed_description, exact_match_text in lookup_attempts:
+            config_key = (require_detailed_description, exact_match_text)
+            if config_key in seen_configs:
+                continue
+            seen_configs.add(config_key)
+
+            stage = f"proto_description:{attempt_name}"
+            try:
+                candidates_df, definition_column = load_wikidata_definition_candidates(
+                    token_text,
+                    use_detailed_description=self.proto_description_use_detailed_description,
+                    exact_match_text=exact_match_text,
+                    exact_match_first=self.proto_description_exact_match_first,
+                    limit=self.proto_description_candidate_limit,
+                    require_detailed_description=require_detailed_description,
+                )
+            except ValueError:
+                self._log_wikidata_no_result(
+                    token_text,
+                    stage,
+                    "no_candidate_definitions",
+                )
+                continue
+
+            candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column=definition_column)
+            if candidate_bank:
+                candidate_bank_cache[token_text] = candidate_bank
+                if attempt_name != "default":
+                    self._log_proto_description_operation(
+                        "fallback_wikidata_candidate_lookup",
+                        token_text=token_text,
+                        fallback=attempt_name,
+                        require_detailed_description=require_detailed_description,
+                        exact_match_text=exact_match_text,
+                        candidate_count=len(candidate_bank),
+                    )
+                return candidate_bank
+
+            self._log_wikidata_no_result(
+                token_text,
+                stage,
+                "empty_candidate_bank",
+            )
+
+        candidate_bank_cache[token_text] = []
+        return []
+
     def _predict_proto_description_from_samples(
         self,
         proto_node,
@@ -1283,27 +1354,10 @@ class ProtoGraphRAG:
         max_samples=10,
     ):
         token_text = proto_node.token_node.token_text
-        candidate_bank = candidate_bank_cache.get(token_text)
-        if candidate_bank is None:
-            try:
-                candidates_df, definition_column = load_wikidata_definition_candidates(
-                    token_text,
-                    use_detailed_description=self.proto_description_use_detailed_description,
-                    exact_match_text=self.proto_description_exact_match_text,
-                    exact_match_first=self.proto_description_exact_match_first,
-                    limit=self.proto_description_candidate_limit,
-                    require_detailed_description=self.proto_description_require_detailed_description,
-                )
-            except ValueError:
-                candidate_bank_cache[token_text] = []
-                self._log_wikidata_no_result(
-                    token_text,
-                    "proto_description",
-                    "no_candidate_definitions",
-                )
-                return None
-            candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column=definition_column)
-            candidate_bank_cache[token_text] = candidate_bank
+        candidate_bank = self._load_proto_description_candidate_bank(
+            token_text,
+            candidate_bank_cache,
+        )
 
         if not candidate_bank:
             self._log_wikidata_no_result(
@@ -2424,6 +2478,7 @@ class ProtoGraphRAG:
             for proto_node in token_node.proto_node_list:
                 result[token_node.token_text]["prototypes"].append({
                     "proto_node_id": proto_node.proto_node_id,
+                    "description": proto_node.description,
                     "chunk_count": len(proto_node.chunk_node_list),
                     "sentence_examples": self._collect_proto_sentence_examples(
                         proto_node,
@@ -2527,8 +2582,10 @@ class ProtoGraphRAG:
             )
 
             for proto_info in token_info["prototypes"]:
+                description = proto_info.get("description") or "(none)"
                 lines.append(
                     f"  [Proto] proto_node_id={proto_info['proto_node_id']} | "
+                    f"description={description!r} | "
                     f"chunk_count={proto_info['chunk_count']}"
                 )
 
@@ -2575,8 +2632,10 @@ class ProtoGraphRAG:
             )
 
             for proto_info in token_info["prototypes"]:
+                description = proto_info.get("description") or "(none)"
                 proto_header = (
                     f"proto_node_id={proto_info['proto_node_id']} | "
+                    f"description={description} | "
                     f"chunk_count={proto_info['chunk_count']}"
                 )
                 html_parts.append(
