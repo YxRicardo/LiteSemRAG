@@ -15,24 +15,20 @@ import math
 import re
 from typing import Sequence, Optional, Set
 
+# Compute MRR for one query using retrieved titles and gold titles.
 def mrr_for_one_query_titles(
     ranked_titles: Sequence[str],
     gold_titles: Sequence[str],
     k: Optional[int] = 10,
     normalize: bool = True,
 ) -> float:
-    """
-    MRR@k for one query, where both retrieved items and gold labels are title strings.
 
-    - Multi-gold: the first occurrence of ANY gold title determines reciprocal rank.
-    - If no gold appears in top-k, returns 0.0
-    """
-
+    # Normalize a title for case-insensitive comparison.
     def norm(s: str, do_norm: bool = normalize) -> str:
         s = str(s).strip()
         if do_norm:
             s = s.lower()
-            s = " ".join(s.split())  # collapse multiple spaces/tabs/newlines
+            s = " ".join(s.split())                                          
         return s
 
     gold_set: Set[str] = {norm(t) for t in gold_titles if t is not None and str(t).strip()}
@@ -45,7 +41,7 @@ def mrr_for_one_query_titles(
         if t is None:
             continue
         if norm(t) in gold_set:
-            return 1.0 / (idx + 1)  # 1-indexed rank
+            return 1.0 / (idx + 1)                  
     return 0.0
 
 time_stamp = datetime.now().strftime("%m-%d-%H-%M")
@@ -79,6 +75,7 @@ NON_WIKIPEDIA_SITELINK_SITES = {
 }
 
 
+# Import optional Wikidata dependencies only when they are needed.
 def _import_wikidata_deps():
     import pandas as pd
     import requests
@@ -86,8 +83,8 @@ def _import_wikidata_deps():
     return requests, pd
 
 
+# Fetch JSON from an HTTP endpoint and return an empty object on failure.
 def _safe_get_json(url, params=None, headers=None, timeout=30):
-    """Safely call an HTTP JSON endpoint and return parsed JSON (or empty dict on failure)."""
     requests, _ = _import_wikidata_deps()
     try:
         response = requests.get(
@@ -106,8 +103,8 @@ def _safe_get_json(url, params=None, headers=None, timeout=30):
         return {}
 
 
+# Convert Wikidata aliases into a clean comma-separated string.
 def _coerce_aliases_for_search(value):
-    """Convert aliases from wbsearchentities result into a clean comma-separated string."""
     if value is None:
         return ""
     if isinstance(value, list):
@@ -117,38 +114,45 @@ def _coerce_aliases_for_search(value):
     return str(value)
 
 
+# Convert a pandas Series into string values safe for string operations.
 def _safe_string_series(series):
-    """Convert a pandas Series to a string-valued Series safe for .str accessors."""
     return series.map(lambda value: "" if value is None else str(value))
 
 
+# Build a case-insensitive equality mask for a pandas Series.
 def _series_casefold_equals(series, target: str):
     target_casefold = str(target).casefold()
     return series.map(lambda value: ("" if value is None else str(value)).casefold() == target_casefold)
 
 
+# Build a case-insensitive containment mask for a pandas Series.
 def _series_casefold_contains(series, target: str):
     target_casefold = str(target).casefold()
     return series.map(lambda value: target_casefold in ("" if value is None else str(value)).casefold())
 
 
+# Build a mask for non-empty string values in a pandas Series.
 def _series_non_empty_mask(series):
     return series.map(lambda value: ("" if value is None else str(value)).strip() != "")
 
 
+# Return whether a label starts with an uppercase character.
 def _starts_with_uppercase_label(value) -> bool:
     text = "" if value is None else str(value).strip()
     return bool(text) and text[0].isupper()
 
 
+# Count whitespace-separated words in a value.
 def _word_count(value) -> int:
     return len(("" if value is None else str(value)).strip().split())
 
 
+# Extract lowercase alphanumeric word tokens from a value.
 def _word_tokens(value) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+", ("" if value is None else str(value)).casefold())
 
 
+# Return whether a value contains the target word sequence in order.
 def _contains_ordered_word_sequence(value, target: str, allow_at_start: bool = True) -> bool:
     value_tokens = _word_tokens(value)
     target_tokens = _word_tokens(target)
@@ -162,6 +166,7 @@ def _contains_ordered_word_sequence(value, target: str, allow_at_start: bool = T
     )
 
 
+# Return whether an alias list exactly contains the target text.
 def _alias_exact_match(value, target: str) -> bool:
     target_text = str(target).strip()
     if not target_text:
@@ -175,6 +180,7 @@ def _alias_exact_match(value, target: str) -> bool:
     return any(alias == target_text for alias in aliases if alias)
 
 
+# Build a mask that removes generic name-description rows.
 def _series_exclude_name_descriptions(series):
     blocked_phrases = ("family name", "given name")
     return series.map(
@@ -183,6 +189,7 @@ def _series_exclude_name_descriptions(series):
     )
 
 
+# Return whether a Wikidata search term is too weak or noisy to query.
 def _should_skip_wikidata_term(term: str) -> bool:
     normalized_term = str(term).strip()
     if not normalized_term:
@@ -198,8 +205,8 @@ def _should_skip_wikidata_term(term: str) -> bool:
     return any(token in ENGLISH_NUMBER_WORDS for token in word_tokens)
 
 
+# Return the best Wikipedia title from a Wikidata entity sitelink map.
 def extract_best_wikipedia_title(entity, language="en"):
-    """Return the best Wikipedia title from a Wikidata entity's sitelinks."""
     if not isinstance(entity, dict):
         return ""
 
@@ -224,6 +231,7 @@ def extract_best_wikipedia_title(entity, language="en"):
     return ""
 
 
+# Limit text to a requested number of sentence-like segments.
 def _truncate_to_sentences(text, sentences):
     if not text or sentences is None or sentences <= 0:
         return text or ""
@@ -235,8 +243,8 @@ def _truncate_to_sentences(text, sentences):
     return " ".join(parts[:sentences])
 
 
+# Fetch a short introductory summary for a Wikipedia title.
 def fetch_wikipedia_intro(title, language="en", headers=None, timeout=30, sentences=3):
-    """Fetch a short introductory summary for a Wikipedia title."""
     if not isinstance(title, str) or not title.strip():
         return ""
 
@@ -268,6 +276,7 @@ def fetch_wikipedia_intro(title, language="en", headers=None, timeout=30, senten
     return ""
 
 
+# Fetch Wikipedia-backed descriptions keyed by Wikidata entity ID.
 def fetch_detailed_descriptions_for_entities(
     entity_ids,
     language="en",
@@ -275,7 +284,6 @@ def fetch_detailed_descriptions_for_entities(
     timeout=30,
     sentences=3,
 ):
-    """Fetch Wikipedia-backed detailed descriptions keyed by Wikidata entity ID."""
     if not entity_ids:
         return {}
 
@@ -310,8 +318,8 @@ def fetch_detailed_descriptions_for_entities(
     return detailed_descriptions
 
 
+# Return entity IDs that have Wikipedia sitelinks in the preferred language.
 def filter_entity_ids_with_wikipedia_sitelinks(entity_ids, language="en", headers=None, timeout=30):
-    """Return entity IDs that have a Wikipedia sitelink, preferring the requested language."""
     if not entity_ids:
         return set()
 
@@ -344,6 +352,7 @@ def filter_entity_ids_with_wikipedia_sitelinks(entity_ids, language="en", header
     return valid_entity_ids
 
 
+# Search Wikidata and return normalized candidate rows with descriptions.
 def search_wikidata(
     term,
     language="en",
@@ -356,9 +365,6 @@ def search_wikidata(
     filter_name=True,
     label_contains_text=True,
 ):
-    """
-    Search Wikidata entities using the same interface as explore_wikidata.ipynb.
-    """
     _, pd = _import_wikidata_deps()
 
     if not isinstance(term, str) or not term.strip():
@@ -449,6 +455,7 @@ def search_wikidata(
     return df
 
 
+# Select usable Wikidata candidates using span-aware label and alias rules.
 def _select_wikidata_candidates_by_span_rules(
     candidates_df,
     query_text: str,
@@ -503,6 +510,7 @@ def _select_wikidata_candidates_by_span_rules(
     return selected
 
 
+# Load Wikidata definition candidates suitable for semantic-description scoring.
 def load_wikidata_definition_candidates(
     query_text: str,
     use_detailed_description: bool = True,
@@ -554,6 +562,7 @@ def load_wikidata_definition_candidates(
     return candidates_df, definition_column
 
 
+# Convert a definition into a natural-language NLI hypothesis.
 def definition_to_hypothesis(definition: str) -> str:
     cleaned_definition = definition.strip()
     if cleaned_definition.endswith((".", "!", "?")):
@@ -561,6 +570,7 @@ def definition_to_hypothesis(definition: str) -> str:
     return f"It refers to {cleaned_definition}."
 
 
+# Normalize CrossEncoder prediction outputs into a flat score array.
 def extract_cross_encoder_scores(raw_scores, model) -> np.ndarray:
     score_array = np.asarray(raw_scores)
     if score_array.ndim == 1:
@@ -579,6 +589,7 @@ def extract_cross_encoder_scores(raw_scores, model) -> np.ndarray:
     return score_array[:, entailment_index].astype(float)
 
 
+# Build candidate dictionaries used by semantic-description prediction.
 def build_wikidata_candidate_bank(candidates_df, definition_column: str) -> list[dict]:
     candidate_bank = []
     for row in candidates_df.itertuples(index=False):
@@ -596,9 +607,9 @@ def build_wikidata_candidate_bank(candidates_df, definition_column: str) -> list
     return candidate_bank
 
 
+# Fetch and cache lightweight Wikidata info for an exact term lookup.
 @lru_cache(maxsize=4096)
 def _get_wikidata_term_info_cached(term, language="en", filter_name=True):
-    """Return exact-match Wikidata row count plus description list using a lightweight lookup."""
     if _should_skip_wikidata_term(term):
         return 0, ("an entity",)
 
@@ -645,55 +656,54 @@ def _get_wikidata_term_info_cached(term, language="en", filter_name=True):
     return row_count, tuple(descriptions)
 
 
+# Return cached Wikidata lookup information for a term.
 def get_wikidata_term_info(term, language="en", filter_name=True):
     normalized_term = " ".join(str(term).strip().split())
     return _get_wikidata_term_info_cached(normalized_term, language=language, filter_name=filter_name)
 
 
+# Return whether Wikidata suggests multiple detailed meanings for a term.
 @lru_cache(maxsize=4096)
 def is_multi_semantic_by_wikidata(term, language="en", filter_name=True):
-    """Return True when a term resolves to more than one detailed exact-match Wikidata entity."""
     row_count, _ = get_wikidata_term_info(term, language=language, filter_name=filter_name)
     return row_count > 1
 
+# Return an L2-normalized NumPy vector.
 def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     n = np.linalg.norm(x)
     return x / (n + eps)
 
-# 其实在 100 样本规模：
-#
-# 👉 HDBSCAN 不一定是最优
-# 👉 有时层次聚类（Agglomerative）更清晰
-# from sklearn.cluster import AgglomerativeClustering
-#
-# clustering = AgglomerativeClustering(
-#     n_clusters=3,
-#     affinity='euclidean',
-#     linkage='ward'
-# )
+               
+ 
+                  
+                            
+                                                     
+ 
+                                       
+                   
+                           
+                    
+   
 
 
+# Cluster embeddings with HDBSCAN and return labels, members, and centers.
 def hdbscan_cluster(
     embeds_list,
     min_cluster_size=10,
     percentile=0.9,
     merge_chunks=False
     ):
-    """
-    embeds_list: List[(embedding_tensor, chunk_node)]
-    merge_chunks: 是否按照 chunk_node_id 聚合
-    """
 
-    # Kept for backward compatibility with existing callers.
+                                                            
     _ = percentile
     original_count = len(embeds_list)
 
     merged_embeds = []
     merged_to_original = []
 
-    # =========================
-    # 1️⃣ 聚合 or 不聚合
-    # =========================
+                               
+                   
+                               
     if merge_chunks:
 
         chunk_groups = defaultdict(list)
@@ -728,9 +738,9 @@ def hdbscan_cluster(
     merged_embeds = np.array(merged_embeds)
     merged_count = len(merged_embeds)
 
-    # =========================
-    # 2️⃣ min_cluster_size 缩放
-    # =========================
+                               
+                             
+                               
     if merge_chunks:
         k = merged_count / original_count
     else:
@@ -738,38 +748,38 @@ def hdbscan_cluster(
 
     scaled_min_cluster_size = max(2, math.ceil(min_cluster_size * k))
 
-    # =========================
-    # 3️⃣ L2 normalize
-    # =========================
+                               
+                      
+                               
     norms = np.linalg.norm(merged_embeds, axis=1, keepdims=True)
     norms[norms == 0] = 1
     X_norm = merged_embeds / norms
 
-    # =========================
-    # 4️⃣ PCA
-    # =========================
+                               
+             
+                               
     pca_n_components = min(50, X_norm.shape[0], X_norm.shape[1])
     pca = PCA(n_components=pca_n_components)
     X_reduced = pca.fit_transform(X_norm)
 
-    # =========================
-    # 5️⃣ HDBSCAN
-    # =========================
+                               
+                 
+                               
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=scaled_min_cluster_size,
-        # min_samples=max(2, scaled_min_cluster_size // 2),
+                                                           
         metric="euclidean",
-        # cluster_selection_method='eom',
-        # cluster_selection_epsilon=0.05
+                                         
+                                        
     )
 
     cluster_labels = clusterer.fit_predict(X_reduced)
 
     n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
 
-    # =========================
-    # 6️⃣ 映射回原始 index
-    # =========================
+                               
+                     
+                               
     clusters = defaultdict(list)
 
     for merged_idx, label in enumerate(cluster_labels):
@@ -778,9 +788,9 @@ def hdbscan_cluster(
 
         clusters[label].extend(original_indices)
 
-    # =========================
-    # 7️⃣ cluster centers
-    # =========================
+                               
+                         
+                               
     cluster_centers = {}
 
     for label in clusters.keys():
@@ -801,65 +811,68 @@ def hdbscan_cluster(
 
     return n_clusters, clusters, cluster_centers
 
+# Compute a similarity threshold from edge weights using a percentile.
 def get_anomaly_threshold(values, percentile):
     q = 1 - percentile
     return float(np.percentile(values, q * 100))
 
-# def get_anomaly_threshold(center, embeds_list, percentile):
-#     embeds = torch.stack(embeds_list)
-#
-#     center = torch.nn.functional.normalize(center, p=2, dim=0)
-#     embeds = torch.nn.functional.normalize(embeds, p=2, dim=1)
-#
-#     similarities = embeds @ center
-#
-#     threshold = torch.quantile(similarities, 1 - percentile)
-#
-#     return threshold.item()
+                                                             
+                                       
+ 
+                                                                
+                                                                
+ 
+                                    
+ 
+                                                              
+ 
+                             
 
-# def hdbscan_cluster(embeds_list, min_size=5):
-#     X = np.array(embeds_list)
-#
-#     clusterer = hdbscan.HDBSCAN(
-#         min_cluster_size=min_size,
-#         metric='cosine'
-#     )
-#
-#     cluster_labels = clusterer.fit_predict(X)
-#     n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-#
-#     clusters = defaultdict(list)
-#
-#     for idx, label in enumerate(cluster_labels):
-#         clusters[label].append(idx)
-#
-#     clusters.pop(-1, None)
-#     cluster_centers = {}
-#
-#     for label, indices in clusters.items():
-#         cluster_embeds = X[indices]
-#         center = np.mean(cluster_embeds, axis=0)
-#         norm = np.linalg.norm(center)
-#         if norm > 0:
-#             center = center / norm
-#
-#         cluster_centers[label] = center
-#     return n_clusters, clusters, cluster_centers
+                                               
+                               
+ 
+                                  
+                                    
+                         
+       
+ 
+                                               
+                                                                                
+ 
+                                  
+ 
+                                                  
+                                     
+ 
+                            
+                          
+ 
+                                             
+                                     
+                                                  
+                                       
+                      
+                                    
+ 
+                                         
+                                                  
 
+# Average-pool transformer hidden states using an attention mask.
 def e5_average_pool(last_hidden_states, attention_mask):
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
     return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
 
 
-# def get_s_mean(embeds_buffer):
-#     embeds_mat = np.stack(embeds_buffer, axis=0)
-#     mu = l2_normalize(embeds_mat.mean(axis=0))
-#     E_norm = embeds_mat / (np.linalg.norm(embeds_mat, axis=1, keepdims=True) + 1e-12)
-#     s_mean = float(E_norm @ mu).mean()
-#     return s_mean
+                                
+                                                  
+                                                
+                                                                                       
+                                        
+                   
 
+# Compute mean cosine concentration for a set of embeddings.
 def get_s_mean(embeds_buffer):
-    embeds_mat = torch.stack(embeds_buffer)  # [N, 1024]
+    embeds_mat = torch.stack(embeds_buffer)             
     mu = F.normalize(embeds_mat.mean(dim=0), dim=0)
     E_norm = F.normalize(embeds_mat, dim=1)
 
@@ -867,18 +880,11 @@ def get_s_mean(embeds_buffer):
     return s_mean.item()
 
 
+# Return indices that would sort a sequence of values.
 def sorted_indices(values: Sequence[float]) -> list[int]:
-    """
-    Sorts the list of values and returns the indices of the sorted order.
-
-    Args:
-        values (Sequence[float]): The input list of values to be sorted.
-
-    Returns:
-        list[int]: Indices of the values in sorted order.
-    """
     return sorted(range(len(values)), key=lambda i: values[i])
 
+# Average and normalize a list of tensor embeddings.
 def average_embeds(tensors, eps=1e-12):
     x = torch.stack(tensors, dim=0)
     x = F.normalize(x, p=2, dim=1)
@@ -886,27 +892,24 @@ def average_embeds(tensors, eps=1e-12):
     return F.normalize(m, p=2, dim=0)
 
 
+# Compute cosine similarities between a semantic node embedding and its member embeddings.
 def sem_embed_sim(sem_node):
     sem_embed = sem_node.embed
     chunk_node_embed = torch.stack(sem_node.chunk_node_embed)
-    sem_embed = sem_embed.unsqueeze(0)  # [1, d]
+    sem_embed = sem_embed.unsqueeze(0)          
     sim = F.cosine_similarity(chunk_node_embed, sem_embed, dim=1)
 
     return sim
 
+# Combine duplicate chunk similarities for a semantic node.
 def sem_node_combine_sim(sim, sem_node, r=3):
-    """
-    sim: list/iterable of similarity floats (same length as sem_node.chunk_node)
-    sem_node.chunk_node: list of chunk nodes (may contain duplicates)
-    r: top-r to average
-    """
     bucket = defaultdict(list)
 
-    # collect sims per chunk
+                            
     for s, chunk in zip(sim, sem_node.chunk_node_list):
         bucket[chunk].append(float(s))
 
-    # unique chunks + top-r mean
+                                
     new_chunks = []
     combined_sim = []
     for chunk, sims in bucket.items():
@@ -919,14 +922,16 @@ def sem_node_combine_sim(sim, sem_node, r=3):
     return combined_sim
 
 
+# Return the most similar semantic node for an embedding.
 def inspect_sem_nodes(embed, sem_node_list):
-    B = torch.stack([sem_node.embed for sem_node in sem_node_list])  # [N, D]
-    A = embed.unsqueeze(0)  # [1, D]
+    B = torch.stack([sem_node.embed for sem_node in sem_node_list])          
+    A = embed.unsqueeze(0)          
     similarities = F.cosine_similarity(A, B, dim=1)
     max_val, max_idx = torch.max(similarities, dim=0)
     return max_val, max_idx
 
 
+# Plot clustered embeddings with PCA and t-SNE visualizations.
 def plot_embeddings(embed, token, clusters):
     folder_name = time_stamp
     current_dir = os.getcwd()
@@ -934,18 +939,18 @@ def plot_embeddings(embed, token, clusters):
     folder_path = os.path.join(base_dir, folder_name)
     os.makedirs(folder_path, exist_ok=True)
 
-    embeddings = torch.stack(embed)  # shape: (N, D)
+    embeddings = torch.stack(embed)                 
     embeddings_np = embeddings.detach().cpu().numpy()
 
-    # tsne = TSNE(n_components=2, random_state=42)
-    # reduced = tsne.fit_transform(embeddings_np)
+                                                  
+                                                 
 
     pca = PCA(n_components=min(50, embeddings_np.shape[1]))
     reduced = pca.fit_transform(embeddings_np)
 
     N = len(embed)
 
-    # 为每个点建立cluster标签
+                     
     labels = [-1] * N
     for cid, idx_list in clusters.items():
         for idx in idx_list:
@@ -956,7 +961,7 @@ def plot_embeddings(embed, token, clusters):
 
     plt.figure()
 
-    # 颜色映射
+          
     cmap = plt.cm.get_cmap("tab20", len(unique_clusters))
 
     for i, cid in enumerate(unique_clusters):
@@ -984,7 +989,7 @@ def plot_embeddings(embed, token, clusters):
 
     N = len(embed)
 
-    # 为每个点建立cluster标签
+                     
     labels = [-1] * N
     for cid, idx_list in clusters.items():
         for idx in idx_list:
@@ -995,7 +1000,7 @@ def plot_embeddings(embed, token, clusters):
 
     plt.figure()
 
-    # 颜色映射
+          
     cmap = plt.cm.get_cmap("tab20", len(unique_clusters))
 
     for i, cid in enumerate(unique_clusters):
@@ -1020,6 +1025,7 @@ def plot_embeddings(embed, token, clusters):
 
 
 
+# Print an approximate object size in megabytes.
 def print_size_mb(obj, precision=2):
     size_bytes = asizeof.asizeof(obj)
     size_mb = size_bytes / (1024 * 1024)
@@ -1027,22 +1033,18 @@ def print_size_mb(obj, precision=2):
 
 
 
+# Return the index of the tensor most similar to a query tensor.
 def max_cosine_similarity_index(query_tensor, tensor_list):
-    """
-    query_tensor: shape (d,)
-    tensor_list:  list of tensors, each shape (d,)
-    return: index of tensor with max cosine similarity
-    """
 
     if len(tensor_list) == 0:
         return None
 
-    matrix = torch.stack(tensor_list)  # shape: (n, d)
+    matrix = torch.stack(tensor_list)                 
 
-    query_norm = F.normalize(query_tensor.unsqueeze(0), dim=1)  # (1, d)
-    matrix_norm = F.normalize(matrix, dim=1)  # (n, d)
+    query_norm = F.normalize(query_tensor.unsqueeze(0), dim=1)          
+    matrix_norm = F.normalize(matrix, dim=1)          
 
-    similarities = torch.mm(query_norm, matrix_norm.t()).squeeze(0)  # (n,)
+    similarities = torch.mm(query_norm, matrix_norm.t()).squeeze(0)        
 
     max_index = torch.argmax(similarities).item()
 
@@ -1051,13 +1053,8 @@ def max_cosine_similarity_index(query_tensor, tensor_list):
 import json
 from pathlib import Path
 
+# Load HotpotQA distractor examples into a simplified structure.
 def load_hotpot_distractor(file_path):
-    """
-    Load HotpotQA distractor setting.
-
-    Returns:
-        samples (list of dict)
-    """
 
     file_path = Path(file_path)
 
@@ -1069,13 +1066,13 @@ def load_hotpot_distractor(file_path):
     for item in data:
         sample = {}
 
-        # 基本字段
+              
         sample["id"] = item["_id"]
         sample["question"] = item["question"]
         sample["answer"] = item["answer"]
 
-        # supporting facts
-        # 格式: [["Page_Title", sentence_id], ...]
+                          
+                                                
         supporting_pages = set()
         supporting_sentences = {}
 
@@ -1086,15 +1083,15 @@ def load_hotpot_distractor(file_path):
         sample["supporting_pages"] = list(supporting_pages)
         sample["supporting_sentences"] = supporting_sentences
 
-        # context (10篇文章)
-        # 格式: [["Page_Title", ["sent1", "sent2", ...]], ...]
+                         
+                                                            
         documents = []
 
         for title, sentences in item["context"]:
             doc = {
                 "title": title,
                 "sentences": sentences,
-                "text": " ".join(sentences)  # 拼成整篇文章
+                "text": " ".join(sentences)          
             }
             documents.append(doc)
 
@@ -1104,13 +1101,8 @@ def load_hotpot_distractor(file_path):
 
     return samples
 
+# Build a deduplicated document list from HotpotQA context records.
 def build_global_document_list(file_path):
-    """
-    从 HotpotQA distractor 数据构建全局去重文档列表
-
-    返回:
-        documents: list[dict]
-    """
 
     file_path = Path(file_path)
 
@@ -1122,10 +1114,10 @@ def build_global_document_list(file_path):
     for item in data:
         for title, sentences in item["context"]:
 
-            # 拼接成完整文本
+                     
             text = " ".join(sentences).strip()
 
-            # 用 title 做唯一键（HotpotQA 基本可行）
+                                         
             if title not in doc_store:
                 doc_store[title] = {
                     "doc_id": title,
@@ -1134,7 +1126,7 @@ def build_global_document_list(file_path):
                     "sentences": sentences
                 }
             else:
-                # 如果出现重复 title 但文本更长，可以选择替换
+                                           
                 if len(text) > len(doc_store[title]["text"]):
                     doc_store[title]["text"] = text
                     doc_store[title]["sentences"] = sentences
@@ -1151,19 +1143,14 @@ import pickle
 from pathlib import Path
 
 
+# Build or load cached HotpotQA documents and retrieval samples.
 def build_hotpot_retrieval_dataset(file_path, num_samples=None):
-    """
-    构建 HotpotQA retrieval dataset，并带缓存机制
-
-    返回:
-        documents, samples
-    """
 
     file_path = Path(file_path)
 
-    # -----------------------------
-    # cache 目录
-    # -----------------------------
+                                   
+              
+                                   
 
     cache_dir = Path("./hotpot_QA")
     cache_dir.mkdir(exist_ok=True)
@@ -1173,9 +1160,9 @@ def build_hotpot_retrieval_dataset(file_path, num_samples=None):
     documents_cache = cache_dir / f"hotpot_documents_{tag}.pkl"
     samples_cache = cache_dir / f"hotpot_samples_{tag}.pkl"
 
-    # -----------------------------
-    # 如果缓存存在，直接读取
-    # -----------------------------
+                                   
+                 
+                                   
 
     if documents_cache.exists() and samples_cache.exists():
         print("Loading cached dataset...")
@@ -1191,9 +1178,9 @@ def build_hotpot_retrieval_dataset(file_path, num_samples=None):
 
         return documents, samples
 
-    # -----------------------------
-    # 否则重新构建
-    # -----------------------------
+                                   
+            
+                                   
 
     print("Building dataset from raw file...")
 
@@ -1203,9 +1190,9 @@ def build_hotpot_retrieval_dataset(file_path, num_samples=None):
     if num_samples is not None:
         data = data[:num_samples]
 
-    # -----------------------------
-    # Step 1: 构建全局去重文档库
-    # -----------------------------
+                                   
+                       
+                                   
 
     title_to_doc = {}
 
@@ -1241,9 +1228,9 @@ def build_hotpot_retrieval_dataset(file_path, num_samples=None):
 
     print(f"Total unique documents: {len(documents)}")
 
-    # -----------------------------
-    # Step 2: 构建 samples
-    # -----------------------------
+                                   
+                        
+                                   
 
     samples = []
 
@@ -1268,9 +1255,9 @@ def build_hotpot_retrieval_dataset(file_path, num_samples=None):
 
     print(f"Total samples: {len(samples)}")
 
-    # -----------------------------
-    # 保存缓存
-    # -----------------------------
+                                   
+          
+                                   
 
     with open(documents_cache, "wb") as f:
         pickle.dump(documents, f)

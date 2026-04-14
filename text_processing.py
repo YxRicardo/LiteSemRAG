@@ -4,18 +4,9 @@ import torch.nn.functional as F
 import re
 
 
+# Normalize raw text by standardizing whitespace, quotes, and casing while preserving selected proper-case spans.
 def clean_text(text):
-    """
-    功能说明：
-    1. 去除因换行产生的断词（如 "-\n"），并将多个换行和多余空白字符替换为单个空格。
-    2. 识别连续两个及以上的大写缩写词（如 NASA）并保护。
-    3. 识别连续两个及以上首字母大写的单词（如 John Smith）并保护。
-    4. 删除所有英文引号（单引号 ' 和双引号 "）。
-    5. 将全文转换为小写。
-    6. 将之前替换的内容恢复。
-    7. 返回去除首尾空格后的清洗文本。
-    """
-    # 1. 处理换行和空白
+                
     text = re.sub(r'-\n', '', text)
     text = re.sub(r'\n+', ' ', text)
     text = re.sub(r'\s+', ' ', text)
@@ -23,14 +14,14 @@ def clean_text(text):
     placeholders = {}
     counter = 0
 
-    # 2. 保护全大写缩写（NASA, USA）
+                           
     for match in re.findall(r'\b[A-Z]{2,}\b', text):
         placeholder = f"__PH_{counter}__"
         placeholders[placeholder] = match
         text = text.replace(match, placeholder)
         counter += 1
 
-    # 3. 保护连续首字母大写单词（John Smith）
+                                
     pattern = r'\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'
     for match in re.findall(pattern, text):
         placeholder = f"__PH_{counter}__"
@@ -38,19 +29,20 @@ def clean_text(text):
         text = text.replace(match, placeholder)
         counter += 1
 
-    # 4. 删除英文引号
+               
     text = re.sub(r"[\"']", "", text)
 
-    # 5. 转小写
+            
     text = text.lower()
 
-    # 6. 恢复占位符
+              
     for placeholder, original in placeholders.items():
         text = text.replace(placeholder.lower(), original)
 
     return text.strip()
 
 
+# Group sentences into chunks that stay under the configured token budget.
 def chunk_by_sentences(text, nlp, max_tokens=200):
     doc = nlp(text)
     chunks = []
@@ -74,6 +66,7 @@ def chunk_by_sentences(text, nlp, max_tokens=200):
 
     return chunks
 
+# Read a document and split it into token-limited text chunks.
 def split_doc(doc_name, nlp, max_tokens=300):
     with fitz.open(doc_name) as pdf:
         text = "".join(page.get_text() for page in pdf)
@@ -84,28 +77,34 @@ def split_doc(doc_name, nlp, max_tokens=300):
     return chunks
 
 
+# Format a span-like item into readable debug text.
 def _debug_item_text(item):
     return getattr(item, "text", str(item))
 
 
+# Build a compact debug prefix for span extraction messages.
 def _debug_prefix(item_type, stage=None):
     if stage:
         return f"[{stage}][{item_type}]"
     return f"[{item_type}]"
 
 
+# Print a span extraction stage header when debug mode is enabled.
 def _debug_stage(stage):
     print(f"\n=== {stage} ===")
 
 
+# Print a debug message for a discarded span candidate.
 def _debug_skip(item_type, item, reason, stage=None):
     print(f"{_debug_prefix(item_type, stage)} Skipping '{_debug_item_text(item)}': {reason}")
 
 
+# Print a debug message for a retained span candidate.
 def _debug_keep(item_type, item, reason="passed all filters", stage=None):
     return
 
 
+# Print span candidates with their labels and character offsets.
 def _debug_dump_spans(name, spans):
     print(f"[final_output] {name} ({len(spans)} items):")
     if not spans:
@@ -116,6 +115,7 @@ def _debug_dump_spans(name, spans):
         print(f"  {index}. '{text}' [{start_char}, {end_char})")
 
 
+# Collect valid named entities and spans that should influence phrase filtering.
 def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_stage=None):
     entity_spans = []
     token_intervals = []
@@ -157,24 +157,21 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_
     return entity_spans, token_intervals, char_intervals
 
 
+# Remove phrase candidates that are contained by stronger entity or phrase spans.
 def _drop_contained_phrases(phrases, debug_mode=False, debug_stage=None):
-    """
-    Remove phrases whose character span is fully contained by another phrase span.
-    Keep outer/longer phrases, and keep original output order for survivors.
-    """
     if len(phrases) <= 1:
         return phrases
 
     indexed_phrases = list(enumerate(phrases))
     indexed_phrases.sort(
         key=lambda item: (
-            -(item[1][2] - item[1][1]),  # longer span first
-            item[1][1],                  # then earlier start
-            item[0],                     # then original order
+            -(item[1][2] - item[1][1]),                     
+            item[1][1],                                      
+            item[0],                                          
         )
     )
 
-    kept = []  # tuples: (orig_idx, (text, start_char, end_char))
+    kept = []                                                    
     for orig_idx, phrase in indexed_phrases:
         _, start_char, end_char = phrase
         is_contained = any(
@@ -207,6 +204,7 @@ _QUANTIFIER_WORDS = {
     "twentieth",
 }
 
+# Return whether a text span behaves like a numeric or quantifier expression.
 def _is_quantifier_like(token):
     token_text = token.text.lower()
     token_lemma = token.lemma_.lower() if token.lemma_ else token_text
@@ -227,6 +225,7 @@ def _is_quantifier_like(token):
     return False
 
 
+# Detect single-word spans that should be treated as quantifier-like.
 def _is_single_word_quantifier_span(span):
     meaningful_tokens = [token for token in span if not token.is_space and not token.is_punct]
     if len(meaningful_tokens) != 1:
@@ -236,6 +235,7 @@ def _is_single_word_quantifier_span(span):
     return _is_quantifier_like(token) or re.fullmatch(r"\d+(\.\d+)?", token.text)
 
 
+# Decide whether a spaCy noun chunk is useful enough to index.
 def _is_valid_noun_chunk(noun_chunk, min_tokens=2, debug_mode=False, debug_stage=None):
     if all(token.is_stop or token.is_punct for token in noun_chunk):
         if debug_mode:
@@ -298,6 +298,7 @@ def _is_valid_noun_chunk(noun_chunk, min_tokens=2, debug_mode=False, debug_stage
     return True
 
 
+# Decide whether a token is useful enough to index as an important token.
 def _is_valid_token(token, debug_mode=False, debug_stage=None):
     if token.is_space or token.is_punct or token.is_stop:
         if debug_mode:
@@ -381,6 +382,7 @@ def _is_valid_token(token, debug_mode=False, debug_stage=None):
         _debug_keep("token", token, stage=debug_stage)
     return True
 
+# Extract important phrase and token spans from text using spaCy filtering rules.
 def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,discard_no_word=False,debug_mode=False):
     doc = nlp(chunk)
 
@@ -479,7 +481,9 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
     return important_phrases, important_tokens
 
 
+# Normalize text for matching by lowercasing words and removing leading articles.
 def normalize_text(text: str) -> str:
+    # Normalize one word while preserving meaningful acronyms.
     def process_word(word: str) -> str:
         if re.search(r'[A-Z]{2,}', word):
             return word
@@ -489,13 +493,14 @@ def normalize_text(text: str) -> str:
     if not words:
         return ""
 
-    # 如果第一个单词是冠词（忽略大小写），删除
+                          
     if words[0].lower() in {"the", "a", "an"}:
         words = words[1:]
 
     return ' '.join(process_word(word) for word in words)
 
 
+# Normalize a token span into a clean query/index surface form.
 def _normalize_token_text(token) -> str:
     token_text = token.text
     token_numbers = set(token.morph.get("Number"))
@@ -505,6 +510,7 @@ def _normalize_token_text(token) -> str:
             token_text = lemma_text
     return normalize_text(token_text)
 
+# Extract named entities and phrase spans for indexing or querying.
 def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
     doc = nlp(chunk)
     important_phrases, _, phrase_token_spans = _collect_valid_entities(doc, debug_mode=debug_mode)
@@ -535,6 +541,7 @@ def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
 
     return important_phrases, num_ents
 
+# Extract important standalone token spans for indexing or querying.
 def extract_important_tokens(chunk,nlp,debug_mode=False):
     doc = nlp(chunk)
     spans = []
@@ -549,11 +556,12 @@ def extract_important_tokens(chunk,nlp,debug_mode=False):
 
     return spans
 
+# Find tokenizer token indices that overlap a character span.
 def get_token_indices_for_phrase(start_char, end_char, offsets):
     token_indices = []
 
     for idx, (start, end) in enumerate(offsets):
-        if start == end:  # special tokens like [CLS]
+        if start == end:                             
             continue
         if not (end <= start_char or start >= end_char):
             token_indices.append(idx)
@@ -561,12 +569,14 @@ def get_token_indices_for_phrase(start_char, end_char, offsets):
     return token_indices
 
 
+# Return a safe maximum sequence length for tokenizer calls.
 def _get_tokenizer_max_length(tokenizer, fallback=512):
     max_length = getattr(tokenizer, "model_max_length", None)
     if isinstance(max_length, int) and 0 < max_length < 100000:
         return max_length
     return fallback
 
+# Encode one chunk and return token embeddings with offset mappings.
 def encode_chunk(text, text_encoder, tokenizer, device):
     max_length = _get_tokenizer_max_length(tokenizer)
 
@@ -592,6 +602,7 @@ def encode_chunk(text, text_encoder, tokenizer, device):
     return token_embeddings.detach().cpu(), offsets.cpu()
 
 
+# Encode a batch of chunks and return embeddings and offsets per chunk.
 def encode_chunk_batch(text_list, text_encoder, tokenizer, device):
     max_length = _get_tokenizer_max_length(tokenizer)
 
@@ -618,13 +629,14 @@ def encode_chunk_batch(text_list, text_encoder, tokenizer, device):
     return token_embeddings, offsets
 
 
+# Pool token embeddings for phrase and token spans using tokenizer offsets.
 def get_token_embeds(token_embeddings, offsets, phrase_list, token_list):
     phrase_embs = []
     token_embs = []
 
-    # with torch.no_grad():
-    #     outputs = text_encoder(**{k: v.to(device) for k, v in inputs.items() if k != "offset_mapping"})
-    #     token_embeddings = outputs.last_hidden_state[0]  # (seq_len, hidden_dim)
+                           
+                                                                                                         
+                                                                                  
 
     for phrase, start_char, end_char in phrase_list:
         token_idxs = get_token_indices_for_phrase(start_char, end_char, offsets)
@@ -654,6 +666,7 @@ def get_token_embeds(token_embeddings, offsets, phrase_list, token_list):
 
     return phrase_embs, token_embs
 
+# Encode arbitrary text and return token embeddings with offsets.
 def encode_text(query_text, text_encoder, tokenizer, device):
     max_length = _get_tokenizer_max_length(tokenizer)
     inputs = tokenizer(
@@ -670,16 +683,18 @@ def encode_text(query_text, text_encoder, tokenizer, device):
             output_hidden_states=True
         )
         token_embeddings = outputs.hidden_states[-2][0]
-    # with torch.no_grad():
-    #     outputs = text_encoder(**{k: v.to(device) for k, v in inputs.items() if k != "offset_mapping"})
-    #     token_embeddings = outputs.last_hidden_state[0]  # (seq_len, hidden_dim)
+                           
+                                                                                                         
+                                                                                  
     return token_embeddings, offsets
 
+# Return the pooled embedding for a query span based on character offsets.
 def get_embed_by_offest(token_embeddings,offsets, token_metadata):
     phrase, start_char, end_char = token_metadata
     token_idxs = get_token_indices_for_phrase(start_char, end_char, offsets)
     return token_embeddings[token_idxs].mean(dim=0)
 
+# Encode a query and return one pooled query embedding.
 def get_query_embed(query_text, token_list, text_encoder, tokenizer, device):
     token_embeddings, offsets = encode_text(query_text, text_encoder, tokenizer, device)
     token_embs = []
@@ -691,87 +706,73 @@ def get_query_embed(query_text, token_list, text_encoder, tokenizer, device):
     return token_embs
 
 
+# Compute token salience scores by cosine similarity to the sentence embedding.
 def token_salience_cosine(
     last_hidden_state: torch.Tensor,
     attention_mask: torch.Tensor,
     topk: int = 4,
 ):
-    """
-    last_hidden_state: (B, L, H) from DeBERTa (or any transformer)
-    attention_mask:    (B, L) with 1 for real tokens, 0 for padding
-    Returns:
-      topk_idx: (B, topk) token indices with highest salience
-      salience: (B, L) cosine(h_i, sent_vec) for each token
-      sent_vec:(B, H) sentence vector (masked mean pooled, L2-normalized)
-    """
-    # masked mean pooling to get sentence vector
-    mask = attention_mask.unsqueeze(-1).float()               # (B, L, 1)
-    summed = (last_hidden_state * mask).sum(dim=1)            # (B, H)
-    denom = mask.sum(dim=1).clamp_min(1.0)                    # (B, 1)
-    sent_vec = summed / denom                                 # (B, H)
+                                                
+    mask = attention_mask.unsqueeze(-1).float()                          
+    summed = (last_hidden_state * mask).sum(dim=1)                    
+    denom = mask.sum(dim=1).clamp_min(1.0)                            
+    sent_vec = summed / denom                                         
 
-    # L2 normalize
-    sent_vec = F.normalize(sent_vec, p=2, dim=-1)             # (B, H)
-    tok_vec = F.normalize(last_hidden_state, p=2, dim=-1)     # (B, L, H)
+                  
+    sent_vec = F.normalize(sent_vec, p=2, dim=-1)                     
+    tok_vec = F.normalize(last_hidden_state, p=2, dim=-1)                
 
-    # cosine similarity for each token: dot(normalized vectors)
-    salience = (tok_vec * sent_vec.unsqueeze(1)).sum(dim=-1)  # (B, L)
+                                                               
+    salience = (tok_vec * sent_vec.unsqueeze(1)).sum(dim=-1)          
 
-    # mask out padding tokens so they won't be selected
+                                                       
     salience = salience.masked_fill(attention_mask == 0, -1e9)
 
-    # top-k token positions
-    topk_idx = torch.topk(salience, k=min(topk, salience.size(1)), dim=-1).indices  # (B, topk)
+                           
+    topk_idx = torch.topk(salience, k=min(topk, salience.size(1)), dim=-1).indices             
 
     return topk_idx, salience, sent_vec
 
 
 
+# Print the highest-salience tokenizer tokens for inspection.
 def print_topk_tokens(tokenizer, input_ids: torch.Tensor, topk_idx: torch.Tensor):
-    """
-    tokenizer: HuggingFace tokenizer
-    input_ids: (B, L)
-    topk_idx:  (B, K) token positions
-    """
     B, K = topk_idx.shape
     for b in range(B):
-        ids = input_ids[b, topk_idx[b]].tolist()            # K ids
-        toks = tokenizer.convert_ids_to_tokens(ids)         # K token strings
+        ids = input_ids[b, topk_idx[b]].tolist()                   
+        toks = tokenizer.convert_ids_to_tokens(ids)                          
         print(f"[batch {b}] top tokens:", toks)
 
+# Count spaCy tokens in a text string.
 def get_num_tokens(text, nlp):
     return len(nlp(text))
 
 
+# Count whitespace-separated words in text.
 def count_words(text: str) -> int:
     if not text:
         return 0
     words = text.split()
     return len(words)
 
+# Return whether every whitespace-separated word is numeric.
 def all_words_are_digits(s: str) -> bool:
 
     words = s.split()
-    if not words:  # 空字符串或全空白
+    if not words:            
         return False
     return all(w.isdigit() for w in words)
 
+# Return whether one phrase appears as a whole phrase inside another.
 def phrase_is_contained(intervals, new_interval):
     new_start, new_end = new_interval
     return any(s <= new_start and new_end <= e for s, e in intervals)
 
+# Compute the BM25 term-frequency saturation factor for a document length.
 def bm25_tf_saturation(tf: int, dl: int, avgdl: float, k1: float = 1.5, b: float = 0.75) -> float:
-    """
-    BM25-style term-frequency saturation factor (without IDF).
-    Returns the multiplicative factor applied to a term weight for a (term, chunk) pair.
-
-    tf   : term frequency in the chunk
-    dl   : chunk length (e.g., number of tokens)
-    avgdl: average chunk length
-    """
     if tf <= 0:
         return 0.0
-    # Avoid division by zero if avgdl is 0 in degenerate datasets
+                                                                 
     if avgdl <= 0:
         avgdl = max(1.0, float(dl))
 
