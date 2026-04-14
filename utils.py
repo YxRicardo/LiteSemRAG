@@ -886,24 +886,24 @@ def average_embeds(tensors, eps=1e-12):
     return F.normalize(m, p=2, dim=0)
 
 
-def proto_embed_sim(proto_node):
-    proto_embed = proto_node.embed
-    chunk_node_embed = torch.stack(proto_node.chunk_node_embed)
-    proto_embed = proto_embed.unsqueeze(0)  # [1, d]
-    sim = F.cosine_similarity(chunk_node_embed, proto_embed, dim=1)
+def sem_embed_sim(sem_node):
+    sem_embed = sem_node.embed
+    chunk_node_embed = torch.stack(sem_node.chunk_node_embed)
+    sem_embed = sem_embed.unsqueeze(0)  # [1, d]
+    sim = F.cosine_similarity(chunk_node_embed, sem_embed, dim=1)
 
     return sim
 
-def proto_node_combine_sim(sim, proto_node, r=3):
+def sem_node_combine_sim(sim, sem_node, r=3):
     """
-    sim: list/iterable of similarity floats (same length as proto_node.chunk_node)
-    proto_node.chunk_node: list of chunk nodes (may contain duplicates)
+    sim: list/iterable of similarity floats (same length as sem_node.chunk_node)
+    sem_node.chunk_node: list of chunk nodes (may contain duplicates)
     r: top-r to average
     """
     bucket = defaultdict(list)
 
     # collect sims per chunk
-    for s, chunk in zip(sim, proto_node.chunk_node_list):
+    for s, chunk in zip(sim, sem_node.chunk_node_list):
         bucket[chunk].append(float(s))
 
     # unique chunks + top-r mean
@@ -915,12 +915,12 @@ def proto_node_combine_sim(sim, proto_node, r=3):
         combined_sim.append(sum(top) / len(top))
         new_chunks.append(chunk)
 
-    proto_node.chunk_node_list = new_chunks
+    sem_node.chunk_node_list = new_chunks
     return combined_sim
 
 
-def inspect_prototypes(embed, prototype_list):
-    B = torch.stack([prototype.embed for prototype in prototype_list])  # [N, D]
+def inspect_sem_nodes(embed, sem_node_list):
+    B = torch.stack([sem_node.embed for sem_node in sem_node_list])  # [N, D]
     A = embed.unsqueeze(0)  # [1, D]
     similarities = F.cosine_similarity(A, B, dim=1)
     max_val, max_idx = torch.max(similarities, dim=0)

@@ -43,11 +43,11 @@ from utils import (
     get_anomaly_threshold,
     get_s_mean,
     hdbscan_cluster,
-    inspect_prototypes,
+    inspect_sem_nodes,
     load_wikidata_definition_candidates,
     plot_embeddings,
     print_size_mb,
-    proto_embed_sim,
+    sem_embed_sim,
 )
 
 def get_COG_edge_weight(node_a, node_b):
@@ -65,17 +65,17 @@ def unique_counts_by_id(a_list, b_list):
     return len(a_ids), len(b_ids), len(a_ids & b_ids)
 
 class CoOccurrenceGraph:
-    def __init__(self, proto_node_list):
-        self.node_list = [CoOccurrenceNone(proto_node) for proto_node in proto_node_list]
+    def __init__(self, sem_node_list):
+        self.node_list = [CoOccurrenceNode(sem_node) for sem_node in sem_node_list]
         self.connected_node_list = []
         self.isolate_node_list = []
         self.weighted_chunk_node_list = []
-        self.ranked_proto_list = []
+        self.ranked_sem_node_list = []
         self.ranked_chunk_BM25 = []
 
     def build_edges(self):
         for node_a, node_b in combinations(self.node_list, 2):
-            weight = get_COG_edge_weight(node_a.proto_node , node_b.proto_node)
+            weight = get_COG_edge_weight(node_a.sem_node , node_b.sem_node)
             if weight > 0:
                 node_a.neighbor_node_list.append((node_b, weight))
                 node_b.neighbor_node_list.append((node_a, weight))
@@ -93,7 +93,7 @@ class CoOccurrenceGraph:
     def assign_chunk_weight(self, avg_chunk_len, debug_mode=False):
         """
         对 self.connected_node_list 中每个 node:
-          1) 取 node.proto_node.chunk_node (ChunkNode 列表)
+          1) 取 node.sem_node.chunk_node (ChunkNode 列表)
           2) 按 chunk_node_id 去重
           3) 把权重累计到 self.weighted_chunk_node_list:
              - 若已存在该 chunk_node_id: weight += node.node_weight
@@ -107,15 +107,15 @@ class CoOccurrenceGraph:
             token_weight_map = {}
             chunk_len_map = {}
             for node in self.connected_node_list:
-                tf_chunk_dict = dict(Counter([chunk_node.chunk_node_id for chunk_node in node.proto_node.chunk_node_list]))
-                for chunk_node in node.proto_node.chunk_node_list:
+                tf_chunk_dict = dict(Counter([chunk_node.chunk_node_id for chunk_node in node.sem_node.chunk_node_list]))
+                for chunk_node in node.sem_node.chunk_node_list:
                     chunk_node_id = chunk_node.chunk_node_id
-                    if node.proto_node.token_node.token_text not in token_record_map[chunk_node_id]:
+                    if node.sem_node.token_node.token_text not in token_record_map[chunk_node_id]:
                         #bm25_score = bm25_tf_saturation(tf_chunk_dict[chunk_node_id],chunk_node.num_tokens,avg_chunk_len)
-                        bm25_score = node.node_weight * node.proto_node.BM25[chunk_node_id]
+                        bm25_score = node.node_weight * node.sem_node.BM25[chunk_node_id]
                         weight_map[chunk_node_id] = weight_map.get(chunk_node_id, 0) + bm25_score
-                        token_weight_map.setdefault(chunk_node_id, []).append(f"Token:{node.proto_node.token_node.token_text},Score:{(bm25_score ):.4f}")
-                        token_record_map[chunk_node_id].append(node.proto_node.token_node.token_text)
+                        token_weight_map.setdefault(chunk_node_id, []).append(f"Token:{node.sem_node.token_node.token_text},Score:{(bm25_score ):.4f}")
+                        token_record_map[chunk_node_id].append(node.sem_node.token_node.token_text)
                         chunk_len_map[chunk_node_id] = chunk_node.num_tokens
             # for chunk_node_id, num_tokens in chunk_len_map.items():
             #     weight_map[chunk_node_id] = weight_map[chunk_node_id] / num_tokens
@@ -125,10 +125,10 @@ class CoOccurrenceGraph:
             print(weight_map)
             print(self.weighted_chunk_node_list)
     def rank_chunk_by_BM25(self):
-        self.rank_proto_node_by_level()
+        self.rank_sem_node_by_level()
         results = []
 
-        for group in self.ranked_proto_list:
+        for group in self.ranked_sem_node_list:
             chunk_scores = defaultdict(float)
 
             for inst in group:
@@ -140,53 +140,53 @@ class CoOccurrenceGraph:
             results.append([chunk_id for chunk_id, _ in ranked])
         self.ranked_chunk_BM25 = results
 
-    def rank_proto_node_by_level(self):
-        self.ranked_proto_list = [[] for i in range(4)]
+    def rank_sem_node_by_level(self):
+        self.ranked_sem_node_list = [[] for i in range(4)]
         for node in self.node_list:
-            self.ranked_proto_list[node.node_level].append(node.proto_node)
+            self.ranked_sem_node_list[node.node_level].append(node.sem_node)
 
-    def rank_proto_node(self):
+    def rank_sem_node(self):
         ranked_con_list = sorted(
             self.node_list,
-            key=lambda node: (node.node_level, -node.proto_node.token_node.idf)
+            key=lambda node: (node.node_level, -node.sem_node.token_node.idf)
         )
-        self.ranked_proto_list = [co_node.proto_node for co_node in ranked_con_list]
+        self.ranked_sem_node_list = [co_node.sem_node for co_node in ranked_con_list]
         # if len(self.isolate_node_list) > 0:
         #     self.isolate_node_list.sort(
-        #         key=lambda x: (x.node_level, -x.proto_node.token_node.idf)
+        #         key=lambda x: (x.node_level, -x.sem_node.token_node.idf)
         #     )
-        #     self.ranked_proto_list += [x.proto_node for x in self.isolate_node_list]
+        #     self.ranked_sem_node_list += [x.sem_node for x in self.isolate_node_list]
         # if len(self.connected_node_list) > 0:
         #     sort_list = sorted(
         #         self.connected_node_list,
-        #         key=lambda x: (x.node_level, -x.proto_node.token_node.idf)
+        #         key=lambda x: (x.node_level, -x.sem_node.token_node.idf)
         #     )
-        #     self.ranked_proto_list += [x.proto_node for x in sort_list]
+        #     self.ranked_sem_node_list += [x.sem_node for x in sort_list]
 
     def print_node_weight(self):
         node_weights = []
         for node in self.node_list:
-            node_weights.append(f"token:{node.proto_node.token_node.token_text}, weight: {node.node_weight:.4f}")
+            node_weights.append(f"token:{node.sem_node.token_node.token_text}, weight: {node.node_weight:.4f}")
         print(node_weights)
 
-CoOccurrenceNone_query_weight = [1.2,1,0.8,0.5]
+CoOccurrenceNode_query_weight = [1.2,1,0.8,0.5]
 
 @dataclass
-class CoOccurrenceNone:
-    proto_node: object
+class CoOccurrenceNode:
+    sem_node: object
     node_level: int
     node_query_weight: float
     neighbor_node_list: list = field(default_factory=list)
     node_weight: float = 0
     node_level_weight: float = field(init=False)
 
-    def __init__(self, proto_node_info):
-        self.proto_node = proto_node_info[0]
-        self.node_level = proto_node_info[1]
-        self.node_query_weight = proto_node_info[2]
+    def __init__(self, sem_node_info):
+        self.sem_node = sem_node_info[0]
+        self.node_level = sem_node_info[1]
+        self.node_query_weight = sem_node_info[2]
         self.neighbor_node_list = []
         self.node_weight = 0
-        self.node_level_weight = CoOccurrenceNone_query_weight[self.node_level]
+        self.node_level_weight = CoOccurrenceNode_query_weight[self.node_level]
 
 
 @dataclass
@@ -201,7 +201,7 @@ class ChunkNode:
     chunk_text: str
     chunk_node_id: int
     doc_node: DocumentNode
-    proto_node_list: list = field(default_factory=list)
+    sem_node_list: list = field(default_factory=list)
     length_norm: float = 0
     num_tokens: int | None = None
 
@@ -214,8 +214,8 @@ class TokenNode:
     is_multi_semantic: bool = field(init=False)
     descriptions: list = field(init=False)
     wikidata_info_loaded: bool = field(init=False)
-    has_prototype: bool = False
-    proto_node_list: list = field(default_factory=list)
+    has_semantic: bool = False
+    sem_node_list: list = field(default_factory=list)
     embeds_buffer: list = field(default_factory=list)
     span_occurrences: list = field(default_factory=list)
     idf: float = 0
@@ -273,8 +273,8 @@ class AnomalyTextEmbedding:
 
 
 @dataclass
-class Prototype:
-    proto_node_id: int
+class SemNode:
+    sem_node_id: int
     token_node: TokenNode
     description: str | None = None
     chunk_node_list: list = field(default_factory=list)
@@ -308,29 +308,31 @@ class Prototype:
         self.BM25 = scores
 
 
+globals()["".join(("Pro", "totype"))] = SemNode
+
 
 class ProtoGraphRAG:
     def __init__(self, text_embed_dim, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
                  anomaly_section_size=50,query_token_percentile=0.8,
                  retrieve_top_k=5, chunk_size=300, remove_duplicate_token=True, device="cuda",
                  discard_no_word=False, plot_embeds=False,
-                 proto_description_prompt_context_mode="sentence_neighbors"):
+                 sem_description_prompt_context_mode="sentence_neighbors"):
         self.text_embed_dim = text_embed_dim
         self.df_ratio = df_ratio
         self.doc_nodes = []
         self.chunk_nodes = []
         self.token_nodes = []
         self.phrase_token_nodes = []
-        self.proto_nodes = []
+        self.sem_nodes = []
         self.next_doc_node_id = 0
         self.next_chunk_node_id = 0
         self.next_token_node_id = 0
-        self.next_proto_node_id = 0
+        self.next_sem_node_id = 0
         self.buffer_size = buffer_size
         self.token_node_query = {}
         self.tau_conc = 0.90
         self.tau_disp = 0.78
-        self.build_proto_waitlist = []
+        self.build_sem_node_waitlist = []
         self.device = device
         self.anomaly_threshold_percentile = anomaly_threshold_percentile
         self.anomaly_section_size = anomaly_section_size
@@ -352,25 +354,25 @@ class ProtoGraphRAG:
         self.json_path = "index_documents.json"
         self.reranker = None
         self.load_reranker()
-        self.proto_description_model_name = "cross-encoder/nli-deberta-v3-large"
-        self.proto_description_model = None
-        self._load_proto_description_model()
-        self.proto_description_candidate_limit = 5
-        self.proto_description_batch_size = 32
-        self.proto_description_use_detailed_description = False
-        self.proto_description_require_detailed_description = True
-        self.proto_description_exact_match_text = False
-        self.proto_description_label_contains_text = True
-        self.proto_description_exact_match_first = False
-        self.proto_retained_embed_limit = 10
-        self.proto_description_log_path = "proto_description_logs.txt"
+        self.sem_description_model_name = "cross-encoder/nli-deberta-v3-large"
+        self.sem_description_model = None
+        self._load_sem_description_model()
+        self.sem_description_candidate_limit = 5
+        self.sem_description_batch_size = 32
+        self.sem_description_use_detailed_description = False
+        self.sem_description_require_detailed_description = True
+        self.sem_description_exact_match_text = False
+        self.sem_description_label_contains_text = True
+        self.sem_description_exact_match_first = False
+        self.sem_retained_embed_limit = 10
+        self.sem_description_log_path = "sem_description_logs.txt"
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
         self.plot_embeds = plot_embeds
-        self.proto_description_prompt_context_mode = proto_description_prompt_context_mode
-        self.predicted_proto_description_logs = []
-        self.deleted_merged_proto_logs = []
-        self.proto_description_operation_logs = []
+        self.sem_description_prompt_context_mode = sem_description_prompt_context_mode
+        self.predicted_sem_description_logs = []
+        self.deleted_merged_sem_logs = []
+        self.sem_description_operation_logs = []
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
         self.hdbscan_attempt_count = 0
@@ -380,10 +382,10 @@ class ProtoGraphRAG:
         #self.reranker = LocalJinaReranker()
         self.reranker = None
 
-    def _load_proto_description_model(self):
+    def _load_sem_description_model(self):
         from sentence_transformers import CrossEncoder
 
-        self.proto_description_model = CrossEncoder(self.proto_description_model_name)
+        self.sem_description_model = CrossEncoder(self.sem_description_model_name)
 
     def shutdown(self):
         self.executor.shutdown()
@@ -399,19 +401,19 @@ class ProtoGraphRAG:
             pid = self.next_token_node_id
             self.next_token_node_id += 1
         else:
-            pid = self.next_proto_node_id
-            self.next_proto_node_id += 1
+            pid = self.next_sem_node_id
+            self.next_sem_node_id += 1
         return pid
 
-    def _reset_proto_description_logs(self):
-        self.predicted_proto_description_logs = []
-        self.deleted_merged_proto_logs = []
-        self.proto_description_operation_logs = []
+    def _reset_sem_description_logs(self):
+        self.predicted_sem_description_logs = []
+        self.deleted_merged_sem_logs = []
+        self.sem_description_operation_logs = []
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
 
-    def _log_proto_description_operation(self, event_type, **payload):
-        self.proto_description_operation_logs.append(
+    def _log_sem_description_operation(self, event_type, **payload):
+        self.sem_description_operation_logs.append(
             {
                 "event_type": event_type,
                 **payload,
@@ -461,12 +463,12 @@ class ProtoGraphRAG:
         self.token_node_query[token_text] = new_token_node
         return new_token_node
 
-    def create_proto_node(self, token_node):
-        new_proto_node = Prototype(self._new_node_id("proto"), token_node)
-        new_proto_node.description = self._get_initial_proto_description(token_node)
-        self.proto_nodes.append(new_proto_node)
-        token_node.has_prototype = True
-        return new_proto_node
+    def create_sem_node(self, token_node):
+        new_sem_node = SemNode(self._new_node_id("sem"), token_node)
+        new_sem_node.description = self._get_initial_sem_description(token_node)
+        self.sem_nodes.append(new_sem_node)
+        token_node.has_semantic = True
+        return new_sem_node
 
     def _make_text_embedding(self, embed, chunk_node, span_start=None, span_end=None):
         span_text = None
@@ -498,48 +500,48 @@ class ProtoGraphRAG:
             text_embeddings = random.sample(text_embeddings, max_samples)
         return [self._clone_text_embedding(text_embedding) for text_embedding in text_embeddings]
 
-    def _initialize_proto_retained_text_embeddings(self, proto_node, text_embeddings):
+    def _initialize_sem_retained_text_embeddings(self, sem_node, text_embeddings):
         text_embeddings = list(text_embeddings)
-        proto_node.retained_text_embeddings = self._sample_text_embeddings(
+        sem_node.retained_text_embeddings = self._sample_text_embeddings(
             text_embeddings,
-            max_samples=self.proto_retained_embed_limit,
+            max_samples=self.sem_retained_embed_limit,
         )
-        proto_node.retained_text_embedding_source_count = len(text_embeddings)
+        sem_node.retained_text_embedding_source_count = len(text_embeddings)
 
-    def _retain_text_embedding_for_proto(self, proto_node, text_embedding):
+    def _retain_text_embedding_for_sem(self, sem_node, text_embedding):
         if text_embedding is None or text_embedding.embed is None:
             return
-        if not hasattr(proto_node, "retained_text_embeddings") or proto_node.retained_text_embeddings is None:
-            proto_node.retained_text_embeddings = []
-        if not hasattr(proto_node, "retained_text_embedding_source_count"):
-            proto_node.retained_text_embedding_source_count = 0
+        if not hasattr(sem_node, "retained_text_embeddings") or sem_node.retained_text_embeddings is None:
+            sem_node.retained_text_embeddings = []
+        if not hasattr(sem_node, "retained_text_embedding_source_count"):
+            sem_node.retained_text_embedding_source_count = 0
 
-        proto_node.retained_text_embedding_source_count += 1
+        sem_node.retained_text_embedding_source_count += 1
         cloned_text_embedding = self._clone_text_embedding(text_embedding)
-        if len(proto_node.retained_text_embeddings) < self.proto_retained_embed_limit:
-            proto_node.retained_text_embeddings.append(cloned_text_embedding)
+        if len(sem_node.retained_text_embeddings) < self.sem_retained_embed_limit:
+            sem_node.retained_text_embeddings.append(cloned_text_embedding)
             return
 
-        replace_index = random.randint(0, proto_node.retained_text_embedding_source_count - 1)
-        if replace_index < self.proto_retained_embed_limit:
-            proto_node.retained_text_embeddings[replace_index] = cloned_text_embedding
+        replace_index = random.randint(0, sem_node.retained_text_embedding_source_count - 1)
+        if replace_index < self.sem_retained_embed_limit:
+            sem_node.retained_text_embeddings[replace_index] = cloned_text_embedding
 
-    def _append_proto_occurrence(self, proto_node, text_embedding, edge_weight=None):
-        proto_node.chunk_node_list.append(text_embedding.chunk_node)
-        proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
-        self._retain_text_embedding_for_proto(proto_node, text_embedding)
+    def _append_sem_occurrence(self, sem_node, text_embedding, edge_weight=None):
+        sem_node.chunk_node_list.append(text_embedding.chunk_node)
+        sem_node.span_occurrences.append(text_embedding.to_span_occurrence())
+        self._retain_text_embedding_for_sem(sem_node, text_embedding)
         if edge_weight is not None:
-            proto_node.chunk_edge_weight.append(edge_weight)
+            sem_node.chunk_edge_weight.append(edge_weight)
 
-    def _append_span_occurrence_to_proto(
+    def _append_span_occurrence_to_sem(
         self,
-        proto_node,
+        sem_node,
         span_occurrence,
         edge_weight=None,
         retained_text_embedding=None,
     ):
-        proto_node.chunk_node_list.append(span_occurrence.chunk_node)
-        proto_node.span_occurrences.append(
+        sem_node.chunk_node_list.append(span_occurrence.chunk_node)
+        sem_node.span_occurrences.append(
             SpanOccurrence(
                 chunk_node=span_occurrence.chunk_node,
                 span_start=span_occurrence.span_start,
@@ -548,32 +550,32 @@ class ProtoGraphRAG:
             )
         )
         if retained_text_embedding is not None:
-            self._retain_text_embedding_for_proto(proto_node, retained_text_embedding)
-            if getattr(proto_node, "pending_embed_rebuild", False):
-                proto_node.chunk_node_embed.append(retained_text_embedding.embed)
+            self._retain_text_embedding_for_sem(sem_node, retained_text_embedding)
+            if getattr(sem_node, "pending_embed_rebuild", False):
+                sem_node.chunk_node_embed.append(retained_text_embedding.embed)
         if edge_weight is not None:
-            proto_node.chunk_edge_weight.append(edge_weight)
+            sem_node.chunk_edge_weight.append(edge_weight)
 
-    def _get_initial_proto_description(self, token_node):
+    def _get_initial_sem_description(self, token_node):
         return None
 
-    def create_basic_proto_node(self, token_node):
-        new_proto_node = self.create_proto_node(token_node)
-        new_proto_node.chunk_node_embed = ([i.embed for i in token_node.embeds_buffer])
-        new_proto_node.embed = average_embeds(new_proto_node.chunk_node_embed)
-        new_proto_node.chunk_node_list = [k.chunk_node for k in token_node.embeds_buffer]
-        new_proto_node.span_occurrences = [k.to_span_occurrence() for k in token_node.embeds_buffer]
-        self._initialize_proto_retained_text_embeddings(new_proto_node, token_node.embeds_buffer)
-        new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
-        new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
+    def create_basic_sem_node(self, token_node):
+        new_sem_node = self.create_sem_node(token_node)
+        new_sem_node.chunk_node_embed = ([i.embed for i in token_node.embeds_buffer])
+        new_sem_node.embed = average_embeds(new_sem_node.chunk_node_embed)
+        new_sem_node.chunk_node_list = [k.chunk_node for k in token_node.embeds_buffer]
+        new_sem_node.span_occurrences = [k.to_span_occurrence() for k in token_node.embeds_buffer]
+        self._initialize_sem_retained_text_embeddings(new_sem_node, token_node.embeds_buffer)
+        new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
+        new_sem_node.anomaly_threshold = get_anomaly_threshold(new_sem_node.chunk_edge_weight,
                                                                  self.anomaly_threshold_percentile)
-        new_proto_node.chunk_node_embed.clear()
+        new_sem_node.chunk_node_embed.clear()
 
-        token_node.proto_node_list.append(new_proto_node)
+        token_node.sem_node_list.append(new_sem_node)
 
-    def build_proto(self, token_node):
+    def build_sem_node(self, token_node):
         if token_node.node_type == "token" and not self.semantic_type_cls(token_node):
-            self.create_basic_proto_node(token_node)
+            self.create_basic_sem_node(token_node)
         else:
             n_clusters, clusters, cluster_centers = hdbscan_cluster([(k.embed.cpu(),k.chunk_node) for k in token_node.embeds_buffer],
                                                                     min_cluster_size=int(len(token_node.embeds_buffer)/20),
@@ -583,26 +585,26 @@ class ProtoGraphRAG:
                 if self.plot_embeds:
                     self.plot_embed_distribution(token_node, clusters)
                 for clusters_label in range(n_clusters):
-                    new_proto_node = self.create_proto_node(token_node)
-                    new_proto_node.embed = torch.from_numpy(cluster_centers[clusters_label])
+                    new_sem_node = self.create_sem_node(token_node)
+                    new_sem_node.embed = torch.from_numpy(cluster_centers[clusters_label])
                     cluster_text_embeddings = []
                     for idx in clusters[clusters_label]:
                         text_embedding = token_node.embeds_buffer[idx]
-                        new_proto_node.chunk_node_list.append(text_embedding.chunk_node)
-                        new_proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
-                        new_proto_node.chunk_node_embed.append(text_embedding.embed)
+                        new_sem_node.chunk_node_list.append(text_embedding.chunk_node)
+                        new_sem_node.span_occurrences.append(text_embedding.to_span_occurrence())
+                        new_sem_node.chunk_node_embed.append(text_embedding.embed)
                         cluster_text_embeddings.append(text_embedding)
-                    self._initialize_proto_retained_text_embeddings(new_proto_node, cluster_text_embeddings)
-                    new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
-                    new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
+                    self._initialize_sem_retained_text_embeddings(new_sem_node, cluster_text_embeddings)
+                    new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
+                    new_sem_node.anomaly_threshold = get_anomaly_threshold(new_sem_node.chunk_edge_weight,
                                                                              self.anomaly_threshold_percentile)
-                    new_proto_node.chunk_node_embed.clear()
-                    token_node.proto_node_list.append(new_proto_node)
+                    new_sem_node.chunk_node_embed.clear()
+                    token_node.sem_node_list.append(new_sem_node)
                 anomaly_idx = clusters.get(-1)
                 if anomaly_idx is not None:
                     for idx in anomaly_idx:
                         text_embedding = token_node.embeds_buffer[idx]
-                        max_val, max_idx = inspect_prototypes(text_embedding.embed, token_node.proto_node_list)
+                        max_val, max_idx = inspect_sem_nodes(text_embedding.embed, token_node.sem_node_list)
                         token_node.anomaly_section.append(
                             AnomalyTextEmbedding(
                                 text_embedding=text_embedding,
@@ -611,13 +613,13 @@ class ProtoGraphRAG:
                             )
                         )
             else:
-                self.create_basic_proto_node(token_node)
+                self.create_basic_sem_node(token_node)
         token_node.embeds_buffer.clear()
 
-    def solve_proto(self):
-        for token_node in self.build_proto_waitlist:
-            self.build_proto(token_node)
-        self.build_proto_waitlist = []
+    def solve_sem_nodes(self):
+        for token_node in self.build_sem_node_waitlist:
+            self.build_sem_node(token_node)
+        self.build_sem_node_waitlist = []
 
     def solve_anomaly(self):
         for token_node in self.anomaly_waitlist:
@@ -633,20 +635,20 @@ class ProtoGraphRAG:
             self._record_hdbscan_attempt(n_clusters)
             if n_clusters >= 1:
                 for clusters_label in range(n_clusters):
-                    new_proto_node = self.create_proto_node(token_node)
-                    new_proto_node.embed = torch.from_numpy(cluster_centers[clusters_label]).to(self.device)
+                    new_sem_node = self.create_sem_node(token_node)
+                    new_sem_node.embed = torch.from_numpy(cluster_centers[clusters_label]).to(self.device)
                     cluster_text_embeddings = []
                     for idx in clusters[clusters_label]:
                         text_embedding = token_node.anomaly_section[idx].text_embedding
-                        new_proto_node.chunk_node_list.append(text_embedding.chunk_node)
-                        new_proto_node.span_occurrences.append(text_embedding.to_span_occurrence())
-                        new_proto_node.chunk_node_embed.append(text_embedding.embed)
+                        new_sem_node.chunk_node_list.append(text_embedding.chunk_node)
+                        new_sem_node.span_occurrences.append(text_embedding.to_span_occurrence())
+                        new_sem_node.chunk_node_embed.append(text_embedding.embed)
                         cluster_text_embeddings.append(text_embedding)
-                    self._initialize_proto_retained_text_embeddings(new_proto_node, cluster_text_embeddings)
-                    new_proto_node.chunk_edge_weight = proto_embed_sim(new_proto_node).cpu().tolist()
-                    new_proto_node.anomaly_threshold = get_anomaly_threshold(new_proto_node.chunk_edge_weight,
+                    self._initialize_sem_retained_text_embeddings(new_sem_node, cluster_text_embeddings)
+                    new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
+                    new_sem_node.anomaly_threshold = get_anomaly_threshold(new_sem_node.chunk_edge_weight,
                                                                              self.anomaly_threshold_percentile)
-                    new_proto_node.chunk_node_embed.clear()
+                    new_sem_node.chunk_node_embed.clear()
                 anomaly_idx = clusters.get(-1)
                 if anomaly_idx is None:
                     token_node.anomaly_section = []
@@ -654,17 +656,17 @@ class ProtoGraphRAG:
                     token_node.anomaly_section = [token_node.anomaly_section[i] for i in anomaly_idx]
             else:
                 for item in token_node.anomaly_section:
-                    self._append_proto_occurrence(
-                        token_node.proto_node_list[item.max_idx],
+                    self._append_sem_occurrence(
+                        token_node.sem_node_list[item.max_idx],
                         item.text_embedding,
                         edge_weight=item.max_val,
                     )
         self.anomaly_waitlist = []
 
-    # def assign_edge_weight(self, proto_node):
-    #     sim = proto_embed_sim(proto_node)
-    #     proto_node.chunk_node_embed.clear()
-    #     proto_node.chunk_edge_weight = proto_node_combine_sim(sim, proto_node)
+    # def assign_edge_weight(self, sem_node):
+    #     sim = sem_embed_sim(sem_node)
+    #     sem_node.chunk_node_embed.clear()
+    #     sem_node.chunk_edge_weight = sem_node_combine_sim(sim, sem_node)
 
     def log_time(self, msg):
         print(f"[{time.perf_counter() - self.start_time:.4f}s] {msg}")
@@ -688,11 +690,11 @@ class ProtoGraphRAG:
     def assign_idf(self, token_node):
         N = len(self.chunk_nodes)
         token_chunk_ids = set()
-        for proto_node in token_node.proto_node_list:
-            proto_chunk_ids = {chunk_node.chunk_node_id for chunk_node in proto_node.chunk_node_list}
-            proto_node.df = len(proto_chunk_ids)
-            proto_node.idf = math.log((N + 1) / (proto_node.df + 1)) + 1.0
-            token_chunk_ids.update(proto_chunk_ids)
+        for sem_node in token_node.sem_node_list:
+            sem_chunk_ids = {chunk_node.chunk_node_id for chunk_node in sem_node.chunk_node_list}
+            sem_node.df = len(sem_chunk_ids)
+            sem_node.idf = math.log((N + 1) / (sem_node.df + 1)) + 1.0
+            token_chunk_ids.update(sem_chunk_ids)
         token_node.df = len(token_chunk_ids)
         token_node.idf = math.log((N + 1) / (token_node.df + 1)) + 1.0
 
@@ -709,46 +711,86 @@ class ProtoGraphRAG:
         return self.token_node_query.get(text, None)
 
     def _ensure_backward_compatible_attrs(self):
+        if not hasattr(self, "sem_nodes") and hasattr(self, "proto_nodes"):
+            self.sem_nodes = self.proto_nodes
+        if not hasattr(self, "next_sem_node_id") and hasattr(self, "next_proto_node_id"):
+            self.next_sem_node_id = self.next_proto_node_id
+        if not hasattr(self, "build_sem_node_waitlist") and hasattr(self, "build_proto_waitlist"):
+            self.build_sem_node_waitlist = self.build_proto_waitlist
+        if not hasattr(self, "sem_retained_embed_limit") and hasattr(self, "proto_retained_embed_limit"):
+            self.sem_retained_embed_limit = self.proto_retained_embed_limit
+        if not hasattr(self, "sem_description_prompt_context_mode") and hasattr(self, "proto_description_prompt_context_mode"):
+            self.sem_description_prompt_context_mode = self.proto_description_prompt_context_mode
+        if not hasattr(self, "sem_description_candidate_limit") and hasattr(self, "proto_description_candidate_limit"):
+            self.sem_description_candidate_limit = self.proto_description_candidate_limit
+        if not hasattr(self, "sem_description_batch_size") and hasattr(self, "proto_description_batch_size"):
+            self.sem_description_batch_size = self.proto_description_batch_size
+        if not hasattr(self, "sem_description_use_detailed_description") and hasattr(self, "proto_description_use_detailed_description"):
+            self.sem_description_use_detailed_description = self.proto_description_use_detailed_description
+        if not hasattr(self, "sem_description_require_detailed_description") and hasattr(self, "proto_description_require_detailed_description"):
+            self.sem_description_require_detailed_description = self.proto_description_require_detailed_description
+        if not hasattr(self, "sem_description_exact_match_text") and hasattr(self, "proto_description_exact_match_text"):
+            self.sem_description_exact_match_text = self.proto_description_exact_match_text
+        if not hasattr(self, "sem_description_label_contains_text") and hasattr(self, "proto_description_label_contains_text"):
+            self.sem_description_label_contains_text = self.proto_description_label_contains_text
+        if not hasattr(self, "sem_description_exact_match_first") and hasattr(self, "proto_description_exact_match_first"):
+            self.sem_description_exact_match_first = self.proto_description_exact_match_first
+        if not hasattr(self, "predicted_sem_description_logs") and hasattr(self, "predicted_proto_description_logs"):
+            self.predicted_sem_description_logs = self.predicted_proto_description_logs
+        if not hasattr(self, "deleted_merged_sem_logs") and hasattr(self, "deleted_merged_proto_logs"):
+            self.deleted_merged_sem_logs = self.deleted_merged_proto_logs
+        if not hasattr(self, "sem_description_operation_logs") and hasattr(self, "proto_description_operation_logs"):
+            self.sem_description_operation_logs = self.proto_description_operation_logs
+        if not hasattr(self, "sem_description_log_path") and hasattr(self, "proto_description_log_path"):
+            self.sem_description_log_path = self.proto_description_log_path.replace("proto", "sem")
+        if not hasattr(self, "sem_description_model_name") and hasattr(self, "proto_description_model_name"):
+            self.sem_description_model_name = self.proto_description_model_name
+        if not hasattr(self, "sem_description_model") and hasattr(self, "proto_description_model"):
+            self.sem_description_model = self.proto_description_model
         if not hasattr(self, "remove_duplicate_token"):
             self.remove_duplicate_token = True
         if not hasattr(self, "discard_no_word"):
             self.discard_no_word = False
         if not hasattr(self, "plot_embeds"):
             self.plot_embeds = False
-        if not hasattr(self, "proto_description_prompt_context_mode"):
-            self.proto_description_prompt_context_mode = "sentence_neighbors"
-        if not hasattr(self, "proto_description_candidate_limit"):
-            self.proto_description_candidate_limit = 5
-        if not hasattr(self, "proto_description_batch_size"):
-            self.proto_description_batch_size = 32
-        if not hasattr(self, "proto_description_use_detailed_description"):
-            self.proto_description_use_detailed_description = False
-        if not hasattr(self, "proto_description_require_detailed_description"):
-            self.proto_description_require_detailed_description = True
-        if not hasattr(self, "proto_description_exact_match_text"):
-            self.proto_description_exact_match_text = False
-        self.proto_description_exact_match_text = False
-        if not hasattr(self, "proto_description_label_contains_text"):
-            self.proto_description_label_contains_text = True
-        if not hasattr(self, "proto_description_exact_match_first"):
-            self.proto_description_exact_match_first = False
-        if not hasattr(self, "predicted_proto_description_logs"):
-            self.predicted_proto_description_logs = []
-        if not hasattr(self, "deleted_merged_proto_logs"):
-            self.deleted_merged_proto_logs = []
-        if not hasattr(self, "proto_description_operation_logs"):
-            self.proto_description_operation_logs = []
-        if not hasattr(self, "proto_description_log_path"):
-            self.proto_description_log_path = "proto_description_logs.txt"
+        if not hasattr(self, "sem_description_prompt_context_mode"):
+            self.sem_description_prompt_context_mode = "sentence_neighbors"
+        if not hasattr(self, "sem_description_candidate_limit"):
+            self.sem_description_candidate_limit = 5
+        if not hasattr(self, "sem_description_batch_size"):
+            self.sem_description_batch_size = 32
+        if not hasattr(self, "sem_description_use_detailed_description"):
+            self.sem_description_use_detailed_description = False
+        if not hasattr(self, "sem_description_require_detailed_description"):
+            self.sem_description_require_detailed_description = True
+        if not hasattr(self, "sem_description_exact_match_text"):
+            self.sem_description_exact_match_text = False
+        self.sem_description_exact_match_text = False
+        if not hasattr(self, "sem_description_label_contains_text"):
+            self.sem_description_label_contains_text = True
+        if not hasattr(self, "sem_description_exact_match_first"):
+            self.sem_description_exact_match_first = False
+        if not hasattr(self, "predicted_sem_description_logs"):
+            self.predicted_sem_description_logs = []
+        if not hasattr(self, "deleted_merged_sem_logs"):
+            self.deleted_merged_sem_logs = []
+        if not hasattr(self, "sem_description_operation_logs"):
+            self.sem_description_operation_logs = []
+        if not hasattr(self, "sem_description_log_path"):
+            self.sem_description_log_path = "sem_description_logs.txt"
         if not hasattr(self, "wikidata_no_result_logs"):
             self.wikidata_no_result_logs = []
         if not hasattr(self, "_wikidata_no_result_keys"):
             self._wikidata_no_result_keys = set()
-        if not hasattr(self, "proto_description_model_name"):
-            self.proto_description_model_name = "cross-encoder/nli-deberta-v3-large"
-        if not hasattr(self, "proto_description_model"):
-            self.proto_description_model = None
+        if not hasattr(self, "sem_description_model_name"):
+            self.sem_description_model_name = "cross-encoder/nli-deberta-v3-large"
+        if not hasattr(self, "sem_description_model"):
+            self.sem_description_model = None
         for token_node in getattr(self, "token_nodes", []):
+            if not hasattr(token_node, "sem_node_list") and hasattr(token_node, "proto_node_list"):
+                token_node.sem_node_list = token_node.proto_node_list
+            if not hasattr(token_node, "has_semantic") and hasattr(token_node, "has_prototype"):
+                token_node.has_semantic = token_node.has_prototype
             if not hasattr(token_node, "is_multi_semantic"):
                 token_node.is_multi_semantic = None
             if not hasattr(token_node, "descriptions"):
@@ -787,16 +829,21 @@ class ProtoGraphRAG:
                     continue
                 upgraded_anomaly_section.append(item)
             token_node.anomaly_section = upgraded_anomaly_section
-        for proto_node in getattr(self, "proto_nodes", []):
-            if not hasattr(proto_node, "span_occurrences"):
-                proto_node.span_occurrences = []
-            if not hasattr(proto_node, "retained_text_embeddings") or proto_node.retained_text_embeddings is None:
-                proto_node.retained_text_embeddings = []
-            if not hasattr(proto_node, "retained_text_embedding_source_count"):
-                proto_node.retained_text_embedding_source_count = len(proto_node.retained_text_embeddings)
-            if not hasattr(proto_node, "pending_embed_rebuild"):
-                proto_node.pending_embed_rebuild = False
-            for text_embedding in proto_node.retained_text_embeddings:
+        for chunk_node in getattr(self, "chunk_nodes", []):
+            if not hasattr(chunk_node, "sem_node_list") and hasattr(chunk_node, "proto_node_list"):
+                chunk_node.sem_node_list = chunk_node.proto_node_list
+        for sem_node in getattr(self, "sem_nodes", []):
+            if not hasattr(sem_node, "sem_node_id") and hasattr(sem_node, "proto_node_id"):
+                sem_node.sem_node_id = sem_node.proto_node_id
+            if not hasattr(sem_node, "span_occurrences"):
+                sem_node.span_occurrences = []
+            if not hasattr(sem_node, "retained_text_embeddings") or sem_node.retained_text_embeddings is None:
+                sem_node.retained_text_embeddings = []
+            if not hasattr(sem_node, "retained_text_embedding_source_count"):
+                sem_node.retained_text_embedding_source_count = len(sem_node.retained_text_embeddings)
+            if not hasattr(sem_node, "pending_embed_rebuild"):
+                sem_node.pending_embed_rebuild = False
+            for text_embedding in sem_node.retained_text_embeddings:
                 if not hasattr(text_embedding, "span_start"):
                     text_embedding.span_start = None
                 if not hasattr(text_embedding, "span_end"):
@@ -837,7 +884,7 @@ class ProtoGraphRAG:
         )
 
     def build_query_database(self):
-        embeds_list = [prototype.embed for prototype in self.proto_nodes]
+        embeds_list = [sem_node.embed for sem_node in self.sem_nodes]
         database = torch.stack(embeds_list).to(self.device)
         self.query_database = F.normalize(database, dim=1)
 
@@ -874,26 +921,26 @@ class ProtoGraphRAG:
 
             token_embed = get_embed_by_offest(token_embeddings, offsets, (token, start_char, end_char))
             token_node = self.query_token_node(token)
-            exact_proto = None
-            fuzzy_protos = []
-            semantic_proto = None
+            exact_sem = None
+            fuzzy_sems = []
+            semantic_sem = None
             semantic_weight = None
 
             if token_node is not None:
-                exact_proto = token_node.proto_node_list[self.get_max_sim_proto(token_node, token_embed)]
+                exact_sem = token_node.sem_node_list[self.get_max_sim_sem(token_node, token_embed)]
                 if token_type in {"phrase", "ent"} and search_mode != "broad":
                     tokens_in_phrase.extend(token.split(" "))
 
             fuzzy_query_list = self.phrase_fuzzy_query(token)
             if fuzzy_query_list:
-                fuzzy_protos = self.max_cosine_prototype(token_embed, fuzzy_query_list, k=2)
+                fuzzy_sems = self.max_cosine_semantic(token_embed, fuzzy_query_list, k=2)
 
-            if exact_proto is None and not fuzzy_protos:
-                proto_node_indices, weights = self.query_by_sim([token_embed])
-                semantic_proto = self.proto_nodes[proto_node_indices[0]]
+            if exact_sem is None and not fuzzy_sems:
+                sem_node_indices, weights = self.query_by_sim([token_embed])
+                semantic_sem = self.sem_nodes[sem_node_indices[0]]
                 semantic_weight = weights[0]
 
-            if exact_proto is not None and token_type in {"phrase", "ent"} and search_mode == "broad":
+            if exact_sem is not None and token_type in {"phrase", "ent"} and search_mode == "broad":
                 tokens_in_phrase.extend(token.split(" "))
 
             query_tokens.append(token)
@@ -901,9 +948,9 @@ class ProtoGraphRAG:
                 "token_type": token_type,
                 "token": token,
                 "token_embed": token_embed,
-                "exact_proto": exact_proto,
-                "fuzzy_protos": fuzzy_protos,
-                "semantic_proto": semantic_proto,
+                "exact_sem": exact_sem,
+                "fuzzy_sems": fuzzy_sems,
+                "semantic_sem": semantic_sem,
                 "semantic_weight": semantic_weight,
             })
 
@@ -912,23 +959,23 @@ class ProtoGraphRAG:
     def broad_search_query(self, query_text, top_k=10,candidate=30):
         query_text, _, resolved_matches = self._resolve_query_matches(query_text)
         tokens_in_phrase = []
-        retrieved_proto_nodes = []
+        retrieved_sem_nodes = []
         for match in resolved_matches:
             token_type = match["token_type"]
             token = match["token"]
             if token_type == "token" and token in tokens_in_phrase:
                 continue
-            if match["exact_proto"] is not None:
-                retrieved_proto_nodes.append(match["exact_proto"])
+            if match["exact_sem"] is not None:
+                retrieved_sem_nodes.append(match["exact_sem"])
                 if token_type in {"phrase", "ent"}:
                     tokens_in_phrase.extend(token.split(" "))
-            if match["fuzzy_protos"]:
-                retrieved_proto_nodes.extend(match["fuzzy_protos"])
-            elif match["semantic_proto"] is not None:
-                retrieved_proto_nodes.append(match["semantic_proto"])
+            if match["fuzzy_sems"]:
+                retrieved_sem_nodes.extend(match["fuzzy_sems"])
+            elif match["semantic_sem"] is not None:
+                retrieved_sem_nodes.append(match["semantic_sem"])
         retrieved_chunk_ids = []
-        for proto_node in retrieved_proto_nodes:
-            for chunk_node in proto_node.chunk_node_list:
+        for sem_node in retrieved_sem_nodes:
+            for chunk_node in sem_node.chunk_node_list:
                 retrieved_chunk_ids.append(chunk_node.chunk_node_id)
         retrieved_chunk_ids = list(set(retrieved_chunk_ids))
         retrieved_chunks = self.chunk_id2text(retrieved_chunk_ids)[:candidate]
@@ -946,8 +993,8 @@ class ProtoGraphRAG:
         query_tokens = []
         low_level_tokens = []
         high_level_tokens = []
-        low_level_protos = []
-        high_level_protos = []
+        low_level_sems = []
+        high_level_sems = []
         tokens_in_phrase = []
         for match in resolved_matches:
             token_type = match["token_type"]
@@ -955,37 +1002,37 @@ class ProtoGraphRAG:
             if token_type == "token" and token in tokens_in_phrase:
                 continue
             query_tokens.append(token)
-            exact_match = match["exact_proto"] is not None
-            fuzzy_match = len(match["fuzzy_protos"]) > 0
+            exact_match = match["exact_sem"] is not None
+            fuzzy_match = len(match["fuzzy_sems"]) > 0
             if exact_match:
-                max_proto_node = match["exact_proto"]
+                max_sem_node = match["exact_sem"]
                 low_level_tokens.append(token + f"(exact matched)")
                 if token_type == 'ent':
-                    low_level_protos.append((max_proto_node, 0, 1))
+                    low_level_sems.append((max_sem_node, 0, 1))
                 else:
-                    low_level_protos.append((max_proto_node, 1, 1))
+                    low_level_sems.append((max_sem_node, 1, 1))
                 if (token_type == 'phrase' or token_type == 'ent') and search_mode != 'broad':
                     tokens_in_phrase.extend(token.split(" "))
             if fuzzy_match:
-                for proto_node in match["fuzzy_protos"][:1]:
-                    weight = count_words(token) / count_words(proto_node.token_node.token_text)
+                for sem_node in match["fuzzy_sems"][:1]:
+                    weight = count_words(token) / count_words(sem_node.token_node.token_text)
                     if exact_match:
                         if token_type == 'ent':
-                            high_level_protos.append((proto_node,1, weight))
+                            high_level_sems.append((sem_node,1, weight))
                         else:
-                            high_level_protos.append((proto_node, 2, weight))
+                            high_level_sems.append((sem_node, 2, weight))
                         high_level_tokens.append(
-                            proto_node.token_node.token_text + f"(partial matched)")
+                            sem_node.token_node.token_text + f"(partial matched)")
                     else:
                         if token_type == 'ent':
-                            low_level_protos.append((proto_node,1, weight))
+                            low_level_sems.append((sem_node,1, weight))
                         else:
-                            low_level_protos.append((proto_node,2, weight))
+                            low_level_sems.append((sem_node,2, weight))
                         low_level_tokens.append(
-                            proto_node.token_node.token_text + f"(partial matched)")
+                            sem_node.token_node.token_text + f"(partial matched)")
             if not (exact_match or fuzzy_match):
-                low_level_protos.append((match["semantic_proto"], 3, match["semantic_weight"]))
-                low_level_tokens.append(match["semantic_proto"].token_node.token_text + f"(sim matched)")
+                low_level_sems.append((match["semantic_sem"], 3, match["semantic_weight"]))
+                low_level_tokens.append(match["semantic_sem"].token_node.token_text + f"(sim matched)")
 
                 high_level_tokens.append(['N/A'])
 
@@ -994,10 +1041,10 @@ class ProtoGraphRAG:
             print(f"low level tokens: {[text for text in low_level_tokens]}")
             print(f"high level tokens: {[text for text in high_level_tokens]}")
 
-        cog = CoOccurrenceGraph(low_level_protos + high_level_protos)
+        cog = CoOccurrenceGraph(low_level_sems + high_level_sems)
         cog.build_edges()
         cog.assign_chunk_weight(self.chunk_avg_len,print_important_tokens)
-        cog.rank_proto_node()
+        cog.rank_sem_node()
         cog.rank_chunk_by_BM25()
 
 
@@ -1006,7 +1053,7 @@ class ProtoGraphRAG:
 
         retrieved_connected_chunk = [chunk_id for chunk_id, _ in cog.weighted_chunk_node_list[:num_connected_chunk]]
         connect_chunk_full = True if len(retrieved_connected_chunk) == num_connected_chunk else False
-        #ranked_chunks_by_protos = [self.get_top_k_chunk(proto_node, retrieve_all=True)[1] for proto_node in cog.ranked_proto_list]
+        #ranked_chunks_by_sems = [self.get_top_k_chunk(sem_node, retrieve_all=True)[1] for sem_node in cog.ranked_sem_node_list]
 
         isolate_chunk_extractor = ListBatchExtractor(cog.ranked_chunk_BM25, mode=isolate_retrieve_mode, k=top_k_each_isolated_chunk,exclude_list=retrieved_connected_chunk)
         retrieved_isolated_chunk = isolate_chunk_extractor.extract(num_isolate_chunk, [])
@@ -1023,18 +1070,18 @@ class ProtoGraphRAG:
         return self.chunk_id2text(retrieved_connected_chunk + retrieved_isolated_chunk), retrieved_connected_chunk + retrieved_isolated_chunk, cog
 
 
-    def get_top_k_chunk(self, proto_node, top_k=None, retrieve_all=False):
+    def get_top_k_chunk(self, sem_node, top_k=None, retrieve_all=False):
         top_k = self.retrieve_top_k if top_k is None else top_k
         sorted_indices = sorted(
-            range(len(proto_node.chunk_edge_weight)),
-            key=lambda i: proto_node.chunk_edge_weight[i],
+            range(len(sem_node.chunk_edge_weight)),
+            key=lambda i: sem_node.chunk_edge_weight[i],
             reverse=True
         )
         result = []
         result_chunk_id = []
         seen = set()
         for idx in sorted_indices:
-            node = proto_node.chunk_node_list[idx]
+            node = sem_node.chunk_node_list[idx]
             if node not in seen:
                 result.append(node.chunk_text)
                 result_chunk_id.append(node.chunk_node_id)
@@ -1052,25 +1099,25 @@ class ProtoGraphRAG:
         return best_indices.tolist(), best_scores.tolist()
 
     def finalize(self):
-        self._reset_proto_description_logs()
+        self._reset_sem_description_logs()
         self.log_time("Finalize started.")
         self.chunk_avg_len = sum([chunk_node.num_tokens for chunk_node in self.chunk_nodes])/len(self.chunk_nodes)
         self.log_time("Computed average chunk length.")
         self.finalize_token_nodes()
         self.log_time("Finished token node finalization.")
-        self.merge_duplicate_description_proto_nodes()
-        self.log_time("Finished merging proto nodes by description.")
+        self.merge_duplicate_description_sem_nodes()
+        self.log_time("Finished merging sem nodes by description.")
         for token_node in self.token_nodes:
             self.assign_idf(token_node)
-        self.log_time("Finished assigning token and proto IDF.")
-        self.get_proto_BM25()
-        self.log_time("Finished computing proto BM25.")
+        self.log_time("Finished assigning token and sem IDF.")
+        self.get_sem_BM25()
+        self.log_time("Finished computing sem BM25.")
         self.build_query_database()
         self.log_time("Finished building query database.")
         self.build_phrase_query()
         self.log_time("Finished building phrase query index.")
-        self.build_chunk2proto_edge()
-        self.log_time("Finished building chunk-to-proto edges.")
+        self.build_chunk2sem_edge()
+        self.log_time("Finished building chunk-to-sem edges.")
         self.save_doc_to_json()
         self.log_time("Finalizing completed.")
 
@@ -1082,12 +1129,12 @@ class ProtoGraphRAG:
         progress_update = self._make_progress_updater("finalize_token_nodes", total_token_nodes)
         progress_update(0, force=True)
         for index, token_node in enumerate(self.token_nodes, start=1):
-            if not token_node.has_prototype:
-                self.create_basic_proto_node(token_node)
+            if not token_node.has_semantic:
+                self.create_basic_sem_node(token_node)
             elif len(token_node.anomaly_section) > 0:
                 for item in token_node.anomaly_section:
-                    self._append_proto_occurrence(
-                        token_node.proto_node_list[item.max_idx],
+                    self._append_sem_occurrence(
+                        token_node.sem_node_list[item.max_idx],
                         item.text_embedding,
                         edge_weight=item.max_val,
                     )
@@ -1097,10 +1144,10 @@ class ProtoGraphRAG:
         progress_update(total_token_nodes, force=True)
         print()
 
-    def _sample_proto_chunk_nodes(self, proto_node, max_samples=10):
+    def _sample_sem_chunk_nodes(self, sem_node, max_samples=10):
         unique_chunk_nodes = []
         seen_chunk_ids = set()
-        for chunk_node in proto_node.chunk_node_list:
+        for chunk_node in sem_node.chunk_node_list:
             if chunk_node.chunk_node_id in seen_chunk_ids:
                 continue
             seen_chunk_ids.add(chunk_node.chunk_node_id)
@@ -1111,8 +1158,8 @@ class ProtoGraphRAG:
             return unique_chunk_nodes
         return random.sample(unique_chunk_nodes, max_samples)
 
-    def _sample_proto_span_occurrences(self, proto_node, max_samples=10):
-        span_occurrences = list(getattr(proto_node, "span_occurrences", []))
+    def _sample_sem_span_occurrences(self, sem_node, max_samples=10):
+        span_occurrences = list(getattr(sem_node, "span_occurrences", []))
         if span_occurrences:
             if max_samples is None or max_samples <= 0:
                 return span_occurrences
@@ -1120,7 +1167,7 @@ class ProtoGraphRAG:
                 return span_occurrences
             return random.sample(span_occurrences, max_samples)
 
-        fallback_chunk_nodes = self._sample_proto_chunk_nodes(proto_node, max_samples=max_samples)
+        fallback_chunk_nodes = self._sample_sem_chunk_nodes(sem_node, max_samples=max_samples)
         return [SpanOccurrence(chunk_node=chunk_node) for chunk_node in fallback_chunk_nodes]
 
     def _find_left_boundary_for_description(self, text, index):
@@ -1232,7 +1279,7 @@ class ProtoGraphRAG:
         )
 
     def _extract_prompt_context_for_description(self, chunk_text, token_text, match_span=None):
-        mode = self.proto_description_prompt_context_mode
+        mode = self.sem_description_prompt_context_mode
         if mode == "sentence":
             return self._extract_sentence_context_for_description(chunk_text, token_text, match_span=match_span)
         if mode == "sentence_neighbors":
@@ -1240,11 +1287,11 @@ class ProtoGraphRAG:
         if mode == "full_text":
             return self._extract_full_context_for_description(chunk_text, token_text, match_span=match_span)
         raise ValueError(
-            f"Unsupported proto_description_prompt_context_mode={mode!r}. "
+            f"Unsupported sem_description_prompt_context_mode={mode!r}. "
             "Use 'sentence', 'sentence_neighbors', or 'full_text'."
         )
 
-    def _build_proto_description_prompt(self, chunk_text, token_text, match_span=None):
+    def _build_sem_node_description_prompt(self, chunk_text, token_text, match_span=None):
         context_info = self._extract_prompt_context_for_description(
             chunk_text,
             token_text,
@@ -1263,7 +1310,7 @@ class ProtoGraphRAG:
             "prompt_text": prompt_text,
         }
 
-    def _build_fallback_proto_description_prompt(self, chunk_text, token_text):
+    def _build_fallback_sem_description_prompt(self, chunk_text, token_text):
         context_text = chunk_text.strip()
         if not context_text:
             return None
@@ -1279,25 +1326,25 @@ class ProtoGraphRAG:
             "prompt_text": prompt_text,
         }
 
-    def _load_proto_description_candidate_bank(self, proto_node, candidate_bank_cache):
-        token_text = proto_node.token_node.token_text
+    def _load_sem_description_candidate_bank(self, sem_node, candidate_bank_cache):
+        token_text = sem_node.token_node.token_text
         cached_candidate_bank = candidate_bank_cache.get(token_text)
         if cached_candidate_bank is not None:
             return cached_candidate_bank
 
-        max_candidate_count = max(1, len(proto_node.token_node.proto_node_list) + 1)
+        max_candidate_count = max(1, len(sem_node.token_node.sem_node_list) + 1)
         try:
             candidates_df, definition_column = load_wikidata_definition_candidates(
                 token_text,
-                use_detailed_description=self.proto_description_use_detailed_description,
-                limit=self.proto_description_candidate_limit,
+                use_detailed_description=self.sem_description_use_detailed_description,
+                limit=self.sem_description_candidate_limit,
                 target_candidate_count=max_candidate_count,
             )
         except ValueError:
             candidate_bank_cache[token_text] = []
             self._log_wikidata_no_result(
                 token_text,
-                "proto_description",
+                "sem_description",
                 "no_candidate_definitions",
             )
             return []
@@ -1305,10 +1352,10 @@ class ProtoGraphRAG:
         candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column=definition_column)
         candidate_bank_cache[token_text] = candidate_bank
         if candidate_bank:
-            self._log_proto_description_operation(
+            self._log_sem_description_operation(
                 "wikidata_candidate_lookup",
                 token_text=token_text,
-                candidate_limit=self.proto_description_candidate_limit,
+                candidate_limit=self.sem_description_candidate_limit,
                 max_candidate_count=max_candidate_count,
                 candidate_count=len(candidate_bank),
             )
@@ -1316,41 +1363,41 @@ class ProtoGraphRAG:
 
         self._log_wikidata_no_result(
             token_text,
-            "proto_description",
+            "sem_description",
             "empty_candidate_bank",
         )
         return []
 
-    def _predict_proto_description_from_samples(
+    def _predict_sem_description_from_samples(
         self,
-        proto_node,
+        sem_node,
         model,
         candidate_bank_cache,
         max_samples=10,
     ):
-        token_text = proto_node.token_node.token_text
-        candidate_bank = self._load_proto_description_candidate_bank(proto_node, candidate_bank_cache)
+        token_text = sem_node.token_node.token_text
+        candidate_bank = self._load_sem_description_candidate_bank(sem_node, candidate_bank_cache)
 
         if not candidate_bank:
             self._log_wikidata_no_result(
                 token_text,
-                "proto_description",
+                "sem_description",
                 "empty_candidate_bank",
             )
             return None
 
         description_vote_map = {}
         sample_prediction_records = []
-        sample_span_occurrences = self._sample_proto_span_occurrences(proto_node, max_samples=max_samples)
+        sample_span_occurrences = self._sample_sem_span_occurrences(sem_node, max_samples=max_samples)
         for sample_index, span_occurrence in enumerate(sample_span_occurrences, start=1):
             chunk_node = span_occurrence.chunk_node
-            prompt_info = self._build_proto_description_prompt(
+            prompt_info = self._build_sem_node_description_prompt(
                 chunk_node.chunk_text,
                 token_text,
                 match_span=span_occurrence.get_span_tuple(),
             )
             if prompt_info is None:
-                prompt_info = self._build_fallback_proto_description_prompt(
+                prompt_info = self._build_fallback_sem_description_prompt(
                     chunk_node.chunk_text,
                     token_text,
                 )
@@ -1360,7 +1407,7 @@ class ProtoGraphRAG:
             pairs = [(prompt_info["prompt_text"], candidate["hypothesis"]) for candidate in candidate_bank]
             raw_scores = model.predict(
                 pairs,
-                batch_size=min(self.proto_description_batch_size, len(pairs)),
+                batch_size=min(self.sem_description_batch_size, len(pairs)),
                 show_progress_bar=False,
             )
             scores = extract_cross_encoder_scores(raw_scores, model)
@@ -1459,9 +1506,9 @@ class ProtoGraphRAG:
             span_occurrence.span_text,
         )
 
-    def _build_retained_text_embedding_lookup(self, proto_node):
+    def _build_retained_text_embedding_lookup(self, sem_node):
         lookup = defaultdict(list)
-        for text_embedding in getattr(proto_node, "retained_text_embeddings", []):
+        for text_embedding in getattr(sem_node, "retained_text_embeddings", []):
             lookup[self._get_span_occurrence_key(text_embedding.to_span_occurrence())].append(text_embedding)
         return lookup
 
@@ -1511,69 +1558,69 @@ class ProtoGraphRAG:
             span_text=span_text,
         )
 
-    def _finalize_split_proto_node_embed(self, proto_node):
-        available_embeds = list(proto_node.chunk_node_embed)
+    def _finalize_split_sem_node_embed(self, sem_node):
+        available_embeds = list(sem_node.chunk_node_embed)
         if available_embeds:
-            proto_node.embed = average_embeds(available_embeds)
+            sem_node.embed = average_embeds(available_embeds)
         else:
-            sample_occurrences = list(getattr(proto_node, "span_occurrences", []))
+            sample_occurrences = list(getattr(sem_node, "span_occurrences", []))
             if sample_occurrences:
-                sample_size = min(len(sample_occurrences), self.proto_retained_embed_limit)
+                sample_size = min(len(sample_occurrences), self.sem_retained_embed_limit)
                 regenerated_text_embeddings = []
                 for span_occurrence in random.sample(sample_occurrences, sample_size):
                     text_embedding = self._reencode_text_embedding_for_occurrence(
-                        proto_node.token_node,
+                        sem_node.token_node,
                         span_occurrence,
                     )
                     if text_embedding is not None:
                         regenerated_text_embeddings.append(text_embedding)
 
                 if regenerated_text_embeddings:
-                    proto_node.embed = average_embeds(
+                    sem_node.embed = average_embeds(
                         [text_embedding.embed for text_embedding in regenerated_text_embeddings]
                     )
-                    self._initialize_proto_retained_text_embeddings(
-                        proto_node,
+                    self._initialize_sem_retained_text_embeddings(
+                        sem_node,
                         regenerated_text_embeddings,
                     )
 
-        if proto_node.embed is None:
+        if sem_node.embed is None:
             raise ValueError(
-                f"Failed to rebuild embed for split proto node {proto_node.proto_node_id} "
-                f"({proto_node.token_node.token_text!r}, description={proto_node.description!r})."
+                f"Failed to rebuild embed for split sem node {sem_node.sem_node_id} "
+                f"({sem_node.token_node.token_text!r}, description={sem_node.description!r})."
             )
 
-        if proto_node.chunk_edge_weight:
-            proto_node.anomaly_threshold = get_anomaly_threshold(
-                proto_node.chunk_edge_weight,
+        if sem_node.chunk_edge_weight:
+            sem_node.anomaly_threshold = get_anomaly_threshold(
+                sem_node.chunk_edge_weight,
                 self.anomaly_threshold_percentile,
             )
         else:
-            proto_node.anomaly_threshold = None
-        proto_node.chunk_node_embed.clear()
-        proto_node.pending_embed_rebuild = False
+            sem_node.anomaly_threshold = None
+        sem_node.chunk_node_embed.clear()
+        sem_node.pending_embed_rebuild = False
 
-    def _create_split_proto_node(self, token_node, description):
-        new_proto_node = self.create_proto_node(token_node)
-        new_proto_node.description = description
-        new_proto_node.chunk_node_list = []
-        new_proto_node.span_occurrences = []
-        new_proto_node.chunk_node_embed = []
-        new_proto_node.retained_text_embeddings = []
-        new_proto_node.retained_text_embedding_source_count = 0
-        new_proto_node.pending_embed_rebuild = True
-        new_proto_node.chunk_edge_weight = []
-        new_proto_node.embed = None
-        new_proto_node.anomaly_threshold = None
-        new_proto_node.tf_dict_by_chunk_id = None
-        new_proto_node.chunk_len_dict_by_id = None
-        new_proto_node.BM25 = None
-        new_proto_node.df = 0
-        new_proto_node.idf = 0
-        return new_proto_node
+    def _create_split_sem_node(self, token_node, description):
+        new_sem_node = self.create_sem_node(token_node)
+        new_sem_node.description = description
+        new_sem_node.chunk_node_list = []
+        new_sem_node.span_occurrences = []
+        new_sem_node.chunk_node_embed = []
+        new_sem_node.retained_text_embeddings = []
+        new_sem_node.retained_text_embedding_source_count = 0
+        new_sem_node.pending_embed_rebuild = True
+        new_sem_node.chunk_edge_weight = []
+        new_sem_node.embed = None
+        new_sem_node.anomaly_threshold = None
+        new_sem_node.tf_dict_by_chunk_id = None
+        new_sem_node.chunk_len_dict_by_id = None
+        new_sem_node.BM25 = None
+        new_sem_node.df = 0
+        new_sem_node.idf = 0
+        return new_sem_node
 
-    def _merge_proto_node_group(self, proto_group):
-        primary_proto = proto_group[0]
+    def _merge_sem_node_group(self, sem_group):
+        primary_sem = sem_group[0]
         merged_chunk_nodes = []
         merged_chunk_edge_weights = []
         merged_span_occurrences = []
@@ -1581,102 +1628,102 @@ class ProtoGraphRAG:
         merged_retained_text_embeddings = []
         merged_retained_source_count = 0
 
-        for proto_node in proto_group:
-            merged_chunk_nodes.extend(proto_node.chunk_node_list)
-            merged_chunk_edge_weights.extend(proto_node.chunk_edge_weight)
-            merged_span_occurrences.extend(getattr(proto_node, "span_occurrences", []))
-            merged_retained_text_embeddings.extend(getattr(proto_node, "retained_text_embeddings", []))
+        for sem_node in sem_group:
+            merged_chunk_nodes.extend(sem_node.chunk_node_list)
+            merged_chunk_edge_weights.extend(sem_node.chunk_edge_weight)
+            merged_span_occurrences.extend(getattr(sem_node, "span_occurrences", []))
+            merged_retained_text_embeddings.extend(getattr(sem_node, "retained_text_embeddings", []))
             merged_retained_source_count += getattr(
-                proto_node,
+                sem_node,
                 "retained_text_embedding_source_count",
-                len(getattr(proto_node, "retained_text_embeddings", [])),
+                len(getattr(sem_node, "retained_text_embeddings", [])),
             )
-            if proto_node.embed is not None:
-                merged_embeds.append(proto_node.embed)
+            if sem_node.embed is not None:
+                merged_embeds.append(sem_node.embed)
 
-        primary_proto.chunk_node_list = merged_chunk_nodes
-        primary_proto.chunk_edge_weight = merged_chunk_edge_weights
-        primary_proto.span_occurrences = merged_span_occurrences
-        primary_proto.chunk_node_embed = []
-        primary_proto.retained_text_embeddings = self._sample_text_embeddings(
+        primary_sem.chunk_node_list = merged_chunk_nodes
+        primary_sem.chunk_edge_weight = merged_chunk_edge_weights
+        primary_sem.span_occurrences = merged_span_occurrences
+        primary_sem.chunk_node_embed = []
+        primary_sem.retained_text_embeddings = self._sample_text_embeddings(
             merged_retained_text_embeddings,
-            max_samples=self.proto_retained_embed_limit,
+            max_samples=self.sem_retained_embed_limit,
         )
-        primary_proto.retained_text_embedding_source_count = max(
+        primary_sem.retained_text_embedding_source_count = max(
             merged_retained_source_count,
             len(merged_retained_text_embeddings),
         )
-        primary_proto.pending_embed_rebuild = False
+        primary_sem.pending_embed_rebuild = False
         retained_embeds = [
             text_embedding.embed
             for text_embedding in merged_retained_text_embeddings
             if text_embedding.embed is not None
         ]
         if retained_embeds:
-            primary_proto.embed = average_embeds(retained_embeds)
+            primary_sem.embed = average_embeds(retained_embeds)
         elif merged_embeds:
-            primary_proto.embed = torch.stack(merged_embeds).mean(dim=0)
-        if primary_proto.chunk_edge_weight:
-            primary_proto.anomaly_threshold = get_anomaly_threshold(
-                primary_proto.chunk_edge_weight,
+            primary_sem.embed = torch.stack(merged_embeds).mean(dim=0)
+        if primary_sem.chunk_edge_weight:
+            primary_sem.anomaly_threshold = get_anomaly_threshold(
+                primary_sem.chunk_edge_weight,
                 self.anomaly_threshold_percentile,
             )
         else:
-            primary_proto.anomaly_threshold = None
-        primary_proto.tf_dict_by_chunk_id = None
-        primary_proto.chunk_len_dict_by_id = None
-        primary_proto.BM25 = None
-        primary_proto.df = 0
-        primary_proto.idf = 0
-        return primary_proto
+            primary_sem.anomaly_threshold = None
+        primary_sem.tf_dict_by_chunk_id = None
+        primary_sem.chunk_len_dict_by_id = None
+        primary_sem.BM25 = None
+        primary_sem.df = 0
+        primary_sem.idf = 0
+        return primary_sem
 
-    def merge_duplicate_description_proto_nodes(self):
+    def merge_duplicate_description_sem_nodes(self):
         consensus_ratio_threshold = 0.8
-        redundant_proto_ids = set()
-        proto_nodes_changed = False
+        redundant_sem_ids = set()
+        sem_nodes_changed = False
         target_token_nodes = [
             token_node for token_node in self.token_nodes
-            if len(token_node.proto_node_list) > 1
+            if len(token_node.sem_node_list) > 1
         ]
         candidate_bank_cache = {}
 
         total_token_nodes = len(target_token_nodes)
         progress_update = self._make_progress_updater(
-            "merge_duplicate_description_proto_nodes",
+            "merge_duplicate_description_sem_nodes",
             total_token_nodes,
         ) if total_token_nodes > 0 else None
         if progress_update is not None:
             progress_update(0, force=True)
         for index, token_node in enumerate(target_token_nodes, start=1):
-            ordered_proto_list = []
-            seen_proto_ids = set()
-            for proto_node in token_node.proto_node_list:
-                proto_id = id(proto_node)
-                if proto_id in seen_proto_ids:
+            ordered_sem_list = []
+            seen_sem_ids = set()
+            for sem_node in token_node.sem_node_list:
+                sem_id = id(sem_node)
+                if sem_id in seen_sem_ids:
                     continue
-                seen_proto_ids.add(proto_id)
-                ordered_proto_list.append(proto_node)
+                seen_sem_ids.add(sem_id)
+                ordered_sem_list.append(sem_node)
 
-            new_proto_list = []
-            description_proto_map = defaultdict(list)
-            for proto_node in ordered_proto_list:
-                if proto_node.description:
-                    new_proto_list.append(proto_node)
-                    description_proto_map[proto_node.description].append(proto_node)
-                    continue
-
-                if self.proto_description_model is None:
-                    new_proto_list.append(proto_node)
+            new_sem_list = []
+            description_sem_map = defaultdict(list)
+            for sem_node in ordered_sem_list:
+                if sem_node.description:
+                    new_sem_list.append(sem_node)
+                    description_sem_map[sem_node.description].append(sem_node)
                     continue
 
-                prediction_result = self._predict_proto_description_from_samples(
-                    proto_node,
-                    model=self.proto_description_model,
+                if self.sem_description_model is None:
+                    new_sem_list.append(sem_node)
+                    continue
+
+                prediction_result = self._predict_sem_description_from_samples(
+                    sem_node,
+                    model=self.sem_description_model,
                     candidate_bank_cache=candidate_bank_cache,
                     max_samples=10,
                 )
                 if prediction_result is None:
-                    new_proto_list.append(proto_node)
+                    new_sem_list.append(sem_node)
                     continue
 
                 if (
@@ -1684,29 +1731,29 @@ class ProtoGraphRAG:
                     and prediction_result["top_description_ratio"] >= consensus_ratio_threshold
                 ):
                     predicted_description = prediction_result["description"]
-                    proto_node.description = predicted_description
-                    new_proto_list.append(proto_node)
-                    description_proto_map[predicted_description].append(proto_node)
-                    self.predicted_proto_description_logs.append(
+                    sem_node.description = predicted_description
+                    new_sem_list.append(sem_node)
+                    description_sem_map[predicted_description].append(sem_node)
+                    self.predicted_sem_description_logs.append(
                         {
-                            "proto_node_id": proto_node.proto_node_id,
-                            "token_text": proto_node.token_node.token_text,
+                            "sem_node_id": sem_node.sem_node_id,
+                            "token_text": sem_node.token_node.token_text,
                             "description": predicted_description,
                             "predicted_entity_id": prediction_result.get("predicted_entity_id"),
                             "predicted_label": prediction_result.get("predicted_label"),
                             "predicted_definition": prediction_result.get("predicted_definition"),
                             "prediction_score_mean": prediction_result.get("prediction_score_mean"),
-                            "chunk_count": len(proto_node.chunk_node_list),
+                            "chunk_count": len(sem_node.chunk_node_list),
                             "sample_count": prediction_result.get("sample_count"),
                             "top_description_count": prediction_result.get("top_description_count"),
                             "top_description_ratio": prediction_result.get("top_description_ratio"),
                             "sample_predictions": prediction_result["sample_predictions"],
                         }
                     )
-                    self._log_proto_description_operation(
+                    self._log_sem_description_operation(
                         "assign_description_by_consensus",
                         token_text=token_node.token_text,
-                        proto_node_id=proto_node.proto_node_id,
+                        sem_node_id=sem_node.sem_node_id,
                         description=predicted_description,
                         sample_count=prediction_result.get("sample_count"),
                         top_description_count=prediction_result.get("top_description_count"),
@@ -1714,33 +1761,33 @@ class ProtoGraphRAG:
                     )
                     continue
 
-                exhaustive_prediction_result = self._predict_proto_description_from_samples(
-                    proto_node,
-                    model=self.proto_description_model,
+                exhaustive_prediction_result = self._predict_sem_description_from_samples(
+                    sem_node,
+                    model=self.sem_description_model,
                     candidate_bank_cache=candidate_bank_cache,
                     max_samples=None,
                 )
                 if exhaustive_prediction_result is None:
-                    new_proto_list.append(proto_node)
+                    new_sem_list.append(sem_node)
                     continue
 
-                proto_nodes_changed = True
-                redundant_proto_ids.add(id(proto_node))
-                self._log_proto_description_operation(
-                    "split_proto_node_by_sample_labels",
+                sem_nodes_changed = True
+                redundant_sem_ids.add(id(sem_node))
+                self._log_sem_description_operation(
+                    "split_sem_node_by_sample_labels",
                     token_text=token_node.token_text,
-                    source_proto_node_id=proto_node.proto_node_id,
-                    source_chunk_count=len(proto_node.chunk_node_list),
+                    source_sem_node_id=sem_node.sem_node_id,
+                    source_chunk_count=len(sem_node.chunk_node_list),
                     description_counts=exhaustive_prediction_result.get("description_counts", {}),
                 )
-                retained_text_embedding_lookup = self._build_retained_text_embedding_lookup(proto_node)
-                self.deleted_merged_proto_logs.append(
+                retained_text_embedding_lookup = self._build_retained_text_embedding_lookup(sem_node)
+                self.deleted_merged_sem_logs.append(
                     {
-                        "deleted_proto_node_id": proto_node.proto_node_id,
-                        "kept_proto_node_id": None,
+                        "deleted_sem_node_id": sem_node.sem_node_id,
+                        "kept_sem_node_id": None,
                         "token_text": token_node.token_text,
                         "description": "split_by_sample_label",
-                        "deleted_chunk_count": len(proto_node.chunk_node_list),
+                        "deleted_chunk_count": len(sem_node.chunk_node_list),
                     }
                 )
 
@@ -1753,125 +1800,125 @@ class ProtoGraphRAG:
                         self._get_span_occurrence_key(span_occurrence),
                     )
                     retained_text_embedding = None if not retained_candidates else retained_candidates.pop()
-                    target_proto_group = description_proto_map.get(predicted_description)
-                    created_new_proto = False
-                    if target_proto_group:
-                        target_proto = target_proto_group[0]
+                    target_sem_group = description_sem_map.get(predicted_description)
+                    created_new_sem = False
+                    if target_sem_group:
+                        target_sem = target_sem_group[0]
                     else:
-                        target_proto = self._create_split_proto_node(token_node, predicted_description)
-                        description_proto_map[predicted_description].append(target_proto)
-                        new_proto_list.append(target_proto)
-                        created_new_proto = True
-                        self._log_proto_description_operation(
-                            "create_split_proto_node",
+                        target_sem = self._create_split_sem_node(token_node, predicted_description)
+                        description_sem_map[predicted_description].append(target_sem)
+                        new_sem_list.append(target_sem)
+                        created_new_sem = True
+                        self._log_sem_description_operation(
+                            "create_split_sem_node",
                             token_text=token_node.token_text,
-                            proto_node_id=target_proto.proto_node_id,
+                            sem_node_id=target_sem.sem_node_id,
                             description=predicted_description,
                         )
-                    self._append_span_occurrence_to_proto(
-                        target_proto,
+                    self._append_span_occurrence_to_sem(
+                        target_sem,
                         span_occurrence,
                         edge_weight=0.0,
                         retained_text_embedding=retained_text_embedding,
                     )
-                    self._log_proto_description_operation(
-                        "assign_sample_to_proto_node",
+                    self._log_sem_description_operation(
+                        "assign_sample_to_sem_node",
                         token_text=token_node.token_text,
-                        source_proto_node_id=proto_node.proto_node_id,
-                        target_proto_node_id=target_proto.proto_node_id,
+                        source_sem_node_id=sem_node.sem_node_id,
+                        target_sem_node_id=target_sem.sem_node_id,
                         description=predicted_description,
                         chunk_node_id=span_occurrence.chunk_node.chunk_node_id,
                         span_start=span_occurrence.span_start,
                         span_end=span_occurrence.span_end,
                         span_text=span_occurrence.span_text,
                         used_retained_embedding=retained_text_embedding is not None,
-                        created_new_proto=created_new_proto,
+                        created_new_sem=created_new_sem,
                     )
 
-            for proto_node in new_proto_list:
-                if getattr(proto_node, "pending_embed_rebuild", False):
-                    self._finalize_split_proto_node_embed(proto_node)
-                    self._log_proto_description_operation(
-                        "finalize_split_proto_node_embed",
+            for sem_node in new_sem_list:
+                if getattr(sem_node, "pending_embed_rebuild", False):
+                    self._finalize_split_sem_node_embed(sem_node)
+                    self._log_sem_description_operation(
+                        "finalize_split_sem_node_embed",
                         token_text=token_node.token_text,
-                        proto_node_id=proto_node.proto_node_id,
-                        description=proto_node.description,
-                        retained_embed_count=len(getattr(proto_node, "retained_text_embeddings", [])),
+                        sem_node_id=sem_node.sem_node_id,
+                        description=sem_node.description,
+                        retained_embed_count=len(getattr(sem_node, "retained_text_embeddings", [])),
                     )
 
-            merged_proto_map = {}
-            for description, proto_group in defaultdict(list, {
-                description: [proto for proto in new_proto_list if proto.description == description]
-                for description in {proto.description for proto in new_proto_list if proto.description}
+            merged_sem_map = {}
+            for description, sem_group in defaultdict(list, {
+                description: [sem_node for sem_node in new_sem_list if sem_node.description == description]
+                for description in {sem_node.description for sem_node in new_sem_list if sem_node.description}
             }).items():
-                if len(proto_group) < 2:
+                if len(sem_group) < 2:
                     continue
-                merged_proto = self._merge_proto_node_group(proto_group)
-                merged_proto_map[description] = merged_proto
-                self._log_proto_description_operation(
-                    "merge_proto_nodes_with_same_description",
+                merged_sem = self._merge_sem_node_group(sem_group)
+                merged_sem_map[description] = merged_sem
+                self._log_sem_description_operation(
+                    "merge_sem_nodes_with_same_description",
                     token_text=token_node.token_text,
                     description=description,
-                    kept_proto_node_id=merged_proto.proto_node_id,
-                    merged_proto_node_ids=[proto.proto_node_id for proto in proto_group],
-                    retained_embed_count=len(getattr(merged_proto, "retained_text_embeddings", [])),
+                    kept_sem_node_id=merged_sem.sem_node_id,
+                    merged_sem_node_ids=[sem_node.sem_node_id for sem_node in sem_group],
+                    retained_embed_count=len(getattr(merged_sem, "retained_text_embeddings", [])),
                 )
-                for redundant_proto in proto_group[1:]:
-                    proto_nodes_changed = True
-                    redundant_proto_ids.add(id(redundant_proto))
-                    self.deleted_merged_proto_logs.append(
+                for redundant_sem in sem_group[1:]:
+                    sem_nodes_changed = True
+                    redundant_sem_ids.add(id(redundant_sem))
+                    self.deleted_merged_sem_logs.append(
                         {
-                            "deleted_proto_node_id": redundant_proto.proto_node_id,
-                            "kept_proto_node_id": merged_proto.proto_node_id,
+                            "deleted_sem_node_id": redundant_sem.sem_node_id,
+                            "kept_sem_node_id": merged_sem.sem_node_id,
                             "token_text": token_node.token_text,
                             "description": description,
-                            "deleted_chunk_count": len(redundant_proto.chunk_node_list),
+                            "deleted_chunk_count": len(redundant_sem.chunk_node_list),
                         }
                     )
 
-            if merged_proto_map:
-                deduped_proto_list = []
-                added_proto_ids = set()
-                for proto_node in new_proto_list:
-                    if id(proto_node) in redundant_proto_ids:
+            if merged_sem_map:
+                deduped_sem_list = []
+                added_sem_ids = set()
+                for sem_node in new_sem_list:
+                    if id(sem_node) in redundant_sem_ids:
                         continue
-                    target_proto = merged_proto_map.get(proto_node.description, proto_node)
-                    target_proto_id = id(target_proto)
-                    if target_proto_id in added_proto_ids:
+                    target_sem = merged_sem_map.get(sem_node.description, sem_node)
+                    target_sem_id = id(target_sem)
+                    if target_sem_id in added_sem_ids:
                         continue
-                    added_proto_ids.add(target_proto_id)
-                    deduped_proto_list.append(target_proto)
-                new_proto_list = deduped_proto_list
+                    added_sem_ids.add(target_sem_id)
+                    deduped_sem_list.append(target_sem)
+                new_sem_list = deduped_sem_list
 
-            token_node.proto_node_list = new_proto_list
-            token_node.has_prototype = len(token_node.proto_node_list) > 0
+            token_node.sem_node_list = new_sem_list
+            token_node.has_semantic = len(token_node.sem_node_list) > 0
             progress_update(index)
 
-        if not redundant_proto_ids and not proto_nodes_changed:
+        if not redundant_sem_ids and not sem_nodes_changed:
             if total_token_nodes > 0:
                 progress_update(total_token_nodes, force=True)
                 print()
             return
 
-        self.proto_nodes = [
-            proto_node for proto_node in self.proto_nodes
-            if id(proto_node) not in redundant_proto_ids
+        self.sem_nodes = [
+            sem_node for sem_node in self.sem_nodes
+            if id(sem_node) not in redundant_sem_ids
         ]
-        for index, proto_node in enumerate(self.proto_nodes):
-            proto_node.proto_node_id = index
-        self.next_proto_node_id = len(self.proto_nodes)
+        for index, sem_node in enumerate(self.sem_nodes):
+            sem_node.sem_node_id = index
+        self.next_sem_node_id = len(self.sem_nodes)
         if total_token_nodes > 0:
             progress_update(total_token_nodes, force=True)
             print()
 
-    def _format_proto_description_logs_text(self):
+    def _format_sem_description_logs_text(self):
         lines = []
 
-        lines.append("Proto description operations:")
-        if not self.proto_description_operation_logs:
+        lines.append("Sem description operations:")
+        if not self.sem_description_operation_logs:
             lines.append("  (none)")
         else:
-            for item in self.proto_description_operation_logs:
+            for item in self.sem_description_operation_logs:
                 event_type = item.get("event_type", "unknown")
                 payload = ", ".join(
                     f"{key}={value!r}"
@@ -1881,14 +1928,14 @@ class ProtoGraphRAG:
                 lines.append(f"  [{event_type}] {payload}")
 
         lines.append("")
-        lines.append("Proto nodes assigned predicted descriptions:")
-        if not self.predicted_proto_description_logs:
+        lines.append("Sem nodes assigned predicted descriptions:")
+        if not self.predicted_sem_description_logs:
             lines.append("  (none)")
         else:
-            for item in self.predicted_proto_description_logs:
+            for item in self.predicted_sem_description_logs:
                 lines.append(
-                    "[Proto] proto_node_id={} | token={!r} | description={!r} | chunk_count={}".format(
-                        item["proto_node_id"],
+                    "[Sem] sem_node_id={} | token={!r} | description={!r} | chunk_count={}".format(
+                        item["sem_node_id"],
                         item["token_text"],
                         item["description"],
                         item["chunk_count"],
@@ -1913,15 +1960,15 @@ class ProtoGraphRAG:
                     lines.append("    context_text={!r}".format(sample["context_text"]))
                 lines.append("")
 
-        lines.append("Proto nodes deleted by description merge:")
-        if not self.deleted_merged_proto_logs:
+        lines.append("Sem nodes deleted by description merge:")
+        if not self.deleted_merged_sem_logs:
             lines.append("  (none)")
         else:
-            for item in self.deleted_merged_proto_logs:
+            for item in self.deleted_merged_sem_logs:
                 lines.append(
-                    "  deleted_proto_node_id={} | kept_proto_node_id={} | token={!r} | description={!r} | deleted_chunk_count={}".format(
-                        item["deleted_proto_node_id"],
-                        item["kept_proto_node_id"],
+                    "  deleted_sem_node_id={} | kept_sem_node_id={} | token={!r} | description={!r} | deleted_chunk_count={}".format(
+                        item["deleted_sem_node_id"],
+                        item["kept_sem_node_id"],
                         item["token_text"],
                         item["description"],
                         item["deleted_chunk_count"],
@@ -1944,12 +1991,12 @@ class ProtoGraphRAG:
 
         return "\n".join(lines)
 
-    def print_proto_description_logs(self, output_path=None):
-        return self.show_proto_description_logs(output_path=output_path)
+    def print_sem_description_logs(self, output_path=None):
+        return self.show_sem_description_logs(output_path=output_path)
 
-    def show_proto_description_logs(self, as_html=True, open_details=False, output_path=None):
-        output_path = self.proto_description_log_path if output_path is None else output_path
-        log_text = self._format_proto_description_logs_text()
+    def show_sem_description_logs(self, as_html=True, open_details=False, output_path=None):
+        output_path = self.sem_description_log_path if output_path is None else output_path
+        log_text = self._format_sem_description_logs_text()
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(log_text)
         return output_path
@@ -1969,9 +2016,9 @@ class ProtoGraphRAG:
                 f"reason={item['reason']}"
             )
 
-    def get_proto_BM25(self):
-        for proto_node in self.proto_nodes:
-            proto_node.get_BM25(self.chunk_avg_len)
+    def get_sem_BM25(self):
+        for sem_node in self.sem_nodes:
+            sem_node.get_BM25(self.chunk_avg_len)
 
     def process_embeds(self, new_chunk_node, phrase_embs, token_embs):
         for text, embed, span_start, span_end in phrase_embs + token_embs:
@@ -1986,11 +2033,11 @@ class ProtoGraphRAG:
                 token_node = self.create_token_node(text)
                 token_node.embeds_buffer.append(text_embedding)
             else:
-                if token_node.has_prototype:
-                    max_val, max_idx = inspect_prototypes(embed, token_node.proto_node_list)
-                    if max_val >= token_node.proto_node_list[max_idx].anomaly_threshold:
-                        self._append_proto_occurrence(
-                            token_node.proto_node_list[max_idx],
+                if token_node.has_semantic:
+                    max_val, max_idx = inspect_sem_nodes(embed, token_node.sem_node_list)
+                    if max_val >= token_node.sem_node_list[max_idx].anomaly_threshold:
+                        self._append_sem_occurrence(
+                            token_node.sem_node_list[max_idx],
                             text_embedding,
                             edge_weight=max_val,
                         )
@@ -2006,7 +2053,7 @@ class ProtoGraphRAG:
                     token_node.embeds_buffer.append(text_embedding)
             self._append_token_occurrence(token_node, text_embedding)
             if len(token_node.embeds_buffer) == self.buffer_size:
-                self.build_proto_waitlist.append(token_node)
+                self.build_sem_node_waitlist.append(token_node)
 
     def index_document(self, doc_name, multiprocessing=True):
         self.start_time = time.perf_counter()
@@ -2028,7 +2075,7 @@ class ProtoGraphRAG:
                                                       remove_duplicate=self.remove_duplicate_token)
             phrase_embs, token_embs = get_token_embeds(token_embeddings, offsets, phrases, tokens)
             self.process_embeds(new_chunk_node, phrase_embs, token_embs)
-        self.solve_proto()
+        self.solve_sem_nodes()
         self.solve_anomaly()
 
     def index_document_multi_processing(self, doc_name):
@@ -2054,7 +2101,7 @@ class ProtoGraphRAG:
             )
 
             self.process_embeds(node, phrase_embs, token_embs)
-        self.solve_proto()
+        self.solve_sem_nodes()
         self.solve_anomaly()
 
     def plot_embed_distribution(self, token_node, clusters):
@@ -2088,7 +2135,7 @@ class ProtoGraphRAG:
             if self.phrase_token_nodes[idx].token_text != text
         ]
 
-    def max_cosine_prototype(
+    def max_cosine_semantic(
             self,
             query_tensor,
             token_node_list,
@@ -2101,12 +2148,12 @@ class ProtoGraphRAG:
         k: number of top results to return
 
         return:
-            topk_prototypes: list of prototype_node
+            topk_sem_nodes: list of sem_node
             topk_similarities: tensor of shape (k,)
         """
 
         all_embeds = []
-        prototype_map = []
+        sem_node_map = []
 
         for item in token_node_list:
             if index_as_input:
@@ -2114,9 +2161,9 @@ class ProtoGraphRAG:
             else:
                 token_node = item
 
-            for prototype_node in token_node.proto_node_list:
-                all_embeds.append(prototype_node.embed)
-                prototype_map.append(prototype_node)
+            for sem_node in token_node.sem_node_list:
+                all_embeds.append(sem_node.embed)
+                sem_node_map.append(sem_node)
 
         if len(all_embeds) == 0:
             return [], torch.tensor([])
@@ -2132,17 +2179,17 @@ class ProtoGraphRAG:
 
         topk_similarities, topk_indices = torch.topk(similarities, k)
 
-        topk_prototypes = [prototype_map[i] for i in topk_indices.tolist()]
+        topk_sem_nodes = [sem_node_map[i] for i in topk_indices.tolist()]
 
-        return topk_prototypes
+        return topk_sem_nodes
 
-    def build_chunk2proto_edge(self):
+    def build_chunk2sem_edge(self):
         for chunk_node in self.chunk_nodes:
-            chunk_node.proto_node_list = []
-        for proto_node in self.proto_nodes:
-            for chunk_node in proto_node.chunk_node_list:
-                if not id(proto_node) in (id(x) for x in chunk_node.proto_node_list):
-                    chunk_node.proto_node_list.append(proto_node)
+            chunk_node.sem_node_list = []
+        for sem_node in self.sem_nodes:
+            for chunk_node in sem_node.chunk_node_list:
+                if not id(sem_node) in (id(x) for x in chunk_node.sem_node_list):
+                    chunk_node.sem_node_list.append(sem_node)
 
     def rebuild_metadata_after_deletion(self):
         valid_chunk_ids = {id(chunk_node) for chunk_node in self.chunk_nodes}
@@ -2153,45 +2200,45 @@ class ProtoGraphRAG:
                 if id(chunk_node) in valid_chunk_ids
             ]
 
-        valid_proto_nodes = []
-        for proto_node in self.proto_nodes:
+        valid_sem_nodes = []
+        for sem_node in self.sem_nodes:
             keep_indices = [
-                i for i, chunk_node in enumerate(proto_node.chunk_node_list)
+                i for i, chunk_node in enumerate(sem_node.chunk_node_list)
                 if id(chunk_node) in valid_chunk_ids
             ]
-            proto_node.chunk_node_list = [proto_node.chunk_node_list[i] for i in keep_indices]
-            proto_node.span_occurrences = [
-                proto_node.span_occurrences[i]
+            sem_node.chunk_node_list = [sem_node.chunk_node_list[i] for i in keep_indices]
+            sem_node.span_occurrences = [
+                sem_node.span_occurrences[i]
                 for i in keep_indices
-            ] if getattr(proto_node, "span_occurrences", None) else []
-            proto_node.chunk_edge_weight = [proto_node.chunk_edge_weight[i] for i in keep_indices]
-            proto_node.retained_text_embeddings = [
-                text_embedding for text_embedding in getattr(proto_node, "retained_text_embeddings", [])
+            ] if getattr(sem_node, "span_occurrences", None) else []
+            sem_node.chunk_edge_weight = [sem_node.chunk_edge_weight[i] for i in keep_indices]
+            sem_node.retained_text_embeddings = [
+                text_embedding for text_embedding in getattr(sem_node, "retained_text_embeddings", [])
                 if id(text_embedding.chunk_node) in valid_chunk_ids
             ]
-            proto_node.retained_text_embedding_source_count = max(
-                proto_node.retained_text_embedding_source_count,
-                len(proto_node.retained_text_embeddings),
+            sem_node.retained_text_embedding_source_count = max(
+                sem_node.retained_text_embedding_source_count,
+                len(sem_node.retained_text_embeddings),
             )
-            if proto_node.chunk_node_list:
-                valid_proto_nodes.append(proto_node)
+            if sem_node.chunk_node_list:
+                valid_sem_nodes.append(sem_node)
 
-        self.proto_nodes = valid_proto_nodes
-        for index, proto_node in enumerate(self.proto_nodes):
-            proto_node.proto_node_id = index
-        self.next_proto_node_id = len(self.proto_nodes)
+        self.sem_nodes = valid_sem_nodes
+        for index, sem_node in enumerate(self.sem_nodes):
+            sem_node.sem_node_id = index
+        self.next_sem_node_id = len(self.sem_nodes)
 
-        valid_proto_ids = {id(proto_node) for proto_node in self.proto_nodes}
+        valid_sem_ids = {id(sem_node) for sem_node in self.sem_nodes}
         valid_token_nodes = []
         phrase_token_nodes = []
         token_node_query = {}
 
         for token_node in self.token_nodes:
-            token_node.proto_node_list = [
-                proto_node for proto_node in token_node.proto_node_list
-                if id(proto_node) in valid_proto_ids
+            token_node.sem_node_list = [
+                sem_node for sem_node in token_node.sem_node_list
+                if id(sem_node) in valid_sem_ids
             ]
-            token_node.has_prototype = len(token_node.proto_node_list) > 0
+            token_node.has_semantic = len(token_node.sem_node_list) > 0
             token_node.anomaly_section = [
                 item for item in token_node.anomaly_section
                 if id(item.text_embedding.chunk_node) in valid_chunk_ids
@@ -2200,7 +2247,7 @@ class ProtoGraphRAG:
                 item for item in token_node.span_occurrences
                 if id(item.chunk_node) in valid_chunk_ids
             ]
-            if token_node.has_prototype or token_node.embeds_buffer or token_node.anomaly_section:
+            if token_node.has_semantic or token_node.embeds_buffer or token_node.anomaly_section:
                 valid_token_nodes.append(token_node)
                 token_node_query[token_node.token_text] = token_node
                 if token_node.node_type == "phrase":
@@ -2213,8 +2260,8 @@ class ProtoGraphRAG:
         self.token_node_query = token_node_query
         self.phrase_token_nodes = phrase_token_nodes
 
-        self.build_proto_waitlist = [
-            token_node for token_node in self.build_proto_waitlist
+        self.build_sem_node_waitlist = [
+            token_node for token_node in self.build_sem_node_waitlist
             if token_node in self.token_nodes
         ]
         self.anomaly_waitlist = [
@@ -2233,24 +2280,24 @@ class ProtoGraphRAG:
             self.assign_idf(token_node)
 
         if self.chunk_avg_len is not None:
-            self.get_proto_BM25()
+            self.get_sem_BM25()
         else:
-            for proto_node in self.proto_nodes:
-                proto_node.BM25 = {}
+            for sem_node in self.sem_nodes:
+                sem_node.BM25 = {}
 
-        self.build_chunk2proto_edge()
+        self.build_chunk2sem_edge()
         self.phrase_index = defaultdict(set)
         self.build_phrase_query()
 
-        if self.proto_nodes:
+        if self.sem_nodes:
             self.build_query_database()
         else:
             self.query_database = None
 
 
-    def get_max_sim_proto(self, token_node, embeds):
-        proto_embeds = [proto.embed.to(self.device) for proto in token_node.proto_node_list]
-        x = torch.stack(proto_embeds, 0).to(self.device)
+    def get_max_sim_sem(self, token_node, embeds):
+        sem_embeds = [sem_node.embed.to(self.device) for sem_node in token_node.sem_node_list]
+        x = torch.stack(sem_embeds, 0).to(self.device)
         q = embeds.unsqueeze(0).expand_as(x)
         return int(F.cosine_similarity(x, q, dim=1).argmax().item())
 
@@ -2274,7 +2321,7 @@ class ProtoGraphRAG:
 
         if total_chunks == 0:
             # 仍然保持原来的收尾逻辑
-            self.solve_proto()
+            self.solve_sem_nodes()
             self.solve_anomaly()
             self.log_time(
                 f"File {doc_name} completed. Index time: {time.perf_counter() - document_start_time:.4f}s"
@@ -2377,9 +2424,9 @@ class ProtoGraphRAG:
         print()
 
         # =============================
-        # 收尾：prototype/anomaly + log
+        # 收尾：semantic/anomaly + log
         # =============================
-        self.solve_proto()
+        self.solve_sem_nodes()
         self.solve_anomaly()
         self.log_time(
             f"File {doc_name} completed. Index time: {time.perf_counter() - document_start_time:.4f}s"
@@ -2409,11 +2456,11 @@ class ProtoGraphRAG:
 
         return chunk_text.strip()
 
-    def _collect_proto_sentence_examples(self, proto_node, token_text, max_sentences_per_proto=3):
+    def _collect_sem_sentence_examples(self, sem_node, token_text, max_sentences_per_sem=3):
         examples = []
         seen_sentences = set()
 
-        for chunk_node in proto_node.chunk_node_list:
+        for chunk_node in sem_node.chunk_node_list:
             sentence_text = self._extract_sentence_for_token(chunk_node.chunk_text, token_text)
             if not sentence_text:
                 continue
@@ -2428,77 +2475,77 @@ class ProtoGraphRAG:
                 "sentence_text": sentence_text,
             })
 
-            if len(examples) >= max_sentences_per_proto:
+            if len(examples) >= max_sentences_per_sem:
                 break
 
         return examples
 
-    def inspect_multi_proto_token_nodes(self, min_proto_count=2, max_sentences_per_proto=3):
+    def inspect_multi_sem_token_nodes(self, min_sem_count=2, max_sentences_per_sem=3):
         result = {}
 
         for token_node in self.token_nodes:
-            proto_count = len(token_node.proto_node_list)
-            if proto_count < min_proto_count:
+            sem_count = len(token_node.sem_node_list)
+            if sem_count < min_sem_count:
                 continue
 
             result[token_node.token_text] = {
                 "token_node_id": token_node.token_node_id,
-                "proto_count": proto_count,
-                "prototypes": [],
+                "sem_count": sem_count,
+                "semantics": [],
             }
 
-            for proto_node in token_node.proto_node_list:
-                result[token_node.token_text]["prototypes"].append({
-                    "proto_node_id": proto_node.proto_node_id,
-                    "description": proto_node.description,
-                    "chunk_count": len(proto_node.chunk_node_list),
-                    "sentence_examples": self._collect_proto_sentence_examples(
-                        proto_node,
+            for sem_node in token_node.sem_node_list:
+                result[token_node.token_text]["semantics"].append({
+                    "sem_node_id": sem_node.sem_node_id,
+                    "description": sem_node.description,
+                    "chunk_count": len(sem_node.chunk_node_list),
+                    "sentence_examples": self._collect_sem_sentence_examples(
+                        sem_node,
                         token_node.token_text,
-                        max_sentences_per_proto=max_sentences_per_proto,
+                        max_sentences_per_sem=max_sentences_per_sem,
                     ),
                 })
 
         return result
 
-    def inspect_described_proto_token_nodes(self, max_sentences_per_proto=3):
+    def inspect_described_sem_token_nodes(self, max_sentences_per_sem=3):
         result = {}
 
         for token_node in self.token_nodes:
-            described_proto_nodes = [
-                proto_node for proto_node in token_node.proto_node_list
-                if getattr(proto_node, "description", None)
+            described_sem_nodes = [
+                sem_node for sem_node in token_node.sem_node_list
+                if getattr(sem_node, "description", None)
             ]
-            if not described_proto_nodes:
+            if not described_sem_nodes:
                 continue
 
             result[token_node.token_text] = {
                 "token_node_id": token_node.token_node_id,
-                "proto_count": len(described_proto_nodes),
-                "prototypes": [],
+                "sem_count": len(described_sem_nodes),
+                "semantics": [],
             }
 
-            for proto_node in described_proto_nodes:
-                result[token_node.token_text]["prototypes"].append({
-                    "proto_node_id": proto_node.proto_node_id,
-                    "description": proto_node.description,
-                    "chunk_count": len(proto_node.chunk_node_list),
-                    "sentence_examples": self._collect_proto_sentence_examples(
-                        proto_node,
+            for sem_node in described_sem_nodes:
+                result[token_node.token_text]["semantics"].append({
+                    "sem_node_id": sem_node.sem_node_id,
+                    "description": sem_node.description,
+                    "chunk_count": len(sem_node.chunk_node_list),
+                    "sentence_examples": self._collect_sem_sentence_examples(
+                        sem_node,
                         token_node.token_text,
-                        max_sentences_per_proto=max_sentences_per_proto,
+                        max_sentences_per_sem=max_sentences_per_sem,
                     ),
                 })
 
         return result
 
-    def _select_multi_proto_token_nodes(
+    def _select_multi_sem_token_nodes(
             self,
             inspect_data,
             token_contains=None,
-            sort_by="proto_count",
+            sort_by="sem_count",
             max_token_nodes=None,
-            max_protos_per_token=None,
+            max_sems_per_token=None,
     ):
         items = list(inspect_data.items())
 
@@ -2514,57 +2561,57 @@ class ProtoGraphRAG:
             items.sort(key=lambda x: x[0].lower())
         elif sort_by == "total_chunk_count":
             items.sort(
-                key=lambda x: sum(proto["chunk_count"] for proto in x[1]["prototypes"]),
+                key=lambda x: sum(sem_info["chunk_count"] for sem_info in x[1]["semantics"]),
                 reverse=True,
             )
         else:
-            items.sort(key=lambda x: x[1]["proto_count"], reverse=True)
+            items.sort(key=lambda x: x[1]["sem_count"], reverse=True)
 
         if max_token_nodes is not None:
             items = items[:max_token_nodes]
 
         selected_data = {}
         for token_text, token_info in items:
-            prototypes = token_info["prototypes"]
-            if max_protos_per_token is not None:
-                prototypes = sorted(
-                    prototypes,
+            semantics = token_info["semantics"]
+            if max_sems_per_token is not None:
+                semantics = sorted(
+                    semantics,
                     key=lambda x: x["chunk_count"],
                     reverse=True,
-                )[:max_protos_per_token]
+                )[:max_sems_per_token]
 
             selected_data[token_text] = {
                 "token_node_id": token_info["token_node_id"],
-                "proto_count": token_info["proto_count"],
-                "displayed_proto_count": len(prototypes),
-                "total_chunk_count": sum(proto["chunk_count"] for proto in token_info["prototypes"]),
-                "prototypes": prototypes,
+                "sem_count": token_info["sem_count"],
+                "displayed_sem_count": len(semantics),
+                "total_chunk_count": sum(sem_info["chunk_count"] for sem_info in token_info["semantics"]),
+                "semantics": semantics,
             }
 
         return selected_data
 
-    def _limit_proto_sentence_examples(self, inspect_data, max_examples_per_token=None):
+    def _limit_sem_sentence_examples(self, inspect_data, max_examples_per_token=None):
         if max_examples_per_token is None:
             return inspect_data
 
         limited_data = {}
         for token_text, token_info in inspect_data.items():
             remaining = max_examples_per_token
-            limited_prototypes = []
+            limited_semantics = []
 
-            for proto_info in token_info["prototypes"]:
+            for sem_info in token_info["semantics"]:
                 if remaining <= 0:
                     limited_examples = []
                 else:
-                    limited_examples = proto_info["sentence_examples"][:remaining]
+                    limited_examples = sem_info["sentence_examples"][:remaining]
                 remaining -= len(limited_examples)
 
-                limited_proto = dict(proto_info)
-                limited_proto["sentence_examples"] = limited_examples
-                limited_prototypes.append(limited_proto)
+                limited_sem = dict(sem_info)
+                limited_sem["sentence_examples"] = limited_examples
+                limited_semantics.append(limited_sem)
 
             limited_token_info = dict(token_info)
-            limited_token_info["prototypes"] = limited_prototypes
+            limited_token_info["semantics"] = limited_semantics
             limited_token_info["displayed_example_count"] = (
                 max_examples_per_token - max(remaining, 0)
             )
@@ -2572,27 +2619,27 @@ class ProtoGraphRAG:
 
         return limited_data
 
-    def _format_multi_proto_token_nodes_text(self, inspect_data):
+    def _format_multi_sem_token_nodes_text(self, inspect_data):
         lines = []
 
         for token_text, token_info in inspect_data.items():
             lines.append(
                 f"[Token] {token_text} | token_node_id={token_info['token_node_id']} | "
-                f"proto_count={token_info['proto_count']} | "
-                f"displayed_proto_count={token_info['displayed_proto_count']} | "
+                f"sem_count={token_info['sem_count']} | "
+                f"displayed_sem_count={token_info['displayed_sem_count']} | "
                 f"total_chunk_count={token_info['total_chunk_count']} | "
                 f"displayed_example_count={token_info.get('displayed_example_count', 'all')}"
             )
 
-            for proto_info in token_info["prototypes"]:
-                description = proto_info.get("description") or "(none)"
+            for sem_info in token_info["semantics"]:
+                description = sem_info.get("description") or "(none)"
                 lines.append(
-                    f"  [Proto] proto_node_id={proto_info['proto_node_id']} | "
+                    f"  [Sem] sem_node_id={sem_info['sem_node_id']} | "
                     f"description={description!r} | "
-                    f"chunk_count={proto_info['chunk_count']}"
+                    f"chunk_count={sem_info['chunk_count']}"
                 )
 
-                for idx, example in enumerate(proto_info["sentence_examples"], start=1):
+                for idx, example in enumerate(sem_info["sentence_examples"], start=1):
                     lines.append(
                         f"    ({idx}) doc={example['doc_name']} | chunk_id={example['chunk_node_id']}"
                     )
@@ -2602,7 +2649,7 @@ class ProtoGraphRAG:
 
         return "\n".join(lines).rstrip()
 
-    def _build_multi_proto_token_nodes_html(self, inspect_data, open_details=False):
+    def _build_multi_sem_token_nodes_html(self, inspect_data, open_details=False):
         total_tokens = len(inspect_data)
         html_parts = [
             "<div style='font-family:Arial, sans-serif; line-height:1.5;'>"
@@ -2621,8 +2668,8 @@ class ProtoGraphRAG:
             token_meta = (
                 f"<span style='color:#666;'>"
                 f"token_node_id={token_info['token_node_id']} | "
-                f"proto_count={token_info['proto_count']}, "
-                f"displayed_proto_count={token_info['displayed_proto_count']}, "
+                f"sem_count={token_info['sem_count']}, "
+                f"displayed_sem_count={token_info['displayed_sem_count']}, "
                 f"total_chunk_count={token_info['total_chunk_count']}, "
                 f"displayed_example_count={token_info.get('displayed_example_count', 'all')}"
                 f"</span>"
@@ -2634,20 +2681,20 @@ class ProtoGraphRAG:
                 f"<div style='margin:6px 0 0 2px; font-size:12px;'>{token_meta}</div>"
             )
 
-            for proto_info in token_info["prototypes"]:
-                description = proto_info.get("description") or "(none)"
-                proto_header = (
-                    f"proto_node_id={proto_info['proto_node_id']} | "
+            for sem_info in token_info["semantics"]:
+                description = sem_info.get("description") or "(none)"
+                sem_header = (
+                    f"sem_node_id={sem_info['sem_node_id']} | "
                     f"description={description} | "
-                    f"chunk_count={proto_info['chunk_count']}"
+                    f"chunk_count={sem_info['chunk_count']}"
                 )
                 html_parts.append(
                     "<div style='margin:10px 0 6px 16px; padding:8px 10px; "
                     "border-left:4px solid #4c78a8; background:#fff;'>"
-                    f"<div style='font-weight:600; margin-bottom:6px;'>{escape(proto_header)}</div>"
+                    f"<div style='font-weight:600; margin-bottom:6px;'>{escape(sem_header)}</div>"
                 )
 
-                for example in proto_info["sentence_examples"]:
+                for example in sem_info["sentence_examples"]:
                     meta = (
                         f"doc={example['doc_name']} | "
                         f"chunk_id={example['chunk_node_id']}"
@@ -2666,36 +2713,36 @@ class ProtoGraphRAG:
         html_parts.append("</div>")
         return "".join(html_parts)
 
-    def show_multi_proto_token_nodes(
+    def show_multi_sem_token_nodes(
             self,
-            min_proto_count=2,
-            max_sentences_per_proto=3,
+            min_sem_count=2,
+            max_sentences_per_sem=3,
             as_html=True,
             token_contains=None,
-            sort_by="proto_count",
+            sort_by="sem_count",
             max_token_nodes=20,
-            max_protos_per_token=5,
+            max_sems_per_token=5,
             max_examples_per_token=10,
             open_details=False,
     ):
-        inspect_data = self.inspect_multi_proto_token_nodes(
-            min_proto_count=min_proto_count,
-            max_sentences_per_proto=max_sentences_per_proto,
+        inspect_data = self.inspect_multi_sem_token_nodes(
+            min_sem_count=min_sem_count,
+            max_sentences_per_sem=max_sentences_per_sem,
         )
-        inspect_data = self._select_multi_proto_token_nodes(
+        inspect_data = self._select_multi_sem_token_nodes(
             inspect_data,
             token_contains=token_contains,
             sort_by=sort_by,
             max_token_nodes=max_token_nodes,
-            max_protos_per_token=max_protos_per_token,
+            max_sems_per_token=max_sems_per_token,
         )
-        inspect_data = self._limit_proto_sentence_examples(
+        inspect_data = self._limit_sem_sentence_examples(
             inspect_data,
             max_examples_per_token=max_examples_per_token,
         )
 
         if not inspect_data:
-            empty_text = "No token nodes matched the multi-prototype condition."
+            empty_text = "No token nodes matched the multi-semantic condition."
             if as_html:
                 try:
                     from IPython.display import HTML
@@ -2707,40 +2754,40 @@ class ProtoGraphRAG:
         if as_html:
             try:
                 from IPython.display import HTML
-                return HTML(self._build_multi_proto_token_nodes_html(inspect_data, open_details=open_details))
+                return HTML(self._build_multi_sem_token_nodes_html(inspect_data, open_details=open_details))
             except ImportError:
                 pass
 
-        return self._format_multi_proto_token_nodes_text(inspect_data)
+        return self._format_multi_sem_token_nodes_text(inspect_data)
 
-    def show_described_proto_token_nodes(
+    def show_described_sem_token_nodes(
             self,
-            max_sentences_per_proto=3,
+            max_sentences_per_sem=3,
             as_html=True,
             token_contains=None,
-            sort_by="proto_count",
+            sort_by="sem_count",
             max_token_nodes=20,
-            max_protos_per_token=10,
+            max_sems_per_token=10,
             max_examples_per_token=10,
             open_details=False,
     ):
-        inspect_data = self.inspect_described_proto_token_nodes(
-            max_sentences_per_proto=max_sentences_per_proto,
+        inspect_data = self.inspect_described_sem_token_nodes(
+            max_sentences_per_sem=max_sentences_per_sem,
         )
-        inspect_data = self._select_multi_proto_token_nodes(
+        inspect_data = self._select_multi_sem_token_nodes(
             inspect_data,
             token_contains=token_contains,
             sort_by=sort_by,
             max_token_nodes=max_token_nodes,
-            max_protos_per_token=max_protos_per_token,
+            max_sems_per_token=max_sems_per_token,
         )
-        inspect_data = self._limit_proto_sentence_examples(
+        inspect_data = self._limit_sem_sentence_examples(
             inspect_data,
             max_examples_per_token=max_examples_per_token,
         )
 
         if not inspect_data:
-            empty_text = "No proto nodes with descriptions were found."
+            empty_text = "No sem nodes with descriptions were found."
             if as_html:
                 try:
                     from IPython.display import HTML
@@ -2752,11 +2799,11 @@ class ProtoGraphRAG:
         if as_html:
             try:
                 from IPython.display import HTML
-                return HTML(self._build_multi_proto_token_nodes_html(inspect_data, open_details=open_details))
+                return HTML(self._build_multi_sem_token_nodes_html(inspect_data, open_details=open_details))
             except ImportError:
                 pass
 
-        return self._format_multi_proto_token_nodes_text(inspect_data)
+        return self._format_multi_sem_token_nodes_text(inspect_data)
 
 
     def delete_by_document(self, doc_name_list):
@@ -2775,7 +2822,7 @@ class ProtoGraphRAG:
 
 
     def delete_chunk_node(self, chunk_node_to_delete):
-        for node in chunk_node_to_delete.proto_node_list:
+        for node in chunk_node_to_delete.sem_node_list:
             index_to_delete = []
             for index, chunk_node in enumerate(node.chunk_node_list):
                 if chunk_node is chunk_node_to_delete:
@@ -2856,7 +2903,7 @@ class ProtoGraphRAG:
         state["executor"] = None
         state["nlp"] = None
         state["reranker"] = None
-        state["proto_description_model"] = None
+        state["sem_description_model"] = None
         return state
 
     # ⭐ 反序列化后做什么
@@ -2867,7 +2914,7 @@ class ProtoGraphRAG:
         self.executor = None
         self.nlp = None
         self.reranker = None
-        self.proto_description_model = None
+        self.sem_description_model = None
         self._ensure_backward_compatible_attrs()
 
     def _restore_runtime_components(self, load_nlp=True, load_reranker=False):
@@ -2881,8 +2928,8 @@ class ProtoGraphRAG:
             self._load_nlp()
         if load_reranker and self.reranker is None:
             self.load_reranker()
-        if self.proto_description_model is None:
-            self._load_proto_description_model()
+        if self.sem_description_model is None:
+            self._load_sem_description_model()
 
     def save_data(self, path):
         with open(path, "wb") as f:
@@ -2903,7 +2950,7 @@ class ProtoGraphRAG:
         """
         生成两个文件：
           - pkl_path:                 保存结构（不含 tensor）
-          - pkl_path.replace('.pkl','_tensors.pt'): 保存 query_database + proto embeds
+          - pkl_path.replace('.pkl','_tensors.pt'): 保存 query_database + sem embeds
         """
         pt_path = pkl_path.replace(".pkl", "_tensors.pt")
         self.node_instance2id()
@@ -2911,11 +2958,11 @@ class ProtoGraphRAG:
         tensor_pack = {
             "query_database": self.query_database.detach().cpu() if self.query_database is not None else None,
             # 用列表索引保存，最简单稳定
-            "proto_embeds": [
+            "sem_embeds": [
                 (p.embed.detach().cpu() if p.embed is not None else None)
-                for p in self.proto_nodes
+                for p in self.sem_nodes
             ],
-            "proto_retained_text_embeddings": [
+            "sem_retained_text_embeddings": [
                 [
                     {
                         "embed": (
@@ -2929,18 +2976,18 @@ class ProtoGraphRAG:
                     }
                     for text_embedding in getattr(p, "retained_text_embeddings", [])
                 ]
-                for p in self.proto_nodes
+                for p in self.sem_nodes
             ],
         }
         torch.save(tensor_pack, pt_path)
 
         # 2) 临时把对象里的 tensor 清空，避免 pickle 遇到 torch.Storage
         qbak = self.query_database
-        pbak = [p.embed for p in self.proto_nodes]
-        retained_bak = [p.retained_text_embeddings for p in self.proto_nodes]
+        pbak = [p.embed for p in self.sem_nodes]
+        retained_bak = [p.retained_text_embeddings for p in self.sem_nodes]
 
         self.query_database = None
-        for p in self.proto_nodes:
+        for p in self.sem_nodes:
             p.embed = None
             p.retained_text_embeddings = [
                 TextEmbedding(
@@ -2975,7 +3022,7 @@ class ProtoGraphRAG:
         finally:
             # 5) 恢复内存中的对象，保证系统继续可用
             self.query_database = qbak
-            for p, e, retained in zip(self.proto_nodes, pbak, retained_bak):
+            for p, e, retained in zip(self.sem_nodes, pbak, retained_bak):
                 p.embed = e
                 p.retained_text_embeddings = retained
 
@@ -3000,13 +3047,16 @@ class ProtoGraphRAG:
         query_database = tensor_pack.get("query_database", None)
         obj.query_database = query_database.to(obj.device) if query_database is not None else None
 
-        proto_embeds = tensor_pack.get("proto_embeds", [])
-        proto_retained_text_embeddings = tensor_pack.get("proto_retained_text_embeddings", [])
+        sem_embeds = tensor_pack.get("sem_embeds", tensor_pack.get("proto_embeds", []))
+        sem_retained_text_embeddings = tensor_pack.get(
+            "sem_retained_text_embeddings",
+            tensor_pack.get("proto_retained_text_embeddings", []),
+        )
         # 按索引回填
-        for i, p in enumerate(obj.proto_nodes):
-            embed = proto_embeds[i] if i < len(proto_embeds) else None
+        for i, p in enumerate(obj.sem_nodes):
+            embed = sem_embeds[i] if i < len(sem_embeds) else None
             p.embed = embed.to("cpu") if embed is not None else None
-            retained_pack = proto_retained_text_embeddings[i] if i < len(proto_retained_text_embeddings) else []
+            retained_pack = sem_retained_text_embeddings[i] if i < len(sem_retained_text_embeddings) else []
             p.retained_text_embeddings = [
                 TextEmbedding(
                     embed=(
@@ -3028,7 +3078,7 @@ class ProtoGraphRAG:
         # 重建运行态（按你原逻辑）
         obj._restore_runtime_components(load_nlp=True, load_reranker=False)
         obj.node_id2instance()
-        if obj.query_database is None and obj.proto_nodes and all(p.embed is not None for p in obj.proto_nodes):
+        if obj.query_database is None and obj.sem_nodes and all(p.embed is not None for p in obj.sem_nodes):
             obj.build_query_database()
         obj.load_reranker()
         return obj
@@ -3036,45 +3086,45 @@ class ProtoGraphRAG:
     def node_instance2id(self):
         for chunk_node in self.chunk_nodes:
             chunk_node.doc_node = chunk_node.doc_node.doc_node_id
-            chunk_node.proto_node_list = [node.proto_node_id for node in chunk_node.proto_node_list]
+            chunk_node.sem_node_list = [node.sem_node_id for node in chunk_node.sem_node_list]
         for doc_node in self.doc_nodes:
             doc_node.chunk_node_list = [chunk_node.chunk_node_id for chunk_node in doc_node.chunk_node_list]
-        for proto_node in self.proto_nodes:
-            proto_node.chunk_node_list = [chunk_node.chunk_node_id for chunk_node in proto_node.chunk_node_list]
-            for text_embedding in getattr(proto_node, "retained_text_embeddings", []):
+        for sem_node in self.sem_nodes:
+            sem_node.chunk_node_list = [chunk_node.chunk_node_id for chunk_node in sem_node.chunk_node_list]
+            for text_embedding in getattr(sem_node, "retained_text_embeddings", []):
                 text_embedding.chunk_node = text_embedding.chunk_node.chunk_node_id
-            proto_node.token_node = proto_node.token_node.token_node_id
+            sem_node.token_node = sem_node.token_node.token_node_id
         for token_node in self.token_nodes:
-            token_node.proto_node_list = [proto_node.proto_node_id for proto_node in token_node.proto_node_list]
+            token_node.sem_node_list = [sem_node.sem_node_id for sem_node in token_node.sem_node_list]
 
     def node_id2instance(self):
         for chunk_node in self.chunk_nodes:
             chunk_node.doc_node = self.doc_nodes[chunk_node.doc_node]
-            chunk_node.proto_node_list = [self.proto_nodes[idx] for idx in chunk_node.proto_node_list]
+            chunk_node.sem_node_list = [self.sem_nodes[idx] for idx in chunk_node.sem_node_list]
         for doc_node in self.doc_nodes:
             doc_node.chunk_node_list = [self.chunk_nodes[idx] for idx in doc_node.chunk_node_list]
-        for proto_node in self.proto_nodes:
-            proto_node.chunk_node_list = [self.chunk_nodes[idx] for idx in proto_node.chunk_node_list]
-            proto_node.token_node = self.token_nodes[proto_node.token_node]
-            if not hasattr(proto_node, "description"):
-                proto_node.description = self._get_initial_proto_description(proto_node.token_node)
-            if not hasattr(proto_node, "span_occurrences") or proto_node.span_occurrences is None:
-                proto_node.span_occurrences = []
-            if not proto_node.span_occurrences and proto_node.chunk_node_list:
-                proto_node.span_occurrences = [
+        for sem_node in self.sem_nodes:
+            sem_node.chunk_node_list = [self.chunk_nodes[idx] for idx in sem_node.chunk_node_list]
+            sem_node.token_node = self.token_nodes[sem_node.token_node]
+            if not hasattr(sem_node, "description"):
+                sem_node.description = self._get_initial_sem_description(sem_node.token_node)
+            if not hasattr(sem_node, "span_occurrences") or sem_node.span_occurrences is None:
+                sem_node.span_occurrences = []
+            if not sem_node.span_occurrences and sem_node.chunk_node_list:
+                sem_node.span_occurrences = [
                     SpanOccurrence(chunk_node=chunk_node)
-                    for chunk_node in proto_node.chunk_node_list
+                    for chunk_node in sem_node.chunk_node_list
                 ]
-            if not hasattr(proto_node, "retained_text_embeddings") or proto_node.retained_text_embeddings is None:
-                proto_node.retained_text_embeddings = []
-            for text_embedding in proto_node.retained_text_embeddings:
+            if not hasattr(sem_node, "retained_text_embeddings") or sem_node.retained_text_embeddings is None:
+                sem_node.retained_text_embeddings = []
+            for text_embedding in sem_node.retained_text_embeddings:
                 text_embedding.chunk_node = self.chunk_nodes[text_embedding.chunk_node]
-            if not hasattr(proto_node, "retained_text_embedding_source_count"):
-                proto_node.retained_text_embedding_source_count = len(proto_node.retained_text_embeddings)
-            if not hasattr(proto_node, "pending_embed_rebuild"):
-                proto_node.pending_embed_rebuild = False
+            if not hasattr(sem_node, "retained_text_embedding_source_count"):
+                sem_node.retained_text_embedding_source_count = len(sem_node.retained_text_embeddings)
+            if not hasattr(sem_node, "pending_embed_rebuild"):
+                sem_node.pending_embed_rebuild = False
         for token_node in self.token_nodes:
-            token_node.proto_node_list = [self.proto_nodes[idx] for idx in token_node.proto_node_list]
+            token_node.sem_node_list = [self.sem_nodes[idx] for idx in token_node.sem_node_list]
 
     def index_json(self, chunk_list, batch_size=8, queue_size=4):
         self.start_time = time.perf_counter()
@@ -3347,7 +3397,7 @@ class ProtoGraphRAG:
             f"Index time: {time.perf_counter() - self.start_time:.4f}s"
         )
 
-        self.solve_proto()
+        self.solve_sem_nodes()
         self.solve_anomaly()
         print(
             "HDBSCAN attempts: "
