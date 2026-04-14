@@ -132,14 +132,47 @@ def _series_casefold_contains(series, target: str):
     return series.map(lambda value: target_casefold in ("" if value is None else str(value)).casefold())
 
 
-def _series_startswith_lowercase(series):
-    return series.map(
-        lambda value: (str(value)[0].islower() if value is not None and str(value) else False)
+def _series_non_empty_mask(series):
+    return series.map(lambda value: ("" if value is None else str(value)).strip() != "")
+
+
+def _starts_with_uppercase_label(value) -> bool:
+    text = "" if value is None else str(value).strip()
+    return bool(text) and text[0].isupper()
+
+
+def _word_count(value) -> int:
+    return len(("" if value is None else str(value)).strip().split())
+
+
+def _word_tokens(value) -> list[str]:
+    return re.findall(r"[A-Za-z0-9]+", ("" if value is None else str(value)).casefold())
+
+
+def _contains_ordered_word_sequence(value, target: str, allow_at_start: bool = True) -> bool:
+    value_tokens = _word_tokens(value)
+    target_tokens = _word_tokens(target)
+    if not value_tokens or not target_tokens or len(target_tokens) > len(value_tokens):
+        return False
+    window_size = len(target_tokens)
+    return any(
+        (allow_at_start or index > 0)
+        and value_tokens[index:index + window_size] == target_tokens
+        for index in range(len(value_tokens) - window_size + 1)
     )
 
 
-def _series_non_empty_mask(series):
-    return series.map(lambda value: ("" if value is None else str(value)).strip() != "")
+def _alias_exact_match(value, target: str) -> bool:
+    target_text = str(target).strip()
+    if not target_text:
+        return False
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, set)):
+        aliases = [str(alias).strip() for alias in value]
+    else:
+        aliases = [alias.strip() for alias in str(value).split(",")]
+    return any(alias == target_text for alias in aliases if alias)
 
 
 def _series_exclude_name_descriptions(series):
@@ -379,18 +412,16 @@ def search_wikidata(
 
     if exact_match_first and not df.empty:
         exact_match_mask = _series_casefold_equals(df["match_text"], normalized_term)
-        lowercase_initial_mask = _series_startswith_lowercase(df["match_text"])
         df = df.assign(
             _exact_match_rank=exact_match_mask.astype(int),
-            _lowercase_initial_rank=lowercase_initial_mask.astype(int),
         )
         df = (
             df.sort_values(
-                ["_exact_match_rank", "_lowercase_initial_rank"],
-                ascending=[False, False],
+                ["_exact_match_rank"],
+                ascending=[False],
                 kind="stable",
             )
-            .drop(columns=["_exact_match_rank", "_lowercase_initial_rank"])
+            .drop(columns=["_exact_match_rank"])
             .reset_index(drop=True)
         )
 
@@ -418,6 +449,60 @@ def search_wikidata(
     return df
 
 
+def _select_wikidata_candidates_by_span_rules(
+    candidates_df,
+    query_text: str,
+    definition_column: str,
+    max_candidate_count: int,
+):
+    if candidates_df.empty:
+        return candidates_df
+
+    max_candidate_count = max(1, int(max_candidate_count))
+    definition_mask = _series_non_empty_mask(candidates_df[definition_column])
+    label_uppercase_mask = candidates_df["label"].map(_starts_with_uppercase_label)
+    is_instance_query = bool(label_uppercase_mask.all())
+
+    if is_instance_query:
+        label_exact_mask = _series_casefold_equals(candidates_df["label"], query_text)
+        selected = candidates_df[definition_mask & label_exact_mask].copy()
+        return selected.head(max_candidate_count).reset_index(drop=True)
+
+    query_word_count = _word_count(query_text)
+    label_exact_mask = _series_casefold_equals(candidates_df["label"], query_text)
+    label_contains_mask = candidates_df["label"].map(
+        lambda value: _contains_ordered_word_sequence(
+            value,
+            query_text,
+            allow_at_start=False,
+        )
+    )
+    alias_exact_mask = candidates_df["aliases"].map(
+        lambda value: _alias_exact_match(value, query_text)
+    )
+    label_word_count_mask = candidates_df["label"].map(
+        lambda value: _word_count(value) <= query_word_count + 1
+    )
+    selected = candidates_df[
+        definition_mask
+        & ~label_uppercase_mask
+        & (label_exact_mask | label_contains_mask | alias_exact_mask)
+        & label_word_count_mask
+    ].copy()
+    if selected.empty:
+        return selected.reset_index(drop=True)
+
+    label_exact_mask = _series_casefold_equals(selected["label"], query_text)
+    selected = (
+        selected.assign(_label_exact_rank=label_exact_mask.astype(int))
+        .sort_values(["_label_exact_rank"], ascending=[False], kind="stable")
+        .drop(columns=["_label_exact_rank"])
+        .head(max_candidate_count)
+        .reset_index(drop=True)
+    )
+    return selected
+
+
 def load_wikidata_definition_candidates(
     query_text: str,
     use_detailed_description: bool = True,
@@ -427,20 +512,21 @@ def load_wikidata_definition_candidates(
     filter_name: bool = True,
     require_detailed_description: bool = False,
     label_contains_text: bool = True,
+    target_candidate_count: int | None = None,
 ):
-    _, pd = _import_wikidata_deps()
-
-    include_detailed_description = use_detailed_description or require_detailed_description
+    max_candidate_count = max(1, int(target_candidate_count or limit))
+    search_limit = int(limit)
+    include_detailed_description = use_detailed_description
     candidates_df = search_wikidata(
         query_text,
-        limit=limit,
-        exact_match_text=exact_match_text,
-        exact_match_first=exact_match_first,
+        limit=search_limit,
+        exact_match_text=False,
+        exact_match_first=False,
         include_detailed_description=include_detailed_description,
         detailed_description_sentences=3,
-        drop_missing_detailed_description=include_detailed_description,
-        filter_name=filter_name,
-        label_contains_text=label_contains_text,
+        drop_missing_detailed_description=False,
+        filter_name=False,
+        label_contains_text=False,
     )
 
     if candidates_df.empty:
@@ -453,12 +539,17 @@ def load_wikidata_definition_candidates(
         )
 
     definition_column = "detailed_description" if use_detailed_description else "description"
-    candidates_df = candidates_df[_series_non_empty_mask(candidates_df[definition_column])].copy()
-    candidates_df = candidates_df.drop_duplicates(subset=["id", definition_column]).reset_index(drop=True)
+    candidates_df = _select_wikidata_candidates_by_span_rules(
+        candidates_df,
+        query_text=query_text,
+        definition_column=definition_column,
+        max_candidate_count=max_candidate_count,
+    )
     if candidates_df.empty:
         raise ValueError(
             f"No usable {definition_column} candidates remained for span={query_text!r}."
         )
+    candidates_df = candidates_df.drop_duplicates(subset=["id", definition_column]).reset_index(drop=True)
 
     return candidates_df, definition_column
 

@@ -359,7 +359,7 @@ class ProtoGraphRAG:
         self.proto_description_batch_size = 32
         self.proto_description_use_detailed_description = False
         self.proto_description_require_detailed_description = True
-        self.proto_description_exact_match_text = True
+        self.proto_description_exact_match_text = False
         self.proto_description_label_contains_text = True
         self.proto_description_exact_match_first = False
         self.proto_retained_embed_limit = 10
@@ -726,7 +726,8 @@ class ProtoGraphRAG:
         if not hasattr(self, "proto_description_require_detailed_description"):
             self.proto_description_require_detailed_description = True
         if not hasattr(self, "proto_description_exact_match_text"):
-            self.proto_description_exact_match_text = True
+            self.proto_description_exact_match_text = False
+        self.proto_description_exact_match_text = False
         if not hasattr(self, "proto_description_label_contains_text"):
             self.proto_description_label_contains_text = True
         if not hasattr(self, "proto_description_exact_match_first"):
@@ -1278,76 +1279,46 @@ class ProtoGraphRAG:
             "prompt_text": prompt_text,
         }
 
-    def _load_proto_description_candidate_bank(self, token_text, candidate_bank_cache):
+    def _load_proto_description_candidate_bank(self, proto_node, candidate_bank_cache):
+        token_text = proto_node.token_node.token_text
         cached_candidate_bank = candidate_bank_cache.get(token_text)
         if cached_candidate_bank is not None:
             return cached_candidate_bank
 
-        lookup_attempts = [
-            (
-                "default",
-                self.proto_description_require_detailed_description,
-                self.proto_description_exact_match_text,
-            ),
-            (
-                "relax_require_detailed_description",
-                False,
-                self.proto_description_exact_match_text,
-            ),
-            (
-                "relax_exact_match_text",
-                False,
-                False,
-            ),
-        ]
-
-        seen_configs = set()
-        for attempt_name, require_detailed_description, exact_match_text in lookup_attempts:
-            config_key = (require_detailed_description, exact_match_text)
-            if config_key in seen_configs:
-                continue
-            seen_configs.add(config_key)
-
-            stage = f"proto_description:{attempt_name}"
-            try:
-                candidates_df, definition_column = load_wikidata_definition_candidates(
-                    token_text,
-                    use_detailed_description=self.proto_description_use_detailed_description,
-                    exact_match_text=exact_match_text,
-                    exact_match_first=self.proto_description_exact_match_first,
-                    limit=self.proto_description_candidate_limit,
-                    require_detailed_description=require_detailed_description,
-                    label_contains_text=self.proto_description_label_contains_text,
-                )
-            except ValueError:
-                self._log_wikidata_no_result(
-                    token_text,
-                    stage,
-                    "no_candidate_definitions",
-                )
-                continue
-
-            candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column=definition_column)
-            if candidate_bank:
-                candidate_bank_cache[token_text] = candidate_bank
-                if attempt_name != "default":
-                    self._log_proto_description_operation(
-                        "fallback_wikidata_candidate_lookup",
-                        token_text=token_text,
-                        fallback=attempt_name,
-                        require_detailed_description=require_detailed_description,
-                        exact_match_text=exact_match_text,
-                        candidate_count=len(candidate_bank),
-                    )
-                return candidate_bank
-
+        max_candidate_count = max(1, len(proto_node.token_node.proto_node_list) + 1)
+        try:
+            candidates_df, definition_column = load_wikidata_definition_candidates(
+                token_text,
+                use_detailed_description=self.proto_description_use_detailed_description,
+                limit=self.proto_description_candidate_limit,
+                target_candidate_count=max_candidate_count,
+            )
+        except ValueError:
+            candidate_bank_cache[token_text] = []
             self._log_wikidata_no_result(
                 token_text,
-                stage,
-                "empty_candidate_bank",
+                "proto_description",
+                "no_candidate_definitions",
             )
+            return []
 
-        candidate_bank_cache[token_text] = []
+        candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column=definition_column)
+        candidate_bank_cache[token_text] = candidate_bank
+        if candidate_bank:
+            self._log_proto_description_operation(
+                "wikidata_candidate_lookup",
+                token_text=token_text,
+                candidate_limit=self.proto_description_candidate_limit,
+                max_candidate_count=max_candidate_count,
+                candidate_count=len(candidate_bank),
+            )
+            return candidate_bank
+
+        self._log_wikidata_no_result(
+            token_text,
+            "proto_description",
+            "empty_candidate_bank",
+        )
         return []
 
     def _predict_proto_description_from_samples(
@@ -1358,10 +1329,7 @@ class ProtoGraphRAG:
         max_samples=10,
     ):
         token_text = proto_node.token_node.token_text
-        candidate_bank = self._load_proto_description_candidate_bank(
-            token_text,
-            candidate_bank_cache,
-        )
+        candidate_bank = self._load_proto_description_candidate_bank(proto_node, candidate_bank_cache)
 
         if not candidate_bank:
             self._log_wikidata_no_result(
