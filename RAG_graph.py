@@ -96,14 +96,12 @@ class CoOccurrenceGraph:
 
     # Aggregate semantic node weights into chunk-level retrieval scores.
     def assign_chunk_weight(self, avg_chunk_len, debug_mode=False):
-                                                   
+        weight_map = {}
+        token_record_map = defaultdict(set)
+        token_weight_map = {}
+
         if len(self.connected_node_list) > 0 :
-            weight_map = {}
-            token_record_map = defaultdict(list)
-            token_weight_map = {}
-            chunk_len_map = {}
             for node in self.connected_node_list:
-                tf_chunk_dict = dict(Counter([chunk_node.chunk_node_id for chunk_node in node.sem_node.chunk_node_list]))
                 for chunk_node in node.sem_node.chunk_node_list:
                     chunk_node_id = chunk_node.chunk_node_id
                     if node.sem_node.token_node.token_text not in token_record_map[chunk_node_id]:
@@ -111,8 +109,7 @@ class CoOccurrenceGraph:
                         bm25_score = node.node_weight * node.sem_node.BM25[chunk_node_id]
                         weight_map[chunk_node_id] = weight_map.get(chunk_node_id, 0) + bm25_score
                         token_weight_map.setdefault(chunk_node_id, []).append(f"Token:{node.sem_node.token_node.token_text},Score:{(bm25_score ):.4f}")
-                        token_record_map[chunk_node_id].append(node.sem_node.token_node.token_text)
-                        chunk_len_map[chunk_node_id] = chunk_node.num_tokens
+                        token_record_map[chunk_node_id].add(node.sem_node.token_node.token_text)
                                                                      
                                                                                     
             self.weighted_chunk_node_list = sorted(weight_map.items(), key=lambda x: x[1], reverse=True)
@@ -139,7 +136,7 @@ class CoOccurrenceGraph:
 
     # Group semantic nodes by their query-match level.
     def rank_sem_node_by_level(self):
-        self.ranked_sem_node_list = [[] for i in range(4)]
+        self.ranked_sem_node_list = [[] for i in range(len(CoOccurrenceNode_query_weight))]
         for node in self.node_list:
             self.ranked_sem_node_list[node.node_level].append(node.sem_node)
 
@@ -185,6 +182,8 @@ class CoOccurrenceNode:
         self.sem_node = sem_node_info[0]
         self.node_level = sem_node_info[1]
         self.node_query_weight = sem_node_info[2]
+        if self.node_level < 0 or self.node_level >= len(CoOccurrenceNode_query_weight):
+            raise ValueError(f"Unsupported co-occurrence node level: {self.node_level}")
         self.neighbor_node_list = []
         self.node_weight = 0
         self.node_level_weight = CoOccurrenceNode_query_weight[self.node_level]
@@ -355,6 +354,7 @@ class ProtoGraphRAG:
         self.nlp = None
         self.text_encoder = None
         self.tokenizer = None
+        self.encoder_lock = threading.Lock()
         self.text_encoder_addr = "/home/xiaoyue/ProtoGraphRAG/deberta-v3-large"
         self._load_text_encoder()
         self._load_nlp()
@@ -395,6 +395,19 @@ class ProtoGraphRAG:
         from sentence_transformers import CrossEncoder
 
         self.sem_description_model = CrossEncoder(self.sem_description_model_name)
+
+    # Keep stored semantic-node embeddings on CPU; move them to self.device only for computation.
+    def _store_sem_embed(self, embed):
+        if embed is None:
+            return None
+        if torch.is_tensor(embed):
+            return embed.detach().cpu()
+        return torch.as_tensor(embed).detach().cpu()
+
+    # Serialize access to the shared encoder when chunk encoding is submitted from worker threads.
+    def _encode_chunk_thread_safe(self, chunk):
+        with self.encoder_lock:
+            return encode_chunk(chunk, self.text_encoder, self.tokenizer, self.device)
 
     # Shut down the background executor used by indexing workers.
     def shutdown(self):
@@ -592,7 +605,7 @@ class ProtoGraphRAG:
     def create_basic_sem_node(self, token_node):
         new_sem_node = self.create_sem_node(token_node)
         new_sem_node.chunk_node_embed = ([i.embed for i in token_node.embeds_buffer])
-        new_sem_node.embed = average_embeds(new_sem_node.chunk_node_embed)
+        new_sem_node.embed = self._store_sem_embed(average_embeds(new_sem_node.chunk_node_embed))
         new_sem_node.chunk_node_list = [k.chunk_node for k in token_node.embeds_buffer]
         new_sem_node.span_occurrences = [k.to_span_occurrence() for k in token_node.embeds_buffer]
         self._initialize_sem_retained_text_embeddings(new_sem_node, token_node.embeds_buffer)
@@ -617,7 +630,7 @@ class ProtoGraphRAG:
                     self.plot_embed_distribution(token_node, clusters)
                 for clusters_label in range(n_clusters):
                     new_sem_node = self.create_sem_node(token_node)
-                    new_sem_node.embed = torch.from_numpy(cluster_centers[clusters_label])
+                    new_sem_node.embed = self._store_sem_embed(torch.from_numpy(cluster_centers[clusters_label]))
                     cluster_text_embeddings = []
                     for idx in clusters[clusters_label]:
                         text_embedding = token_node.embeds_buffer[idx]
@@ -669,7 +682,7 @@ class ProtoGraphRAG:
             if n_clusters >= 1:
                 for clusters_label in range(n_clusters):
                     new_sem_node = self.create_sem_node(token_node)
-                    new_sem_node.embed = torch.from_numpy(cluster_centers[clusters_label]).to(self.device)
+                    new_sem_node.embed = self._store_sem_embed(torch.from_numpy(cluster_centers[clusters_label]))
                     cluster_text_embeddings = []
                     for idx in clusters[clusters_label]:
                         text_embedding = token_node.anomaly_section[idx].text_embedding
@@ -793,6 +806,8 @@ class ProtoGraphRAG:
             self.discard_no_word = False
         if not hasattr(self, "plot_embeds"):
             self.plot_embeds = False
+        if not hasattr(self, "encoder_lock") or self.encoder_lock is None:
+            self.encoder_lock = threading.Lock()
         if not hasattr(self, "sem_description_prompt_context_mode"):
             self.sem_description_prompt_context_mode = "sentence_neighbors"
         if not hasattr(self, "sem_description_candidate_limit"):
@@ -805,7 +820,6 @@ class ProtoGraphRAG:
             self.sem_description_require_detailed_description = True
         if not hasattr(self, "sem_description_exact_match_text"):
             self.sem_description_exact_match_text = False
-        self.sem_description_exact_match_text = False
         if not hasattr(self, "sem_description_label_contains_text"):
             self.sem_description_label_contains_text = True
         if not hasattr(self, "sem_description_exact_match_first"):
@@ -926,6 +940,19 @@ class ProtoGraphRAG:
 
     # Build the normalized semantic-node embedding matrix used for similarity search.
     def build_query_database(self):
+        if not self.sem_nodes:
+            self.query_database = None
+            raise ValueError("Cannot build query database without semantic nodes.")
+        missing_embed_ids = [
+            sem_node.sem_node_id
+            for sem_node in self.sem_nodes
+            if sem_node.embed is None
+        ]
+        if missing_embed_ids:
+            raise ValueError(
+                "Cannot build query database because semantic nodes are missing embeddings: "
+                f"{missing_embed_ids}"
+            )
         embeds_list = [sem_node.embed for sem_node in self.sem_nodes]
         database = torch.stack(embeds_list).to(self.device)
         self.query_database = F.normalize(database, dim=1)
@@ -971,7 +998,9 @@ class ProtoGraphRAG:
             semantic_weight = None
 
             if token_node is not None:
-                exact_sem_node = token_node.sem_node_list[self.get_max_sim_sem(token_node, token_embed)]
+                max_sem_index = self.get_max_sim_sem(token_node, token_embed)
+                if max_sem_index is not None:
+                    exact_sem_node = token_node.sem_node_list[max_sem_index]
                 if token_type in {"phrase", "ent"} and search_mode != "broad":
                     tokens_in_phrase.extend(token.split(" "))
 
@@ -1022,10 +1051,13 @@ class ProtoGraphRAG:
         for sem_node in retrieved_sem_nodes:
             for chunk_node in sem_node.chunk_node_list:
                 retrieved_chunk_ids.append(chunk_node.chunk_node_id)
-        retrieved_chunk_ids = list(set(retrieved_chunk_ids))
-        retrieved_chunks = self.chunk_id2text(retrieved_chunk_ids)[:candidate]
+        retrieved_chunk_ids = list(dict.fromkeys(retrieved_chunk_ids))
+        candidate_chunk_ids = retrieved_chunk_ids[:candidate]
+        retrieved_chunks = self.chunk_id2text(candidate_chunk_ids)
+        if self.reranker is None:
+            return retrieved_chunks[:top_k], candidate_chunk_ids[:top_k]
         rerank_chunks, rerank_chunk_index= self.reranker.rerank(query_text, retrieved_chunks, top_k=top_k)
-        rerank_chunk_ids = [retrieved_chunk_ids[i] for i in rerank_chunk_index]
+        rerank_chunk_ids = [candidate_chunk_ids[i] for i in rerank_chunk_index]
 
         return rerank_chunks, rerank_chunk_ids
 
@@ -1150,6 +1182,8 @@ class ProtoGraphRAG:
 
     # Find the nearest semantic-node embeddings for query embeddings.
     def query_by_sim(self, query_embeds):
+        if self.query_database is None:
+            raise ValueError("Query database is empty; finalize or build the query database before querying.")
         query_tensor = torch.stack(query_embeds).to(self.device)          
         query_tensor = F.normalize(query_tensor, dim=1)
         sims = torch.matmul(self.query_database, query_tensor.T)
@@ -1161,12 +1195,16 @@ class ProtoGraphRAG:
     def finalize(self):
         self._reset_sem_description_logs()
         self.log_time("Finalize started.")
+        if not self.chunk_nodes:
+            raise ValueError("Cannot finalize an empty graph: no chunk nodes have been indexed.")
         self.chunk_avg_len = sum([chunk_node.num_tokens for chunk_node in self.chunk_nodes])/len(self.chunk_nodes)
         self.log_time("Computed average chunk length.")
         self.finalize_token_nodes()
         self.log_time("Finished token node finalization.")
         self.merge_duplicate_description_sem_nodes()
         self.log_time("Finished merging sem nodes by description.")
+        if not self.sem_nodes:
+            raise ValueError("Cannot finalize graph: no semantic nodes were created.")
         for token_node in self.token_nodes:
             self.assign_idf(token_node)
         self.log_time("Finished assigning token and sem IDF.")
@@ -1639,9 +1677,15 @@ class ProtoGraphRAG:
 
     # Rebuild the embedding and threshold for a semantic node created by splitting.
     def _finalize_split_sem_node_embed(self, sem_node):
-        available_embeds = list(sem_node.chunk_node_embed)
+        available_embeds = [
+            text_embedding.embed
+            for text_embedding in getattr(sem_node, "retained_text_embeddings", [])
+            if text_embedding.embed is not None
+        ]
+        if not available_embeds:
+            available_embeds = list(sem_node.chunk_node_embed)
         if available_embeds:
-            sem_node.embed = average_embeds(available_embeds)
+            sem_node.embed = self._store_sem_embed(average_embeds(available_embeds))
         else:
             sample_occurrences = list(getattr(sem_node, "span_occurrences", []))
             if sample_occurrences:
@@ -1656,9 +1700,9 @@ class ProtoGraphRAG:
                         regenerated_text_embeddings.append(text_embedding)
 
                 if regenerated_text_embeddings:
-                    sem_node.embed = average_embeds(
+                    sem_node.embed = self._store_sem_embed(average_embeds(
                         [text_embedding.embed for text_embedding in regenerated_text_embeddings]
-                    )
+                    ))
                     self._initialize_sem_retained_text_embeddings(
                         sem_node,
                         regenerated_text_embeddings,
@@ -1742,9 +1786,9 @@ class ProtoGraphRAG:
             if text_embedding.embed is not None
         ]
         if retained_embeds:
-            primary_sem.embed = average_embeds(retained_embeds)
+            primary_sem.embed = self._store_sem_embed(average_embeds(retained_embeds))
         elif merged_embeds:
-            primary_sem.embed = torch.stack(merged_embeds).mean(dim=0)
+            primary_sem.embed = self._store_sem_embed(torch.stack(merged_embeds).mean(dim=0))
         if primary_sem.chunk_edge_weight:
             primary_sem.anomaly_threshold = get_anomaly_threshold(
                 primary_sem.chunk_edge_weight,
@@ -1887,6 +1931,7 @@ class ProtoGraphRAG:
                     created_new_sem = False
                     if target_sem_group:
                         target_sem = target_sem_group[0]
+                        target_sem.pending_embed_rebuild = True
                     else:
                         target_sem = self._create_split_sem_node(token_node, predicted_description)
                         description_sem_map[predicted_description].append(target_sem)
@@ -2141,7 +2186,10 @@ class ProtoGraphRAG:
                 else:
                     token_node.embeds_buffer.append(text_embedding)
             self._append_token_occurrence(token_node, text_embedding)
-            if len(token_node.embeds_buffer) == self.buffer_size:
+            if (
+                len(token_node.embeds_buffer) >= self.buffer_size
+                and token_node not in self.build_sem_node_waitlist
+            ):
                 self.build_sem_node_waitlist.append(token_node)
 
     # Index one document using the selected single or multi-processing path.
@@ -2177,7 +2225,7 @@ class ProtoGraphRAG:
         futures = []
 
         for chunk in chunk_list:
-            futures.append(self.executor.submit(encode_chunk, chunk, self.text_encoder, self.tokenizer, self.device))
+            futures.append(self.executor.submit(self._encode_chunk_thread_safe, chunk))
             new_chunk_node = self.create_chunk_node(chunk, new_doc_node)
             phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2, remove_duplicate=self.remove_duplicate_token)
             chunk_meta.append((new_chunk_node, phrases, tokens))
@@ -2387,10 +2435,18 @@ class ProtoGraphRAG:
 
     # Return the index of the semantic node most similar to an embedding.
     def get_max_sim_sem(self, token_node, embeds):
-        sem_embeds = [sem_node.embed.to(self.device) for sem_node in token_node.sem_node_list]
+        sem_embeds = []
+        sem_indices = []
+        for index, sem_node in enumerate(token_node.sem_node_list):
+            if sem_node.embed is None:
+                continue
+            sem_embeds.append(sem_node.embed.to(self.device))
+            sem_indices.append(index)
+        if not sem_embeds:
+            return None
         x = torch.stack(sem_embeds, 0).to(self.device)
         q = embeds.unsqueeze(0).expand_as(x)
-        return int(F.cosine_similarity(x, q, dim=1).argmax().item())
+        return sem_indices[int(F.cosine_similarity(x, q, dim=1).argmax().item())]
 
 
     # Index one document with staged CPU preprocessing, GPU encoding, and CPU consumption.
@@ -2521,6 +2577,14 @@ class ProtoGraphRAG:
 
     # Map chunk IDs to their stored chunk texts.
     def chunk_id2text(self, ids):
+        for chunk_id in ids:
+            if chunk_id < 0 or chunk_id >= len(self.chunk_nodes):
+                raise IndexError(f"Chunk id {chunk_id} is outside the chunk node list.")
+            if self.chunk_nodes[chunk_id].chunk_node_id != chunk_id:
+                raise ValueError(
+                    "chunk_nodes index invariant is broken: "
+                    f"position {chunk_id} contains chunk id {self.chunk_nodes[chunk_id].chunk_node_id}."
+                )
         return [self.chunk_nodes[id].chunk_text for id in ids]
 
     # Extract a representative sentence containing a token from a chunk.
@@ -3009,6 +3073,7 @@ class ProtoGraphRAG:
         state["nlp"] = None
         state["reranker"] = None
         state["sem_description_model"] = None
+        state["encoder_lock"] = None
         return state
 
                 
@@ -3021,6 +3086,7 @@ class ProtoGraphRAG:
         self.nlp = None
         self.reranker = None
         self.sem_description_model = None
+        self.encoder_lock = threading.Lock()
         self._ensure_backward_compatible_attrs()
 
     # Reload runtime components needed after deserialization.
@@ -3031,6 +3097,8 @@ class ProtoGraphRAG:
         self.save_doc_to_json()
         if self.executor is None:
             self.executor = ThreadPoolExecutor(max_workers=4)
+        if getattr(self, "encoder_lock", None) is None:
+            self.encoder_lock = threading.Lock()
         if load_nlp and self.nlp is None:
             self._load_nlp()
         if load_reranker and self.reranker is None:
@@ -3056,90 +3124,147 @@ class ProtoGraphRAG:
         obj._restore_runtime_components(load_nlp=True, load_reranker=False)
         return obj
 
+    # Snapshot object references before temporary ID conversion for split serialization.
+    def _snapshot_node_references(self):
+        return {
+            "chunks": [
+                (chunk_node, chunk_node.doc_node, list(chunk_node.sem_node_list))
+                for chunk_node in self.chunk_nodes
+            ],
+            "docs": [
+                (doc_node, list(doc_node.chunk_node_list))
+                for doc_node in self.doc_nodes
+            ],
+            "sems": [
+                (
+                    sem_node,
+                    list(sem_node.chunk_node_list),
+                    sem_node.token_node,
+                    getattr(sem_node, "retained_text_embeddings", []),
+                    [
+                        (text_embedding, text_embedding.chunk_node)
+                        for text_embedding in getattr(sem_node, "retained_text_embeddings", [])
+                    ],
+                )
+                for sem_node in self.sem_nodes
+            ],
+            "tokens": [
+                (token_node, list(token_node.sem_node_list))
+                for token_node in self.token_nodes
+            ],
+        }
+
+    # Restore references captured by _snapshot_node_references.
+    def _restore_node_references_from_snapshot(self, snapshot):
+        for chunk_node, doc_node, sem_node_list in snapshot["chunks"]:
+            chunk_node.doc_node = doc_node
+            chunk_node.sem_node_list = sem_node_list
+        for doc_node, chunk_node_list in snapshot["docs"]:
+            doc_node.chunk_node_list = chunk_node_list
+        for sem_node, chunk_node_list, token_node, retained_list, retained_refs in snapshot["sems"]:
+            sem_node.chunk_node_list = chunk_node_list
+            sem_node.token_node = token_node
+            sem_node.retained_text_embeddings = retained_list
+            for text_embedding, chunk_node in retained_refs:
+                text_embedding.chunk_node = chunk_node
+        for token_node, sem_node_list in snapshot["tokens"]:
+            token_node.sem_node_list = sem_node_list
+
     # Save graph structure and tensors into separate files.
     def save_data_split(self, pkl_path: str):
         pt_path = pkl_path.replace(".pkl", "_tensors.pt")
-        self.node_instance2id()
-                                           
-        tensor_pack = {
-            "query_database": self.query_database.detach().cpu() if self.query_database is not None else None,
-                           
-            "sem_embeds": [
-                (p.embed.detach().cpu() if p.embed is not None else None)
-                for p in self.sem_nodes
-            ],
-            "sem_retained_text_embeddings": [
-                [
-                    {
-                        "embed": (
-                            text_embedding.embed.detach().cpu()
-                            if text_embedding.embed is not None else None
-                        ),
-                        "chunk_node": text_embedding.chunk_node,
-                        "span_start": text_embedding.span_start,
-                        "span_end": text_embedding.span_end,
-                        "span_text": text_embedding.span_text,
-                    }
-                    for text_embedding in getattr(p, "retained_text_embeddings", [])
-                ]
-                for p in self.sem_nodes
-            ],
-        }
-        torch.save(tensor_pack, pt_path)
-
-                                                         
-        qbak = self.query_database
-        pbak = [p.embed for p in self.sem_nodes]
-        retained_bak = [p.retained_text_embeddings for p in self.sem_nodes]
-
-        self.query_database = None
-        for p in self.sem_nodes:
-            p.embed = None
-            p.retained_text_embeddings = [
-                TextEmbedding(
-                    embed=None,
-                    chunk_node=text_embedding.chunk_node,
-                    span_start=text_embedding.span_start,
-                    span_end=text_embedding.span_end,
-                    span_text=text_embedding.span_text,
-                )
-                for text_embedding in getattr(p, "retained_text_embeddings", [])
-            ]
-
-                                              
+        reference_snapshot = self._snapshot_node_references()
+        qbak = None
+        pbak = None
+        retained_bak = None
+        tensor_fields_cleared = False
         exec_bak = getattr(self, "executor", None)
         enc_bak = getattr(self, "text_encoder", None)
         tok_bak = getattr(self, "tokenizer", None)
         nlp_bak = getattr(self, "nlp", None)
         reranker_bak = getattr(self, "reranker", None)
-
-        if hasattr(self, "executor"): self.executor = None
-        if hasattr(self, "text_encoder"): self.text_encoder = None
-        if hasattr(self, "tokenizer"): self.tokenizer = None
-        if hasattr(self, "nlp"): self.nlp = None
-        if hasattr(self, "reranker"): self.reranker = None
-
-                                
-        tensors_path_bak = getattr(self, "tensors_path", None)
-        self.tensors_path = pt_path
+        runtime_fields_cleared = False
+        missing_tensors_path = object()
+        tensors_path_bak = getattr(self, "tensors_path", missing_tensors_path)
         try:
+            self.node_instance2id()
+
+            tensor_pack = {
+                "query_database": self.query_database.detach().cpu() if self.query_database is not None else None,
+
+                "sem_embeds": [
+                    (p.embed.detach().cpu() if p.embed is not None else None)
+                    for p in self.sem_nodes
+                ],
+                "sem_retained_text_embeddings": [
+                    [
+                        {
+                            "embed": (
+                                text_embedding.embed.detach().cpu()
+                                if text_embedding.embed is not None else None
+                            ),
+                            "chunk_node": text_embedding.chunk_node,
+                            "span_start": text_embedding.span_start,
+                            "span_end": text_embedding.span_end,
+                            "span_text": text_embedding.span_text,
+                        }
+                        for text_embedding in getattr(p, "retained_text_embeddings", [])
+                    ]
+                    for p in self.sem_nodes
+                ],
+            }
+            torch.save(tensor_pack, pt_path)
+
+            qbak = self.query_database
+            pbak = [p.embed for p in self.sem_nodes]
+            retained_bak = [p.retained_text_embeddings for p in self.sem_nodes]
+
+            self.query_database = None
+            for p in self.sem_nodes:
+                p.embed = None
+                p.retained_text_embeddings = [
+                    TextEmbedding(
+                        embed=None,
+                        chunk_node=text_embedding.chunk_node,
+                        span_start=text_embedding.span_start,
+                        span_end=text_embedding.span_end,
+                        span_text=text_embedding.span_text,
+                    )
+                    for text_embedding in getattr(p, "retained_text_embeddings", [])
+                ]
+            tensor_fields_cleared = True
+
+            if hasattr(self, "executor"): self.executor = None
+            if hasattr(self, "text_encoder"): self.text_encoder = None
+            if hasattr(self, "tokenizer"): self.tokenizer = None
+            if hasattr(self, "nlp"): self.nlp = None
+            if hasattr(self, "reranker"): self.reranker = None
+            runtime_fields_cleared = True
+
+            self.tensors_path = pt_path
             with open(pkl_path, "wb") as f:
                 pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
         finally:
-                                  
-            self.query_database = qbak
-            for p, e, retained in zip(self.sem_nodes, pbak, retained_bak):
-                p.embed = e
-                p.retained_text_embeddings = retained
+            if tensor_fields_cleared:
+                self.query_database = qbak
+                for p, e, retained in zip(self.sem_nodes, pbak, retained_bak):
+                    p.embed = e
+                    p.retained_text_embeddings = retained
 
-            if hasattr(self, "executor"): self.executor = exec_bak
-            if hasattr(self, "text_encoder"): self.text_encoder = enc_bak
-            if hasattr(self, "tokenizer"): self.tokenizer = tok_bak
-            if hasattr(self, "nlp"): self.nlp = nlp_bak
-            if hasattr(self, "reranker"): self.reranker = reranker_bak
-            self.node_id2instance()
-                                  
-            self.tensors_path = tensors_path_bak
+            if runtime_fields_cleared:
+                if hasattr(self, "executor"): self.executor = exec_bak
+                if hasattr(self, "text_encoder"): self.text_encoder = enc_bak
+                if hasattr(self, "tokenizer"): self.tokenizer = tok_bak
+                if hasattr(self, "nlp"): self.nlp = nlp_bak
+                if hasattr(self, "reranker"): self.reranker = reranker_bak
+
+            self._restore_node_references_from_snapshot(reference_snapshot)
+
+            if tensors_path_bak is missing_tensors_path:
+                if hasattr(self, "tensors_path"):
+                    del self.tensors_path
+            else:
+                self.tensors_path = tensors_path_bak
 
 
     # Load split graph structure and tensor files, then restore runtime components.

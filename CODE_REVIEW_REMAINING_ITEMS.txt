@@ -1,0 +1,185 @@
+LiteSemRAG Remaining Code Review Items
+======================================
+
+Created after fixing the clear runtime/correctness bugs from CODE_REVIEW_FINDINGS.txt.
+These items were intentionally not changed because they need algorithmic clarification,
+API decisions, or broader refactoring.
+
+================================================================
+SECTION 1. NEEDS ALGORITHMIC OR BEHAVIOR CONFIRMATION
+================================================================
+
+[R3/D1] solve_anomaly appears to be dead code.
+    Current finding:
+      self.anomaly_waitlist is initialized and filtered, but nothing appends to it.
+      Real anomaly absorption currently happens in finalize_token_nodes.
+    Decision needed:
+      Delete solve_anomaly and its callers, or wire anomaly_waitlist back into
+      build_sem_node when HDBSCAN creates noise points.
+
+[R4] semantic_type_cls df pruning is unreachable during indexing.
+    Current finding:
+      semantic_type_cls checks token_node.df, but df is assigned only during finalize.
+      During indexing this check always sees df == 0.
+    Decision needed:
+      Maintain a running document-frequency count during indexing, or move the
+      multi-semantic decision to finalize after df is known.
+
+[L3/D3] CoOccurrenceGraph.assign_chunk_weight still accepts avg_chunk_len.
+    Current finding:
+      The unused local chunk_len_map was removed, but avg_chunk_len remains in the
+      method signature because changing retrieval scoring needs a design decision.
+    Decision needed:
+      Remove the parameter and update the call site, or add explicit BM25-style
+      length normalization at the co-occurrence aggregation layer.
+
+[L7] connect_chunk_full / isolate_chunk_full naming is confusing.
+    Current finding:
+      The logic depends on two flags with different meanings.
+    Decision needed:
+      Rename and possibly rewrite this branch after confirming the intended
+      connected-vs-isolated fallback behavior.
+
+[L8] query_by_sim does not threshold weak cosine matches.
+    Current finding:
+      All nearest semantic nodes are accepted, even when the best score is low.
+    Decision needed:
+      Choose a minimum score threshold or keep surfacing weak matches as recall-heavy
+      fallback behavior.
+
+[S8] Split-sample assignments use edge_weight=0.0.
+    Current finding:
+      These samples sort to the bottom in get_top_k_chunks_for_sem_node.
+    Decision needed:
+      Confirm that this is intended, or compute edge weights from retained embeddings.
+
+================================================================
+SECTION 2. PERSISTENCE AND BACKWARD-COMPATIBILITY CLEANUP
+================================================================
+
+[P1] save_data_split duplicates some runtime-field cleanup from __getstate__.
+    Follow-up:
+      Consider routing all runtime cleanup through __getstate__ and leaving
+      save_data_split responsible only for tensor splitting.
+
+[P2] node_id2instance repeats backward-compatible field patching.
+    Follow-up:
+      Consolidate missing-field migrations in _ensure_backward_compatible_attrs.
+
+[P3/M6] _ensure_backward_compatible_attrs is large and runs repeatedly.
+    Follow-up:
+      Add an explicit schema version to short-circuit already-upgraded objects.
+
+[P4] load_data_split depends on tensors_path or file naming convention.
+    Follow-up:
+      Store tensor-file metadata in a more explicit split-save manifest or state field.
+
+[P5] prototype-to-sem migration is spread across several locations.
+    Follow-up:
+      Move migration logic into one helper/module, including the old Prototype alias.
+
+================================================================
+SECTION 3. THREADING AND API CONTRACT DOCUMENTATION
+================================================================
+
+[T1] index_json relies on a single CPU preprocess worker mutating doc/chunk state.
+    Follow-up:
+      Document the single-writer invariant or add locks if more preprocess workers
+      are introduced.
+
+[T2] index_json currently has one GPU worker using the shared text_encoder.
+    Follow-up:
+      Document that there is exactly one GPU worker, or reuse the encoder lock if
+      this path becomes parallel.
+
+[T3] record_error relies on traceback.format_exc() inside an active except block.
+    Follow-up:
+      Pass the exception object explicitly to make future refactors safer.
+
+[L6] ListBatchExtractor.extract treats N as final target length, not delta.
+    Follow-up:
+      Document the contract and consider renaming N to target_length.
+
+================================================================
+SECTION 4. RENAMES AND LOW-RISK CLEANUP
+================================================================
+
+[D2] show_sem_description_logs ignores as_html and open_details.
+    Follow-up:
+      Remove the parameters or implement HTML/details output.
+
+[D6] phrase_fuzzy_query is not fuzzy matching.
+    Follow-up:
+      Rename to phrase_word_intersection_query or phrase_containing_all_words.
+
+[D7] ProtoGraphRAG class name still uses Proto while the model is SemNode-based.
+    Follow-up:
+      Rename only with a compatibility plan for old imports and pickles.
+
+[D8] index_document_multi_processing uses ThreadPoolExecutor.
+    Follow-up:
+      Rename to index_document_threaded or actually switch to multiprocessing.
+
+[D9] ListBatchExtractor get_state/load_state are unused.
+    Follow-up:
+      Remove or add a caller if query extraction needs resumability.
+
+[D10] Whitespace-only comment blocks remain in RAG_graph.py.
+    Follow-up:
+      Clean these mechanically in a separate formatting-only change.
+
+[D11] merged_sem_map construction is over-engineered.
+    Follow-up:
+      Simplify the defaultdict/dict-comprehension structure inside
+      merge_duplicate_description_sem_nodes.
+
+[S9] print_sem_description_logs writes to disk instead of stdout.
+    Follow-up:
+      Rename to write_ or save_ if callers can be updated.
+
+[S10] Prototype alias is intentionally obfuscated.
+    Follow-up:
+      Replace with `Prototype = SemNode` and a direct backward-compatibility comment.
+
+================================================================
+SECTION 5. BROADER MAINTAINABILITY WORK
+================================================================
+
+[M1] ProtoGraphRAG is too broad.
+    Follow-up:
+      Split persistence, description/Wikidata, inspection/display, and retrieval
+      responsibilities into smaller modules.
+
+[M2] merge_duplicate_description_sem_nodes mutates many fields in one pass.
+    Follow-up:
+      Extract consensus assignment, split-by-sample, and merge-by-description into
+      smaller testable helpers.
+
+[M3] __init__ contains hardcoded local paths and runtime defaults.
+    Follow-up:
+      Accept these as constructor arguments with environment-variable fallbacks.
+
+[M4] multi_level_query returns CoOccurrenceGraph as part of the public result.
+    Follow-up:
+      Split normal retrieval from explanation/debug output.
+
+[M5] TokenNode annotations say bool/list but values are initialized to None.
+    Follow-up:
+      Use Optional annotations or real defaults.
+
+[M7] SemNode uses several parallel member lists.
+    Follow-up:
+      Add helper methods for append/filter operations to keep chunk_node_list,
+      span_occurrences, and chunk_edge_weight aligned.
+
+[M8] CoOccurrenceNode_query_weight is a mutable top-level list.
+    Follow-up:
+      Change it to a tuple or a class-level constant.
+
+[M9] chunk_avg_len computation is duplicated.
+    Follow-up:
+      Extract a _recompute_chunk_avg_len helper.
+
+[M10] finalize ordering is implicit.
+    Follow-up:
+      Add a short docstring describing required ordering and invariants.
