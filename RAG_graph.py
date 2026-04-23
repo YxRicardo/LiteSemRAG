@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import pickle
 import random
 import re
@@ -346,13 +347,34 @@ class SemNode:
 # Backward-compatible alias for old imports and pickles.
 Prototype = SemNode
 
+
+def _find_description_match_span(chunk_text, token_text):
+    normalized_token = token_text.strip()
+    if not normalized_token:
+        return None
+
+    pattern = re.compile(rf"(?<!\w){re.escape(normalized_token)}(?!\w)", flags=re.IGNORECASE)
+    match = pattern.search(chunk_text)
+    if match is None:
+        lowered_text = chunk_text.casefold()
+        lowered_token = normalized_token.casefold()
+        match_start = lowered_text.find(lowered_token)
+        if match_start < 0:
+            return None
+        match_end = match_start + len(lowered_token)
+    else:
+        match_start, match_end = match.span()
+    return match_start, match_end
+
+
 class LiteSemRAG:
     # Initialize graph storage, model handles, retrieval settings, and runtime state.
     def __init__(self, text_embed_dim, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
                  anomaly_section_size=50,query_token_percentile=0.8,
                  retrieve_top_k=5, chunk_size=300, remove_duplicate_token=True, device="cuda",
                  discard_no_word=False, plot_embeds=False,
-                 sem_description_prompt_context_mode="sentence_neighbors"):
+                 sem_description_prompt_context_mode="sentence_neighbors",
+                 consensus_ratio_threshold=0.8):
         self.text_embed_dim = text_embed_dim
         self.df_ratio = df_ratio
         self.doc_nodes = []
@@ -407,11 +429,15 @@ class LiteSemRAG:
         self.discard_no_word = discard_no_word
         self.plot_embeds = plot_embeds
         self.sem_description_prompt_context_mode = sem_description_prompt_context_mode
+        # Minimum agreement ratio (top predicted description / total samples) required
+        # to accept a cross-encoder prediction as the semantic node's description.
+        self.consensus_ratio_threshold = consensus_ratio_threshold
         self.predicted_sem_description_logs = []
         self.deleted_merged_sem_logs = []
         self.sem_description_operation_logs = []
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
+        self._sem_description_candidate_bank_cache = {}
         self.hdbscan_attempt_count = 0
         self.hdbscan_success_count = 0
         self.schema_version = CURRENT_SCHEMA_VERSION
@@ -685,8 +711,11 @@ class LiteSemRAG:
                     new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
                     new_sem_node.anomaly_threshold = get_anomaly_threshold(new_sem_node.chunk_edge_weight,
                                                                              self.anomaly_threshold_percentile)
-                    new_sem_node.chunk_node_embed.clear()
-                    token_node.sem_node_list.append(new_sem_node)
+                    final_sem_nodes = self._assign_sem_description_on_build(
+                        new_sem_node,
+                        cluster_text_embeddings,
+                    )
+                    token_node.sem_node_list.extend(final_sem_nodes)
                 anomaly_idx = clusters.get(-1)
                 if anomaly_idx is not None:
                     for idx in anomaly_idx:
@@ -738,8 +767,11 @@ class LiteSemRAG:
                     new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
                     new_sem_node.anomaly_threshold = get_anomaly_threshold(new_sem_node.chunk_edge_weight,
                                                                              self.anomaly_threshold_percentile)
-                    new_sem_node.chunk_node_embed.clear()
-                    token_node.sem_node_list.append(new_sem_node)
+                    final_sem_nodes = self._assign_sem_description_on_build(
+                        new_sem_node,
+                        cluster_text_embeddings,
+                    )
+                    token_node.sem_node_list.extend(final_sem_nodes)
                 anomaly_idx = clusters.get(-1)
                 if anomaly_idx is None:
                     token_node.anomaly_section = []
@@ -879,10 +911,14 @@ class LiteSemRAG:
             self.wikidata_no_result_logs = []
         if not hasattr(self, "_wikidata_no_result_keys"):
             self._wikidata_no_result_keys = set()
+        if not hasattr(self, "_sem_description_candidate_bank_cache"):
+            self._sem_description_candidate_bank_cache = {}
         if not hasattr(self, "sem_description_model_name"):
             self.sem_description_model_name = "cross-encoder/nli-deberta-v3-large"
         if not hasattr(self, "sem_description_model"):
             self.sem_description_model = None
+        if not hasattr(self, "consensus_ratio_threshold"):
+            self.consensus_ratio_threshold = 0.8
         for token_node in getattr(self, "token_nodes", []):
             self._ensure_token_node_backward_compatible_attrs(token_node)
             for text_embedding in getattr(token_node, "embeds_buffer", []):
@@ -1269,6 +1305,7 @@ class LiteSemRAG:
         self.log_time("Computed average chunk length.")
         self.finalize_token_nodes()
         self.log_time("Finished token node finalization.")
+
         self.merge_duplicate_description_sem_nodes()
         self.log_time("Finished merging sem nodes by description.")
         if not self.sem_nodes:
@@ -1285,7 +1322,18 @@ class LiteSemRAG:
         self.build_chunk2sem_edge()
         self.log_time("Finished building chunk-to-sem edges.")
         self.save_doc_to_json()
+        log_path = self._save_sem_description_logs_to_timestamped_file()
+        self.log_time(f"Saved sem description logs to {log_path}.")
         self.log_time("Finalizing completed.")
+
+    # Persist sem description logs to a timestamped file under <project_root>/logs/.
+    def _save_sem_description_logs_to_timestamped_file(self):
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        logs_dir = os.path.join(project_root, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(logs_dir, f"sem_description_{timestamp}.log")
+        return self.save_sem_description_logs(output_path=output_path, as_html=False)
 
     # Ensure every token node has semantic nodes and absorb pending anomalies.
     def finalize_token_nodes(self):
@@ -1381,28 +1429,11 @@ class LiteSemRAG:
         }
 
     # Locate a token text span inside a chunk for description prompting.
-    def _find_description_match_span(self, chunk_text, token_text):
-        normalized_token = token_text.strip()
-        if not normalized_token:
-            return None
-
-        pattern = re.compile(rf"(?<!\w){re.escape(normalized_token)}(?!\w)", flags=re.IGNORECASE)
-        match = pattern.search(chunk_text)
-        if match is None:
-            lowered_text = chunk_text.casefold()
-            lowered_token = normalized_token.casefold()
-            match_start = lowered_text.find(lowered_token)
-            if match_start < 0:
-                return None
-            match_end = match_start + len(lowered_token)
-        else:
-            match_start, match_end = match.span()
-        return match_start, match_end
 
     # Extract the sentence containing the target token for description prediction.
     def _extract_sentence_context_for_description(self, chunk_text, token_text, match_span=None):
         if match_span is None:
-            match_span = self._find_description_match_span(chunk_text, token_text)
+            match_span = _find_description_match_span(chunk_text, token_text)
         if match_span is None:
             return None
         match_start, match_end = match_span
@@ -1419,7 +1450,7 @@ class LiteSemRAG:
     # Extract the target sentence plus neighboring sentence context for description prediction.
     def _extract_neighbor_sentence_context_for_description(self, chunk_text, token_text, match_span=None):
         if match_span is None:
-            match_span = self._find_description_match_span(chunk_text, token_text)
+            match_span = _find_description_match_span(chunk_text, token_text)
         if match_span is None:
             return None
         match_start, match_end = match_span
@@ -1444,7 +1475,7 @@ class LiteSemRAG:
     # Use the full chunk as context for semantic-description prediction.
     def _extract_full_context_for_description(self, chunk_text, token_text, match_span=None):
         if match_span is None:
-            match_span = self._find_description_match_span(chunk_text, token_text)
+            match_span = _find_description_match_span(chunk_text, token_text)
         if match_span is None:
             return None
         return self._build_description_context_from_bounds(
@@ -1506,6 +1537,9 @@ class LiteSemRAG:
         }
 
     # Load and cache Wikidata definition candidates for a semantic node token.
+    # Cache key is token_text alone: once a token has been looked up (with any
+    # parameter values), later calls return the cached bank without re-querying
+    # Wikidata or consulting the arguments again.
     def _load_sem_description_candidate_bank(self, sem_node, candidate_bank_cache):
         token_text = sem_node.token_node.token_text
         cached_candidate_bank = candidate_bank_cache.get(token_text)
@@ -1678,6 +1712,383 @@ class LiteSemRAG:
             ),
         }
 
+    # Run cross-encoder prediction for a single span occurrence; return the top candidate or None.
+    def _predict_description_for_span_occurrence(
+        self,
+        token_text,
+        span_occurrence,
+        candidate_bank,
+        model,
+    ):
+        chunk_node = span_occurrence.chunk_node
+        prompt_info = self._build_sem_node_description_prompt(
+            chunk_node.chunk_text,
+            token_text,
+            match_span=span_occurrence.get_span_tuple(),
+        )
+        if prompt_info is None:
+            prompt_info = self._build_fallback_sem_description_prompt(
+                chunk_node.chunk_text,
+                token_text,
+            )
+        if prompt_info is None:
+            return None
+        pairs = [
+            (prompt_info["prompt_text"], candidate["hypothesis"])
+            for candidate in candidate_bank
+        ]
+        raw_scores = model.predict(
+            pairs,
+            batch_size=min(self.sem_description_batch_size, len(pairs)),
+            show_progress_bar=False,
+        )
+        scores = extract_cross_encoder_scores(raw_scores, model)
+        ranked_candidates = sorted(
+            [
+                {**candidate, "score": float(score)}
+                for candidate, score in zip(candidate_bank, scores)
+            ],
+            key=lambda item: item["score"],
+            reverse=True,
+        )
+        if not ranked_candidates:
+            return None
+        return ranked_candidates[0]
+
+    # Pick the medoid index from a list of embedding tensors using cosine distance.
+    def _compute_medoid_index(self, embeds):
+        if not embeds:
+            return None
+        if len(embeds) == 1:
+            return 0
+        stacked = torch.stack([F.normalize(embed, p=2, dim=0) for embed in embeds])
+        sims = stacked @ stacked.T
+        dists = (1.0 - sims).clamp(min=0.0)
+        total = dists.sum(dim=1)
+        return int(torch.argmin(total).item())
+
+    # Create a new sem node initialized from a subset of cluster text embeddings (build-time path).
+    def _create_sem_node_from_cluster_subset(self, token_node, description, text_embeddings):
+        new_sem_node = self.create_sem_node(token_node)
+        new_sem_node.description = description
+        new_sem_node.chunk_node_list = [te.chunk_node for te in text_embeddings]
+        new_sem_node.span_occurrences = [te.to_span_occurrence() for te in text_embeddings]
+        new_sem_node.chunk_node_embed = [te.embed for te in text_embeddings]
+        new_sem_node.embed = self._store_sem_embed(average_embeds(new_sem_node.chunk_node_embed))
+        self._initialize_sem_retained_text_embeddings(new_sem_node, text_embeddings)
+        new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
+        new_sem_node.anomaly_threshold = get_anomaly_threshold(
+            new_sem_node.chunk_edge_weight,
+            self.anomaly_threshold_percentile,
+        )
+        new_sem_node.chunk_node_embed.clear()
+        return new_sem_node
+
+    # Assign a description to a freshly-built sem node; may split it into multiple sem nodes.
+    #
+    # Called before `chunk_node_embed.clear()` so that full cluster embeddings are still
+    # available for medoid / d1-d2 based sample classification.
+    # Returns the list of sem nodes that should be attached to `token_node.sem_node_list`.
+    # Each returned sem node has its `chunk_node_embed` cleared.
+    def _assign_sem_description_on_build(self, sem_node, cluster_text_embeddings):
+        token_node = sem_node.token_node
+
+        if self.sem_description_model is None:
+            sem_node.chunk_node_embed.clear()
+            return [sem_node]
+
+        prediction_result = self._predict_sem_description_from_samples(
+            sem_node,
+            model=self.sem_description_model,
+            candidate_bank_cache=self._sem_description_candidate_bank_cache,
+            max_samples=10,
+        )
+        if prediction_result is None:
+            sem_node.chunk_node_embed.clear()
+            return [sem_node]
+
+        if (
+            prediction_result["sample_count"] > 0
+            and prediction_result["top_description_ratio"] >= self.consensus_ratio_threshold
+        ):
+            predicted_description = prediction_result["description"]
+            sem_node.description = predicted_description
+            self.predicted_sem_description_logs.append(
+                {
+                    "sem_node_id": sem_node.sem_node_id,
+                    "token_text": token_node.token_text,
+                    "description": predicted_description,
+                    "predicted_entity_id": prediction_result.get("predicted_entity_id"),
+                    "predicted_label": prediction_result.get("predicted_label"),
+                    "predicted_definition": prediction_result.get("predicted_definition"),
+                    "prediction_score_mean": prediction_result.get("prediction_score_mean"),
+                    "chunk_count": len(sem_node.chunk_node_list),
+                    "sample_count": prediction_result.get("sample_count"),
+                    "top_description_count": prediction_result.get("top_description_count"),
+                    "top_description_ratio": prediction_result.get("top_description_ratio"),
+                    "sample_predictions": prediction_result["sample_predictions"],
+                }
+            )
+            self._log_sem_description_operation(
+                "assign_description_by_consensus",
+                token_text=token_node.token_text,
+                sem_node_id=sem_node.sem_node_id,
+                description=predicted_description,
+                sample_count=prediction_result.get("sample_count"),
+                top_description_count=prediction_result.get("top_description_count"),
+                top_description_ratio=prediction_result.get("top_description_ratio"),
+            )
+            sem_node.chunk_node_embed.clear()
+            return [sem_node]
+
+        # Consensus failed: run d1/d2 medoid split using full cluster embeddings.
+        candidate_bank = self._load_sem_description_candidate_bank(
+            sem_node,
+            self._sem_description_candidate_bank_cache,
+        )
+
+        sample_records = prediction_result["sample_prediction_records"]
+        description_groups = defaultdict(list)
+        for record in sample_records:
+            description_groups[record["predicted_description"]].append(record)
+
+        valid_classes = {
+            description: records
+            for description, records in description_groups.items()
+            if len(records) >= 2
+        }
+        if len(valid_classes) < 2:
+            raise ValueError(
+                "Consensus failed but fewer than 2 valid classes with >=2 samples were "
+                f"found for sem_node {sem_node.sem_node_id} "
+                f"(token={token_node.token_text!r}); "
+                f"class sizes={{{', '.join(f'{d!r}: {len(r)}' for d, r in description_groups.items())}}}"
+            )
+
+        embedding_lookup = {
+            self._get_span_occurrence_key(te.to_span_occurrence()): te
+            for te in cluster_text_embeddings
+        }
+        initial_sample_keys = {
+            self._get_span_occurrence_key(record["span_occurrence"])
+            for record in sample_records
+        }
+
+        final_groups = defaultdict(list)
+        class_medoid_embeds = {}
+        sample_assignments = []
+
+        for description, records in valid_classes.items():
+            class_tes = []
+            for record in records:
+                key = self._get_span_occurrence_key(record["span_occurrence"])
+                te = embedding_lookup.get(key)
+                if te is None:
+                    continue
+                class_tes.append(te)
+            if len(class_tes) < 2:
+                raise ValueError(
+                    f"Valid class {description!r} lost members during embedding lookup for "
+                    f"sem_node {sem_node.sem_node_id} (token={token_node.token_text!r})."
+                )
+            medoid_idx = self._compute_medoid_index([te.embed for te in class_tes])
+            class_medoid_embeds[description] = class_tes[medoid_idx].embed
+            final_groups[description].extend(class_tes)
+            for te in class_tes:
+                sample_assignments.append({
+                    "provenance": "class_seed",
+                    "description": description,
+                    "text_embedding": te,
+                })
+
+        unclassified_records = []
+        for record in sample_records:
+            if record["predicted_description"] in valid_classes:
+                continue
+            key = self._get_span_occurrence_key(record["span_occurrence"])
+            te = embedding_lookup.get(key)
+            if te is None:
+                continue
+            unclassified_records.append((te, record["predicted_description"]))
+        for te in cluster_text_embeddings:
+            key = self._get_span_occurrence_key(te.to_span_occurrence())
+            if key not in initial_sample_keys:
+                unclassified_records.append((te, None))
+
+        medoid_descriptions = list(class_medoid_embeds.keys())
+        medoid_stack = torch.stack(
+            [F.normalize(class_medoid_embeds[d], p=2, dim=0) for d in medoid_descriptions]
+        )
+
+        model_judgment_records = []
+        for te, singleton_description in unclassified_records:
+            sample_vec = F.normalize(te.embed, p=2, dim=0).unsqueeze(0)
+            sims = (sample_vec @ medoid_stack.T).squeeze(0)
+            dists = (1.0 - sims).clamp(min=0.0)
+            sorted_dists, sorted_idx = torch.sort(dists)
+            d1 = float(sorted_dists[0].item())
+            d2 = float(sorted_dists[1].item())
+            ratio = (d1 / d2) if d2 > 0 else float("inf")
+            if d2 > 0 and ratio <= 0.8:
+                chosen_desc = medoid_descriptions[int(sorted_idx[0].item())]
+                final_groups[chosen_desc].append(te)
+                sample_assignments.append({
+                    "provenance": "d1_d2",
+                    "description": chosen_desc,
+                    "text_embedding": te,
+                    "d1": d1,
+                    "d2": d2,
+                    "ratio": ratio,
+                    "singleton_class_description": singleton_description,
+                })
+            else:
+                model_judgment_records.append((te, singleton_description, d1, d2, ratio))
+
+        for te, singleton_description, d1, d2, ratio in model_judgment_records:
+            span_occurrence = te.to_span_occurrence()
+            top_candidate = self._predict_description_for_span_occurrence(
+                token_node.token_text,
+                span_occurrence,
+                candidate_bank,
+                self.sem_description_model,
+            )
+            if top_candidate is None:
+                sample_vec = F.normalize(te.embed, p=2, dim=0).unsqueeze(0)
+                sims = (sample_vec @ medoid_stack.T).squeeze(0)
+                dists = (1.0 - sims).clamp(min=0.0)
+                nearest_idx = int(torch.argmin(dists).item())
+                chosen_desc = medoid_descriptions[nearest_idx]
+                final_groups[chosen_desc].append(te)
+                sample_assignments.append({
+                    "provenance": "medoid_fallback",
+                    "description": chosen_desc,
+                    "text_embedding": te,
+                    "nearest_medoid_distance": float(dists[nearest_idx].item()),
+                    "d1": d1,
+                    "d2": d2,
+                    "ratio": ratio,
+                    "singleton_class_description": singleton_description,
+                })
+            else:
+                final_groups[top_candidate["description"]].append(te)
+                sample_assignments.append({
+                    "provenance": "model_judgment",
+                    "description": top_candidate["description"],
+                    "text_embedding": te,
+                    "predicted_entity_id": top_candidate.get("entity_id"),
+                    "predicted_label": top_candidate.get("label"),
+                    "predicted_definition": top_candidate.get("definition"),
+                    "score": float(top_candidate.get("score", 0.0)),
+                    "d1": d1,
+                    "d2": d2,
+                    "ratio": ratio,
+                    "singleton_class_description": singleton_description,
+                })
+
+        provenance_counts = Counter(entry["provenance"] for entry in sample_assignments)
+        split_event_payload = {
+            "token_text": token_node.token_text,
+            "source_sem_node_id": sem_node.sem_node_id,
+            "source_chunk_count": len(sem_node.chunk_node_list),
+            "cluster_sample_count": len(cluster_text_embeddings),
+            "initial_prediction_sample_count": len(sample_records),
+            "valid_class_count": len(valid_classes),
+            "singleton_class_count": len(description_groups) - len(valid_classes),
+            "class_seed_sample_count": provenance_counts.get("class_seed", 0),
+            "d1_d2_assigned_count": provenance_counts.get("d1_d2", 0),
+            "model_judgment_count": provenance_counts.get("model_judgment", 0),
+            "medoid_fallback_count": provenance_counts.get("medoid_fallback", 0),
+            "description_counts": {d: len(tes) for d, tes in final_groups.items()},
+            "initial_class_sizes": {d: len(r) for d, r in description_groups.items()},
+        }
+        self._log_sem_description_operation(
+            "split_sem_node_by_sample_labels",
+            **split_event_payload,
+        )
+        self.deleted_merged_sem_logs.append(
+            {
+                "deleted_sem_node_id": sem_node.sem_node_id,
+                "kept_sem_node_id": None,
+                "token_text": token_node.token_text,
+                "description": "split_by_sample_label",
+                "deleted_chunk_count": len(sem_node.chunk_node_list),
+            }
+        )
+
+        try:
+            self.sem_nodes.remove(sem_node)
+        except ValueError:
+            pass
+        sem_node.chunk_node_embed.clear()
+
+        new_sem_nodes = []
+        description_to_sem_node = {}
+        for description, tes in final_groups.items():
+            if not tes:
+                continue
+            new_node = self._create_sem_node_from_cluster_subset(
+                token_node,
+                description,
+                tes,
+            )
+            new_sem_nodes.append(new_node)
+            description_to_sem_node[description] = new_node
+            self._log_sem_description_operation(
+                "create_split_sem_node",
+                token_text=token_node.token_text,
+                source_sem_node_id=sem_node.sem_node_id,
+                sem_node_id=new_node.sem_node_id,
+                description=description,
+                sample_count=len(tes),
+            )
+
+        for entry in sample_assignments:
+            target_sem = description_to_sem_node.get(entry["description"])
+            if target_sem is None:
+                continue
+            te = entry["text_embedding"]
+            chunk_node = te.chunk_node
+            log_payload = {
+                "token_text": token_node.token_text,
+                "source_sem_node_id": sem_node.sem_node_id,
+                "target_sem_node_id": target_sem.sem_node_id,
+                "description": entry["description"],
+                "chunk_node_id": chunk_node.chunk_node_id,
+                "span_start": te.span_start,
+                "span_end": te.span_end,
+                "span_text": te.span_text,
+            }
+            provenance = entry["provenance"]
+            if provenance == "class_seed":
+                event_type = "assign_sample_as_class_seed"
+            elif provenance == "d1_d2":
+                event_type = "assign_sample_by_d1_d2"
+                log_payload["d1"] = entry["d1"]
+                log_payload["d2"] = entry["d2"]
+                log_payload["ratio"] = entry["ratio"]
+                log_payload["singleton_class_description"] = entry["singleton_class_description"]
+            elif provenance == "model_judgment":
+                event_type = "assign_sample_by_model_judgment"
+                log_payload["predicted_entity_id"] = entry["predicted_entity_id"]
+                log_payload["predicted_label"] = entry["predicted_label"]
+                log_payload["predicted_definition"] = entry["predicted_definition"]
+                log_payload["score"] = entry["score"]
+                log_payload["d1"] = entry["d1"]
+                log_payload["d2"] = entry["d2"]
+                log_payload["ratio"] = entry["ratio"]
+                log_payload["singleton_class_description"] = entry["singleton_class_description"]
+            else:
+                event_type = "assign_sample_by_medoid_fallback"
+                log_payload["nearest_medoid_distance"] = entry["nearest_medoid_distance"]
+                log_payload["d1"] = entry["d1"]
+                log_payload["d2"] = entry["d2"]
+                log_payload["ratio"] = entry["ratio"]
+                log_payload["singleton_class_description"] = entry["singleton_class_description"]
+            self._log_sem_description_operation(event_type, **log_payload)
+
+        token_node.has_semantic = bool(new_sem_nodes)
+        return new_sem_nodes
+
     # Create a stable in-memory key for matching span occurrences.
     def _get_span_occurrence_key(self, span_occurrence):
         chunk_node = span_occurrence.chunk_node
@@ -1709,7 +2120,7 @@ class LiteSemRAG:
             if match_start >= 0:
                 return match_start, match_start + len(span_occurrence.span_text)
 
-        return self._find_description_match_span(chunk_text, token_text)
+        return _find_description_match_span(chunk_text, token_text)
 
     # Re-encode a token span to regenerate a missing retained embedding.
     def _reencode_text_embedding_for_occurrence(self, token_node, span_occurrence):
@@ -1873,14 +2284,12 @@ class LiteSemRAG:
 
     # Assign descriptions, split ambiguous semantic nodes, and merge duplicates by description.
     def merge_duplicate_description_sem_nodes(self):
-        consensus_ratio_threshold = 0.8
         redundant_sem_ids = set()
         sem_nodes_changed = False
         target_token_nodes = [
             token_node for token_node in self.token_nodes
             if len(token_node.sem_node_list) > 1
         ]
-        candidate_bank_cache = {}
 
         total_token_nodes = len(target_token_nodes)
         progress_update = self._make_progress_updater(
@@ -1899,155 +2308,12 @@ class LiteSemRAG:
                 seen_sem_ids.add(sem_id)
                 ordered_sem_list.append(sem_node)
 
-            new_sem_list = []
-            description_sem_map = defaultdict(list)
-            for sem_node in ordered_sem_list:
-                if sem_node.description:
-                    new_sem_list.append(sem_node)
-                    description_sem_map[sem_node.description].append(sem_node)
-                    continue
-
-                if self.sem_description_model is None:
-                    new_sem_list.append(sem_node)
-                    continue
-
-                prediction_result = self._predict_sem_description_from_samples(
-                    sem_node,
-                    model=self.sem_description_model,
-                    candidate_bank_cache=candidate_bank_cache,
-                    max_samples=10,
-                )
-                if prediction_result is None:
-                    new_sem_list.append(sem_node)
-                    continue
-
-                if (
-                    prediction_result["sample_count"] > 0
-                    and prediction_result["top_description_ratio"] >= consensus_ratio_threshold
-                ):
-                    predicted_description = prediction_result["description"]
-                    sem_node.description = predicted_description
-                    new_sem_list.append(sem_node)
-                    description_sem_map[predicted_description].append(sem_node)
-                    self.predicted_sem_description_logs.append(
-                        {
-                            "sem_node_id": sem_node.sem_node_id,
-                            "token_text": sem_node.token_node.token_text,
-                            "description": predicted_description,
-                            "predicted_entity_id": prediction_result.get("predicted_entity_id"),
-                            "predicted_label": prediction_result.get("predicted_label"),
-                            "predicted_definition": prediction_result.get("predicted_definition"),
-                            "prediction_score_mean": prediction_result.get("prediction_score_mean"),
-                            "chunk_count": len(sem_node.chunk_node_list),
-                            "sample_count": prediction_result.get("sample_count"),
-                            "top_description_count": prediction_result.get("top_description_count"),
-                            "top_description_ratio": prediction_result.get("top_description_ratio"),
-                            "sample_predictions": prediction_result["sample_predictions"],
-                        }
-                    )
-                    self._log_sem_description_operation(
-                        "assign_description_by_consensus",
-                        token_text=token_node.token_text,
-                        sem_node_id=sem_node.sem_node_id,
-                        description=predicted_description,
-                        sample_count=prediction_result.get("sample_count"),
-                        top_description_count=prediction_result.get("top_description_count"),
-                        top_description_ratio=prediction_result.get("top_description_ratio"),
-                    )
-                    continue
-
-                exhaustive_prediction_result = self._predict_sem_description_from_samples(
-                    sem_node,
-                    model=self.sem_description_model,
-                    candidate_bank_cache=candidate_bank_cache,
-                    max_samples=None,
-                )
-                if exhaustive_prediction_result is None:
-                    new_sem_list.append(sem_node)
-                    continue
-
-                sem_nodes_changed = True
-                redundant_sem_ids.add(id(sem_node))
-                self._log_sem_description_operation(
-                    "split_sem_node_by_sample_labels",
-                    token_text=token_node.token_text,
-                    source_sem_node_id=sem_node.sem_node_id,
-                    source_chunk_count=len(sem_node.chunk_node_list),
-                    description_counts=exhaustive_prediction_result.get("description_counts", {}),
-                )
-                retained_text_embedding_lookup = self._build_retained_text_embedding_lookup(sem_node)
-                self.deleted_merged_sem_logs.append(
-                    {
-                        "deleted_sem_node_id": sem_node.sem_node_id,
-                        "kept_sem_node_id": None,
-                        "token_text": token_node.token_text,
-                        "description": "split_by_sample_label",
-                        "deleted_chunk_count": len(sem_node.chunk_node_list),
-                    }
-                )
-
-                for sample_prediction in exhaustive_prediction_result["sample_prediction_records"]:
-                    predicted_description = sample_prediction["predicted_description"]
-                    if not predicted_description:
-                        continue
-                    span_occurrence = sample_prediction["span_occurrence"]
-                    retained_candidates = retained_text_embedding_lookup.get(
-                        self._get_span_occurrence_key(span_occurrence),
-                    )
-                    retained_text_embedding = None if not retained_candidates else retained_candidates.pop()
-                    target_sem_group = description_sem_map.get(predicted_description)
-                    created_new_sem = False
-                    if target_sem_group:
-                        target_sem = target_sem_group[0]
-                        target_sem.pending_embed_rebuild = True
-                    else:
-                        target_sem = self._create_split_sem_node(token_node, predicted_description)
-                        description_sem_map[predicted_description].append(target_sem)
-                        new_sem_list.append(target_sem)
-                        created_new_sem = True
-                        self._log_sem_description_operation(
-                            "create_split_sem_node",
-                            token_text=token_node.token_text,
-                            sem_node_id=target_sem.sem_node_id,
-                            description=predicted_description,
-                        )
-                    self._append_span_occurrence_to_sem(
-                        target_sem,
-                        span_occurrence,
-                        edge_weight=0.0,
-                        retained_text_embedding=retained_text_embedding,
-                    )
-                    self._log_sem_description_operation(
-                        "assign_sample_to_sem_node",
-                        token_text=token_node.token_text,
-                        source_sem_node_id=sem_node.sem_node_id,
-                        target_sem_node_id=target_sem.sem_node_id,
-                        description=predicted_description,
-                        chunk_node_id=span_occurrence.chunk_node.chunk_node_id,
-                        span_start=span_occurrence.span_start,
-                        span_end=span_occurrence.span_end,
-                        span_text=span_occurrence.span_text,
-                        used_retained_embedding=retained_text_embedding is not None,
-                        created_new_sem=created_new_sem,
-                    )
-
-            for sem_node in new_sem_list:
-                if getattr(sem_node, "pending_embed_rebuild", False):
-                    self._finalize_split_sem_node_embed(sem_node)
-                    self._log_sem_description_operation(
-                        "finalize_split_sem_node_embed",
-                        token_text=token_node.token_text,
-                        sem_node_id=sem_node.sem_node_id,
-                        description=sem_node.description,
-                        retained_embed_count=len(getattr(sem_node, "retained_text_embeddings", [])),
-                    )
-
-            merged_sem_map = {}
             merge_groups = defaultdict(list)
-            for sem_node in new_sem_list:
+            for sem_node in ordered_sem_list:
                 if sem_node.description:
                     merge_groups[sem_node.description].append(sem_node)
 
+            merged_sem_map = {}
             for description, sem_group in merge_groups.items():
                 if len(sem_group) < 2:
                     continue
@@ -2077,7 +2343,7 @@ class LiteSemRAG:
             if merged_sem_map:
                 deduped_sem_list = []
                 added_sem_ids = set()
-                for sem_node in new_sem_list:
+                for sem_node in ordered_sem_list:
                     if id(sem_node) in redundant_sem_ids:
                         continue
                     target_sem = merged_sem_map.get(sem_node.description, sem_node)
@@ -2086,9 +2352,9 @@ class LiteSemRAG:
                         continue
                     added_sem_ids.add(target_sem_id)
                     deduped_sem_list.append(target_sem)
-                new_sem_list = deduped_sem_list
-
-            token_node.sem_node_list = new_sem_list
+                token_node.sem_node_list = deduped_sem_list
+            else:
+                token_node.sem_node_list = ordered_sem_list
             token_node.has_semantic = len(token_node.sem_node_list) > 0
             progress_update(index)
 
@@ -2111,61 +2377,184 @@ class LiteSemRAG:
 
     # Format semantic-description logs as plain text.
     def _format_sem_description_logs_text(self):
-        lines = []
+        operations = list(self.sem_description_operation_logs)
+        event_counts = Counter(item.get("event_type", "unknown") for item in operations)
 
-        lines.append("Sem description operations:")
-        if not self.sem_description_operation_logs:
-            lines.append("  (none)")
+        consensus_events = [e for e in operations if e.get("event_type") == "assign_description_by_consensus"]
+        split_events = [e for e in operations if e.get("event_type") == "split_sem_node_by_sample_labels"]
+        create_split_events = [e for e in operations if e.get("event_type") == "create_split_sem_node"]
+        sample_assignment_event_types = {
+            "assign_sample_as_class_seed",
+            "assign_sample_by_d1_d2",
+            "assign_sample_by_model_judgment",
+            "assign_sample_by_medoid_fallback",
+        }
+        sample_events = [e for e in operations if e.get("event_type") in sample_assignment_event_types]
+        merge_events = [e for e in operations if e.get("event_type") == "merge_sem_nodes_with_same_description"]
+        handled_event_types = (
+            {"assign_description_by_consensus",
+             "split_sem_node_by_sample_labels",
+             "create_split_sem_node",
+             "merge_sem_nodes_with_same_description"}
+            | sample_assignment_event_types
+        )
+        misc_events = [e for e in operations if e.get("event_type") not in handled_event_types]
+
+        create_split_by_source = defaultdict(list)
+        for event in create_split_events:
+            create_split_by_source[event.get("source_sem_node_id")].append(event)
+        sample_events_by_source = defaultdict(list)
+        for event in sample_events:
+            sample_events_by_source[event.get("source_sem_node_id")].append(event)
+
+        predicted_by_sem_id = {
+            item["sem_node_id"]: item for item in self.predicted_sem_description_logs
+        }
+
+        lines = []
+        lines.append("=== Semantic description log ===")
+        lines.append("")
+        lines.append("Event summary:")
+        if not operations:
+            lines.append("  (no operations recorded)")
         else:
-            for item in self.sem_description_operation_logs:
-                event_type = item.get("event_type", "unknown")
-                payload = ", ".join(
-                    f"{key}={value!r}"
-                    for key, value in item.items()
-                    if key != "event_type"
-                )
-                lines.append(f"  [{event_type}] {payload}")
+            for event_type, count in sorted(event_counts.items()):
+                lines.append(f"  {event_type}: {count}")
 
         lines.append("")
-        lines.append("Sem nodes assigned predicted descriptions:")
-        if not self.predicted_sem_description_logs:
+        lines.append(f"[1] Consensus description assignments ({len(consensus_events)})")
+        if not consensus_events:
             lines.append("  (none)")
         else:
-            for item in self.predicted_sem_description_logs:
+            for event in consensus_events:
+                sem_id = event.get("sem_node_id")
                 lines.append(
-                    "[Sem] sem_node_id={} | token={!r} | description={!r} | chunk_count={}".format(
-                        item["sem_node_id"],
-                        item["token_text"],
-                        item["description"],
-                        item["chunk_count"],
+                    "  sem_node_id={} | token={!r} | description={!r} | "
+                    "samples={} | top_count={} | top_ratio={:.3f}".format(
+                        sem_id,
+                        event.get("token_text"),
+                        event.get("description"),
+                        event.get("sample_count"),
+                        event.get("top_description_count"),
+                        self._safe_float(event.get("top_description_ratio")),
                     )
                 )
-                sample_predictions = item.get("sample_predictions", [])
-                if not sample_predictions:
-                    lines.append("  sample_predictions: (none)")
-                    lines.append("")
-                    continue
-                for sample in sample_predictions:
-                    lines.append(
-                        "  (sample {}) chunk_node_id={} | predicted_description={!r} | predicted_label={!r} | score={:.4f}".format(
-                            sample["sample_index"],
-                            sample["chunk_node_id"],
-                            sample["predicted_description"],
-                            sample["predicted_label"],
-                            sample["prediction_score"],
+                predicted = predicted_by_sem_id.get(sem_id)
+                if predicted is not None:
+                    sample_predictions = predicted.get("sample_predictions", [])
+                    for sample in sample_predictions:
+                        lines.append(
+                            "    sample #{} | chunk_node_id={} | predicted_description={!r} | "
+                            "predicted_label={!r} | score={:.4f}".format(
+                                sample["sample_index"],
+                                sample["chunk_node_id"],
+                                sample["predicted_description"],
+                                sample["predicted_label"],
+                                sample["prediction_score"],
+                            )
                         )
-                    )
-                    lines.append("    matched_text={!r}".format(sample["matched_text"]))
-                    lines.append("    context_text={!r}".format(sample["context_text"]))
-                lines.append("")
+                        lines.append("      matched_text={!r}".format(sample["matched_text"]))
 
-        lines.append("Sem nodes deleted by description merge:")
+        lines.append("")
+        lines.append(f"[2] Split sem nodes by sample label ({len(split_events)})")
+        if not split_events:
+            lines.append("  (none)")
+        else:
+            for event in split_events:
+                source_id = event.get("source_sem_node_id")
+                lines.append(
+                    "  source_sem_node_id={} | token={!r} | source_chunk_count={} | "
+                    "cluster_samples={} | initial_samples={}".format(
+                        source_id,
+                        event.get("token_text"),
+                        event.get("source_chunk_count"),
+                        event.get("cluster_sample_count"),
+                        event.get("initial_prediction_sample_count"),
+                    )
+                )
+                lines.append(
+                    "    valid_classes={} | singleton_classes={} | "
+                    "class_seed={} | d1_d2={} | model_judgment={} | medoid_fallback={}".format(
+                        event.get("valid_class_count"),
+                        event.get("singleton_class_count"),
+                        event.get("class_seed_sample_count"),
+                        event.get("d1_d2_assigned_count"),
+                        event.get("model_judgment_count"),
+                        event.get("medoid_fallback_count"),
+                    )
+                )
+                initial_sizes = event.get("initial_class_sizes") or {}
+                if initial_sizes:
+                    lines.append(
+                        "    initial_class_sizes: "
+                        + ", ".join(f"{desc!r}={count}" for desc, count in initial_sizes.items())
+                    )
+                final_sizes = event.get("description_counts") or {}
+                if final_sizes:
+                    lines.append(
+                        "    final_description_counts: "
+                        + ", ".join(f"{desc!r}={count}" for desc, count in final_sizes.items())
+                    )
+                created_events = create_split_by_source.get(source_id, [])
+                if created_events:
+                    lines.append("    created sem nodes:")
+                    for created in created_events:
+                        lines.append(
+                            "      sem_node_id={} | description={!r} | sample_count={}".format(
+                                created.get("sem_node_id"),
+                                created.get("description"),
+                                created.get("sample_count"),
+                            )
+                        )
+                assignment_events = sample_events_by_source.get(source_id, [])
+                if assignment_events:
+                    lines.append("    sample assignments:")
+                    for entry in assignment_events:
+                        lines.append("      " + self._format_sample_assignment(entry))
+
+        orphan_create_events = [
+            event for event in create_split_events
+            if event.get("source_sem_node_id") not in {s.get("source_sem_node_id") for s in split_events}
+        ]
+        if orphan_create_events:
+            lines.append("")
+            lines.append("  (orphan create_split_sem_node events without a matching split record)")
+            for event in orphan_create_events:
+                lines.append(
+                    "    sem_node_id={} | source_sem_node_id={} | description={!r} | sample_count={}".format(
+                        event.get("sem_node_id"),
+                        event.get("source_sem_node_id"),
+                        event.get("description"),
+                        event.get("sample_count"),
+                    )
+                )
+
+        lines.append("")
+        lines.append(f"[3] Same-description merges ({len(merge_events)})")
+        if not merge_events:
+            lines.append("  (none)")
+        else:
+            for event in merge_events:
+                lines.append(
+                    "  token={!r} | description={!r} | kept_sem_node_id={} | "
+                    "merged_sem_node_ids={} | retained_embed_count={}".format(
+                        event.get("token_text"),
+                        event.get("description"),
+                        event.get("kept_sem_node_id"),
+                        event.get("merged_sem_node_ids"),
+                        event.get("retained_embed_count"),
+                    )
+                )
+
+        lines.append("")
+        lines.append(f"[4] Deleted sem nodes ({len(self.deleted_merged_sem_logs)})")
         if not self.deleted_merged_sem_logs:
             lines.append("  (none)")
         else:
             for item in self.deleted_merged_sem_logs:
                 lines.append(
-                    "  deleted_sem_node_id={} | kept_sem_node_id={} | token={!r} | description={!r} | deleted_chunk_count={}".format(
+                    "  deleted_sem_node_id={} | kept_sem_node_id={} | token={!r} | "
+                    "description={!r} | deleted_chunk_count={}".format(
                         item["deleted_sem_node_id"],
                         item["kept_sem_node_id"],
                         item["token_text"],
@@ -2175,7 +2564,7 @@ class LiteSemRAG:
                 )
 
         lines.append("")
-        lines.append("Wikidata lookups with no usable results:")
+        lines.append(f"[5] Wikidata lookups with no usable results ({len(self.wikidata_no_result_logs)})")
         if not self.wikidata_no_result_logs:
             lines.append("  (none)")
         else:
@@ -2188,7 +2577,68 @@ class LiteSemRAG:
                     )
                 )
 
+        if misc_events:
+            lines.append("")
+            lines.append(f"[6] Other operations ({len(misc_events)})")
+            for event in misc_events:
+                event_type = event.get("event_type", "unknown")
+                payload = ", ".join(
+                    f"{key}={value!r}"
+                    for key, value in event.items()
+                    if key != "event_type"
+                )
+                lines.append(f"  [{event_type}] {payload}")
+
         return "\n".join(lines)
+
+    # Format a per-sample assignment event into a single human-readable line.
+    def _format_sample_assignment(self, event):
+        event_type = event.get("event_type", "")
+        span_repr = "chunk_node_id={} | span=({}, {}) | span_text={!r}".format(
+            event.get("chunk_node_id"),
+            event.get("span_start"),
+            event.get("span_end"),
+            event.get("span_text"),
+        )
+        description = event.get("description")
+        target = event.get("target_sem_node_id")
+        if event_type == "assign_sample_as_class_seed":
+            return (
+                f"[class_seed] target_sem_node_id={target} | description={description!r} | "
+                f"{span_repr}"
+            )
+        if event_type == "assign_sample_by_d1_d2":
+            return (
+                f"[d1_d2]     target_sem_node_id={target} | description={description!r} | "
+                f"d1={self._safe_float(event.get('d1')):.4f} | d2={self._safe_float(event.get('d2')):.4f} | "
+                f"ratio={self._safe_float(event.get('ratio')):.4f} | {span_repr}"
+            )
+        if event_type == "assign_sample_by_model_judgment":
+            return (
+                f"[model]     target_sem_node_id={target} | description={description!r} | "
+                f"predicted_label={event.get('predicted_label')!r} | "
+                f"score={self._safe_float(event.get('score')):.4f} | "
+                f"d1={self._safe_float(event.get('d1')):.4f} | d2={self._safe_float(event.get('d2')):.4f} | "
+                f"ratio={self._safe_float(event.get('ratio')):.4f} | {span_repr}"
+            )
+        if event_type == "assign_sample_by_medoid_fallback":
+            return (
+                f"[fallback]  target_sem_node_id={target} | description={description!r} | "
+                f"nearest_medoid_distance={self._safe_float(event.get('nearest_medoid_distance')):.4f} | "
+                f"d1={self._safe_float(event.get('d1')):.4f} | d2={self._safe_float(event.get('d2')):.4f} | "
+                f"ratio={self._safe_float(event.get('ratio')):.4f} | {span_repr}"
+            )
+        return f"[{event_type}] target_sem_node_id={target} | description={description!r} | {span_repr}"
+
+    # Coerce a possibly-None numeric field to float for safe formatting.
+    @staticmethod
+    def _safe_float(value):
+        if value is None:
+            return float("nan")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
 
     # Format semantic-description logs as a small HTML details block.
     def _format_sem_description_logs_html(self, open_details=False):
