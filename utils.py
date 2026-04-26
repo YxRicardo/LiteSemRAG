@@ -1268,3 +1268,98 @@ def build_hotpot_retrieval_dataset(file_path, num_samples=None):
     print(f"Dataset cached to: {cache_dir}")
 
     return documents, samples
+
+
+# Convert a list/array/tensor of embeddings into a contiguous (N, D) float32 numpy array.
+def _embeddings_to_numpy_2d(embeddings):
+    if isinstance(embeddings, torch.Tensor):
+        arr = embeddings.detach().cpu().numpy()
+    elif (
+        isinstance(embeddings, (list, tuple))
+        and len(embeddings) > 0
+        and isinstance(embeddings[0], torch.Tensor)
+    ):
+        arr = torch.stack([e.detach().cpu().flatten() for e in embeddings]).numpy()
+    else:
+        arr = np.asarray(embeddings)
+    if arr.ndim != 2:
+        raise ValueError(f"embeddings must be 2D, got shape {arr.shape}")
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+# Select N representative indices via farthest-first traversal.
+#
+# Returns indices in selection order. The first index is the global medoid
+# (start="medoid") or a seeded random point (start="random"). Each subsequent
+# index is the unselected point whose minimum distance to the selected set is
+# maximal. Distances are updated incrementally; only the first medoid step
+# materializes a full (N, N) matrix.
+def farthest_first_traversal(
+    embeddings,
+    N,
+    metric="cosine",
+    start="medoid",
+    random_state=None,
+    return_min_distances=False,
+):
+    arr = _embeddings_to_numpy_2d(embeddings)
+    num_points = arr.shape[0]
+    if num_points == 0 or N <= 0:
+        return ([], []) if return_min_distances else []
+    if N >= num_points:
+        indices = list(range(num_points))
+        return (indices, []) if return_min_distances else indices
+
+    if metric == "cosine":
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0.0] = 1.0
+        work = arr / norms
+
+        def dist_to(i):
+            return 1.0 - work @ work[i]
+    elif metric == "euclidean":
+        work = arr
+
+        def dist_to(i):
+            diff = work - work[i]
+            return np.sqrt(np.einsum("ij,ij->i", diff, diff))
+    else:
+        raise ValueError(f"unsupported metric: {metric}")
+
+    if start == "medoid":
+        if metric == "cosine":
+            dist_matrix = 1.0 - work @ work.T
+        else:
+            sq = np.einsum("ij,ij->i", work, work)
+            dist_matrix = np.sqrt(
+                np.maximum(sq[:, None] + sq[None, :] - 2.0 * work @ work.T, 0.0)
+            )
+        first = int(np.argmin(dist_matrix.sum(axis=1)))
+    elif start == "random":
+        rng = np.random.default_rng(random_state)
+        first = int(rng.integers(0, num_points))
+    else:
+        raise ValueError(f"unsupported start: {start}")
+
+    selected = [first]
+    min_dist = dist_to(first).astype(np.float32, copy=False)
+    selected_mask = np.zeros(num_points, dtype=bool)
+    selected_mask[first] = True
+    min_dist[first] = -np.inf
+    step_distances = []
+
+    while len(selected) < N:
+        next_idx = int(np.argmax(min_dist))
+        next_min = float(min_dist[next_idx])
+        if not np.isfinite(next_min):
+            break  # remaining points are duplicates of selected ones
+        selected.append(next_idx)
+        step_distances.append(next_min)
+        selected_mask[next_idx] = True
+        new_dist = dist_to(next_idx)
+        np.minimum(min_dist, new_dist, out=min_dist)
+        min_dist[next_idx] = -np.inf
+
+    return (selected, step_distances) if return_min_distances else selected
+
+    return documents, samples
