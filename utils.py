@@ -521,7 +521,51 @@ def load_wikidata_definition_candidates(
     require_detailed_description: bool = False,
     label_contains_text: bool = True,
     target_candidate_count: int | None = None,
+    use_llm_filter: bool = False,
+    llm_filter=None,
+    llm_filter_use_api: bool = False,
+    llm_filter_use_cache: bool = True,
 ):
+    # When use_llm_filter is enabled, defer entirely to WikidataDefinitionFilter:
+    # no rule-based filtering or reranking, no exact-match logic — the LLM's
+    # returned definitions are used as-is.
+    if use_llm_filter:
+        from wikidata_definition_filter import WikidataDefinitionFilter
+
+        _, pd = _import_wikidata_deps()
+        filter_instance = llm_filter or WikidataDefinitionFilter(use_api=llm_filter_use_api)
+        result = filter_instance.filter_definitions(
+            query_text,
+            num_candidates=int(target_candidate_count or limit),
+            use_cache=llm_filter_use_cache,
+        )
+        if not result.definitions:
+            raise ValueError(
+                f"WikidataDefinitionFilter returned no definitions for span={query_text!r}."
+            )
+
+        rows = []
+        for defn in result.definitions:
+            primary_id = defn.source_entity_ids[0] if defn.source_entity_ids else ""
+            primary_label = defn.source_labels[0] if defn.source_labels else query_text
+            text = defn.definition.strip()
+            rows.append(
+                {
+                    "id": primary_id,
+                    "label": primary_label,
+                    "description": text,
+                    "detailed_description": text,
+                    "match_text": "",
+                    "aliases": (),
+                    "concepturi": "",
+                    "source_entity_ids": tuple(defn.source_entity_ids),
+                    "source_labels": tuple(defn.source_labels),
+                    "is_merged": defn.is_merged,
+                    "is_rewritten": defn.is_rewritten,
+                }
+            )
+        return pd.DataFrame(rows), "description"
+
     max_candidate_count = max(1, int(target_candidate_count or limit))
     search_limit = int(limit)
     include_detailed_description = use_detailed_description

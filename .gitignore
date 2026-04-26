@@ -4,15 +4,8 @@
 # 允许目录
 !*/
 
-# 允许指定文件
-!RAG_graph.py
-!text_processing.py
-!utils.py
-!wikipedia_redirects.py
-!prepare_wikipedia_redirects.py
-!prepare_semcor.py
-!inspect_redirect_index.py
-!wordnet_explorer.py
+# 允许根目录 Python 文件
+!/*.py
 !jupyter_notebooks/
 !jupyter_notebooks/*.ipynb
 
