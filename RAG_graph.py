@@ -45,7 +45,6 @@ from utils import (
     farthest_first_traversal,
     get_anomaly_threshold,
     get_s_mean,
-    hdbscan_cluster,
     inspect_sem_nodes,
     load_wikidata_definition_candidates,
     plot_embeddings,
@@ -377,8 +376,7 @@ class LiteSemRAG:
                  discard_no_word=False, plot_embeds=False,
                  sem_description_prompt_context_mode="sentence_neighbors",
                  consensus_ratio_threshold=0.8,
-                 single_cluster_mode=False,
-                 single_cluster_min_description_candidates=3):
+                 min_description_candidates=3):
         self.text_embed_dim = text_embed_dim
         self.df_ratio = df_ratio
         self.doc_nodes = []
@@ -436,9 +434,8 @@ class LiteSemRAG:
         # Minimum agreement ratio (top predicted description / total samples) required
         # to accept a cross-encoder prediction as the semantic node's description.
         self.consensus_ratio_threshold = consensus_ratio_threshold
-        self.single_cluster_mode = single_cluster_mode
-        self.single_cluster_min_description_candidates = max(
-            1, int(single_cluster_min_description_candidates)
+        self.min_description_candidates = max(
+            1, int(min_description_candidates)
         )
         self.predicted_sem_description_logs = []
         self.deleted_merged_sem_logs = []
@@ -446,9 +443,7 @@ class LiteSemRAG:
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
         self._sem_description_candidate_bank_cache = {}
-        self.hdbscan_attempt_count = 0
-        self.hdbscan_success_count = 0
-        self.single_cluster_build_count = 0
+        self.sem_build_count = 0
         self.schema_version = CURRENT_SCHEMA_VERSION
 
     # Recompute the average chunk length used by BM25 scoring.
@@ -552,17 +547,9 @@ class LiteSemRAG:
             }
         )
 
-    # Reset HDBSCAN attempt and success counters.
-    def _reset_hdbscan_stats(self):
-        self.hdbscan_attempt_count = 0
-        self.hdbscan_success_count = 0
-        self.single_cluster_build_count = 0
-
-    # Track whether an HDBSCAN clustering attempt produced clusters.
-    def _record_hdbscan_attempt(self, n_clusters):
-        self.hdbscan_attempt_count += 1
-        if n_clusters >= 1:
-            self.hdbscan_success_count += 1
+    # Reset semantic-node build counters.
+    def _reset_sem_build_stats(self):
+        self.sem_build_count = 0
 
     # Create and register a document node.
     def create_doc_node(self, doc_name):
@@ -712,8 +699,8 @@ class LiteSemRAG:
         token_node.sem_node_list.append(new_sem_node)
 
     # Build one sem node from a given list of text embeddings and run description assignment.
-    def _build_single_cluster_sem_node(self, token_node, text_embeddings):
-        self.single_cluster_build_count += 1
+    def _build_sem_node_from_cluster(self, token_node, text_embeddings):
+        self.sem_build_count += 1
         new_sem_node = self.create_sem_node(token_node)
         embeds = [te.embed for te in text_embeddings]
         new_sem_node.embed = self._store_sem_embed(average_embeds(embeds))
@@ -732,52 +719,12 @@ class LiteSemRAG:
         )
         token_node.sem_node_list.extend(final_sem_nodes)
 
-    # Cluster buffered token embeddings and build semantic nodes or anomaly records.
+    # Build semantic nodes from buffered token embeddings.
     def build_sem_node(self, token_node):
         if token_node.node_type == "token" and not self.semantic_type_cls(token_node):
             self.create_basic_sem_node(token_node)
-        elif self.single_cluster_mode:
-            self._build_single_cluster_sem_node(token_node, list(token_node.embeds_buffer))
         else:
-            n_clusters, clusters, cluster_centers = hdbscan_cluster([(k.embed.cpu(),k.chunk_node) for k in token_node.embeds_buffer],
-                                                                    min_cluster_size=int(len(token_node.embeds_buffer)/20),
-                                                                    percentile=self.anomaly_threshold_percentile, merge_chunks=False)
-            self._record_hdbscan_attempt(n_clusters)
-            if n_clusters >= 1:
-                if self.plot_embeds:
-                    self.plot_embed_distribution(token_node, clusters)
-                for clusters_label in range(n_clusters):
-                    new_sem_node = self.create_sem_node(token_node)
-                    new_sem_node.embed = self._store_sem_embed(torch.from_numpy(cluster_centers[clusters_label]))
-                    cluster_text_embeddings = []
-                    for idx in clusters[clusters_label]:
-                        text_embedding = token_node.embeds_buffer[idx]
-                        new_sem_node.chunk_node_list.append(text_embedding.chunk_node)
-                        new_sem_node.span_occurrences.append(text_embedding.to_span_occurrence())
-                        new_sem_node.chunk_node_embed.append(text_embedding.embed)
-                        cluster_text_embeddings.append(text_embedding)
-                    self._initialize_sem_retained_text_embeddings(new_sem_node, cluster_text_embeddings)
-                    new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
-                    new_sem_node.anomaly_threshold = get_anomaly_threshold(new_sem_node.chunk_edge_weight,
-                                                                             self.anomaly_threshold_percentile)
-                    final_sem_nodes = self._assign_sem_description_on_build(
-                        new_sem_node,
-                        cluster_text_embeddings,
-                    )
-                    token_node.sem_node_list.extend(final_sem_nodes)
-                anomaly_idx = clusters.get(-1)
-                if anomaly_idx is not None:
-                    for idx in anomaly_idx:
-                        text_embedding = token_node.embeds_buffer[idx]
-                        max_val, max_idx = inspect_sem_nodes(text_embedding.embed, token_node.sem_node_list)
-                        self._append_anomaly_embedding(
-                            token_node,
-                            text_embedding,
-                            max_val,
-                            max_idx,
-                        )
-            else:
-                self.create_basic_sem_node(token_node)
+            self._build_sem_node_from_cluster(token_node, list(token_node.embeds_buffer))
         token_node.embeds_buffer.clear()
 
     # Build semantic nodes for all token nodes waiting in the build queue.
@@ -791,54 +738,9 @@ class LiteSemRAG:
         for token_node in self.anomaly_waitlist:
             if len(token_node.anomaly_section) < self.anomaly_section_size:
                 continue
-            if self.single_cluster_mode:
-                text_embeddings = [item.text_embedding for item in token_node.anomaly_section]
-                self._build_single_cluster_sem_node(token_node, text_embeddings)
-                token_node.anomaly_section = []
-                continue
-            n_clusters, clusters, cluster_centers = hdbscan_cluster(
-                [
-                    (
-                        item.text_embedding.embed.cpu(),
-                        item.text_embedding.chunk_node,
-                    )
-                    for item in token_node.anomaly_section
-                ],
-                min_cluster_size=10, percentile=self.anomaly_threshold_percentile)
-            self._record_hdbscan_attempt(n_clusters)
-            if n_clusters >= 1:
-                for clusters_label in range(n_clusters):
-                    new_sem_node = self.create_sem_node(token_node)
-                    new_sem_node.embed = self._store_sem_embed(torch.from_numpy(cluster_centers[clusters_label]))
-                    cluster_text_embeddings = []
-                    for idx in clusters[clusters_label]:
-                        text_embedding = token_node.anomaly_section[idx].text_embedding
-                        new_sem_node.chunk_node_list.append(text_embedding.chunk_node)
-                        new_sem_node.span_occurrences.append(text_embedding.to_span_occurrence())
-                        new_sem_node.chunk_node_embed.append(text_embedding.embed)
-                        cluster_text_embeddings.append(text_embedding)
-                    self._initialize_sem_retained_text_embeddings(new_sem_node, cluster_text_embeddings)
-                    new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
-                    new_sem_node.anomaly_threshold = get_anomaly_threshold(new_sem_node.chunk_edge_weight,
-                                                                             self.anomaly_threshold_percentile)
-                    final_sem_nodes = self._assign_sem_description_on_build(
-                        new_sem_node,
-                        cluster_text_embeddings,
-                    )
-                    token_node.sem_node_list.extend(final_sem_nodes)
-                anomaly_idx = clusters.get(-1)
-                if anomaly_idx is None:
-                    token_node.anomaly_section = []
-                else:
-                    token_node.anomaly_section = [token_node.anomaly_section[i] for i in anomaly_idx]
-            else:
-                for item in token_node.anomaly_section:
-                    self._append_sem_occurrence(
-                        token_node.sem_node_list[item.max_idx],
-                        item.text_embedding,
-                        edge_weight=item.max_val,
-                    )
-                token_node.anomaly_section.clear()
+            text_embeddings = [item.text_embedding for item in token_node.anomaly_section]
+            self._build_sem_node_from_cluster(token_node, text_embeddings)
+            token_node.anomaly_section = []
         self.anomaly_waitlist = []
 
     # Print an elapsed-time progress message for the current operation.
@@ -973,8 +875,11 @@ class LiteSemRAG:
             self.sem_description_model = None
         if not hasattr(self, "consensus_ratio_threshold"):
             self.consensus_ratio_threshold = 0.8
-        if not hasattr(self, "single_cluster_min_description_candidates"):
-            self.single_cluster_min_description_candidates = 3
+        if not hasattr(self, "min_description_candidates"):
+            legacy_min_candidates = getattr(self, "single_cluster_min_description_candidates", 3)
+            self.min_description_candidates = max(1, int(legacy_min_candidates))
+        if not hasattr(self, "sem_build_count"):
+            self.sem_build_count = getattr(self, "single_cluster_build_count", 0)
         for token_node in getattr(self, "token_nodes", []):
             self._ensure_token_node_backward_compatible_attrs(token_node)
             for text_embedding in getattr(token_node, "embeds_buffer", []):
@@ -1614,11 +1519,10 @@ class LiteSemRAG:
             return cached_candidate_bank
 
         max_candidate_count = max(1, len(sem_node.token_node.sem_node_list) + 1)
-        if self.single_cluster_mode:
-            max_candidate_count = max(
-                max_candidate_count,
-                self.single_cluster_min_description_candidates,
-            )
+        max_candidate_count = max(
+            max_candidate_count,
+            self.min_description_candidates,
+        )
         try:
             candidates_df, definition_column = load_wikidata_definition_candidates(
                 token_text,
@@ -4325,7 +4229,7 @@ class LiteSemRAG:
         Adding more workers requires locking or partitioning those shared states.
         """
         self.start_time = time.perf_counter()
-        self._reset_hdbscan_stats()
+        self._reset_sem_build_stats()
         total_chunks = len(chunk_list)
         doc_node_map = {}
 
@@ -4570,18 +4474,10 @@ class LiteSemRAG:
 
         self.solve_sem_nodes()
         self.solve_anomaly()
-        if self.single_cluster_mode:
-            print(
-                "single_cluster_mode: "
-                f"built {self.single_cluster_build_count} single-cluster sem nodes "
-                "(HDBSCAN skipped)"
-            )
-        else:
-            print(
-                "HDBSCAN attempts: "
-                f"{self.hdbscan_attempt_count}, "
-                f"successes (n_clusters >= 1): {self.hdbscan_success_count}"
-            )
+        print(
+            "single-cluster semantic build: "
+            f"built {self.sem_build_count} sem nodes"
+        )
 
 class ListBatchExtractor:
     # Initialize batched extraction state for round-robin or sequential modes.
