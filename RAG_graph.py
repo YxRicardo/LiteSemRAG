@@ -38,6 +38,12 @@ from text_processing import (
     get_token_embeds,
     split_doc,
 )
+from phrase_analysis import (
+    PHRASE_TYPE_ATOMIC,
+    PHRASE_TYPE_COMPOSITIONAL,
+    PHRASE_TYPE_UNKNOWN,
+    PhraseAnalyzer,
+)
 from utils import (
     average_embeds,
     build_wikidata_candidate_bank,
@@ -52,7 +58,7 @@ from utils import (
     sem_embed_sim,
 )
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 RUNTIME_FIELD_NAMES = (
     "text_encoder",
     "tokenizer",
@@ -61,6 +67,7 @@ RUNTIME_FIELD_NAMES = (
     "reranker",
     "sem_description_model",
     "encoder_lock",
+    "phrase_analyzer",
 )
 CO_OCCURRENCE_NODE_QUERY_WEIGHT = (1.2, 1, 0.8, 0.5)
 
@@ -234,6 +241,15 @@ class TextEmbedding:
     span_start: int | None = None
     span_end: int | None = None
     span_text: str | None = None
+    surface_text: str | None = None
+    surface_start: int | None = None
+    surface_end: int | None = None
+    phrase_type: str | None = None
+    modifier_text: str | None = None
+    modifier_texts: list = field(default_factory=list)
+    modifier_texts_norm: list = field(default_factory=list)
+    modifier_spans: list = field(default_factory=list)
+    atomic_modifier_spans: list = field(default_factory=list)
 
     # Convert a retained text embedding into a span occurrence record.
     def to_span_occurrence(self):
@@ -249,6 +265,15 @@ class TextEmbedding:
             span_start=self.span_start,
             span_end=self.span_end,
             span_text=span_text,
+            surface_text=self.surface_text or span_text,
+            surface_start=self.surface_start if self.surface_start is not None else self.span_start,
+            surface_end=self.surface_end if self.surface_end is not None else self.span_end,
+            phrase_type=self.phrase_type,
+            modifier_text=self.modifier_text,
+            modifier_texts=list(self.modifier_texts or []),
+            modifier_texts_norm=list(self.modifier_texts_norm or []),
+            modifier_spans=list(self.modifier_spans or []),
+            atomic_modifier_spans=list(self.atomic_modifier_spans or []),
         )
 
 @dataclass
@@ -257,6 +282,15 @@ class SpanOccurrence:
     span_start: int | None = None
     span_end: int | None = None
     span_text: str | None = None
+    surface_text: str | None = None
+    surface_start: int | None = None
+    surface_end: int | None = None
+    phrase_type: str | None = None
+    modifier_text: str | None = None
+    modifier_texts: list = field(default_factory=list)
+    modifier_texts_norm: list = field(default_factory=list)
+    modifier_spans: list = field(default_factory=list)
+    atomic_modifier_spans: list = field(default_factory=list)
 
     # Return the span boundaries when both endpoints are available.
     def get_span_tuple(self):
@@ -306,6 +340,15 @@ class SemNode:
                 span_start=span_occurrence.span_start,
                 span_end=span_occurrence.span_end,
                 span_text=span_occurrence.span_text,
+                surface_text=getattr(span_occurrence, "surface_text", None),
+                surface_start=getattr(span_occurrence, "surface_start", None),
+                surface_end=getattr(span_occurrence, "surface_end", None),
+                phrase_type=getattr(span_occurrence, "phrase_type", None),
+                modifier_text=getattr(span_occurrence, "modifier_text", None),
+                modifier_texts=list(getattr(span_occurrence, "modifier_texts", []) or []),
+                modifier_texts_norm=list(getattr(span_occurrence, "modifier_texts_norm", []) or []),
+                modifier_spans=list(getattr(span_occurrence, "modifier_spans", []) or []),
+                atomic_modifier_spans=list(getattr(span_occurrence, "atomic_modifier_spans", []) or []),
             )
         )
         if edge_weight is not None:
@@ -406,6 +449,7 @@ class LiteSemRAG:
         self.phrase_index = defaultdict(set)
         self.query_token_percentile = query_token_percentile
         self.nlp = None
+        self.phrase_analyzer = None
         self.text_encoder = None
         self.tokenizer = None
         self.encoder_lock = threading.Lock()
@@ -583,8 +627,106 @@ class LiteSemRAG:
         token_node.has_semantic = True
         return new_sem_node
 
+    # Return the runtime phrase analyzer used by indexing.
+    def _get_phrase_analyzer(self):
+        if self.phrase_analyzer is None:
+            self.phrase_analyzer = PhraseAnalyzer(self.nlp)
+        return self.phrase_analyzer
+
+    # Return occurrence metadata for a routed index span.
+    def _build_occurrence_metadata(
+        self,
+        *,
+        phrase_type=None,
+        surface_text=None,
+        surface_start=None,
+        surface_end=None,
+        modifier_texts=None,
+        modifier_texts_norm=None,
+        modifier_spans=None,
+        atomic_modifier_spans=None,
+    ):
+        modifier_texts = list(modifier_texts or [])
+        return {
+            "phrase_type": phrase_type,
+            "surface_text": surface_text,
+            "surface_start": surface_start,
+            "surface_end": surface_end,
+            "modifier_text": " ".join(modifier_texts) if modifier_texts else None,
+            "modifier_texts": modifier_texts,
+            "modifier_texts_norm": list(modifier_texts_norm or []),
+            "modifier_spans": list(modifier_spans or []),
+            "atomic_modifier_spans": list(atomic_modifier_spans or []),
+        }
+
+    # Route compositional phrase spans to their semantic head for indexing.
+    def _prepare_index_phrase_spans(self, chunk_text, phrases):
+        if not phrases:
+            return phrases
+
+        analyzer = self._get_phrase_analyzer()
+        doc = self.nlp(chunk_text)
+        routed_phrases = []
+
+        for phrase, start_char, end_char in phrases:
+            analysis = analyzer.analyze(
+                phrase,
+                chunk_text=chunk_text,
+                span_start=start_char,
+                span_end=end_char,
+                doc=doc,
+            )
+            surface_text = analysis.phrase_text or chunk_text[start_char:end_char]
+
+            if (
+                analysis.phrase_type == PHRASE_TYPE_COMPOSITIONAL
+                and analysis.head_text_norm
+                and analysis.head_start is not None
+                and analysis.head_end is not None
+            ):
+                metadata = self._build_occurrence_metadata(
+                    phrase_type=PHRASE_TYPE_COMPOSITIONAL,
+                    surface_text=surface_text,
+                    surface_start=start_char,
+                    surface_end=end_char,
+                    modifier_texts=analysis.modifier_texts,
+                    modifier_texts_norm=analysis.modifier_texts_norm,
+                    modifier_spans=analysis.modifier_spans,
+                    atomic_modifier_spans=analysis.atomic_modifier_spans,
+                )
+                routed_phrases.append(
+                    (
+                        analysis.head_text_norm,
+                        analysis.head_start,
+                        analysis.head_end,
+                        metadata,
+                    )
+                )
+                continue
+
+            phrase_type = analysis.phrase_type
+            if phrase_type == PHRASE_TYPE_UNKNOWN:
+                phrase_type = PHRASE_TYPE_ATOMIC
+            metadata = self._build_occurrence_metadata(
+                phrase_type=phrase_type,
+                surface_text=surface_text,
+                surface_start=start_char,
+                surface_end=end_char,
+            )
+            routed_phrases.append((phrase, start_char, end_char, metadata))
+
+        return routed_phrases
+
     # Wrap an embedding with chunk and optional span metadata.
-    def _make_text_embedding(self, embed, chunk_node, span_start=None, span_end=None):
+    def _make_text_embedding(
+        self,
+        embed,
+        chunk_node,
+        span_start=None,
+        span_end=None,
+        occurrence_metadata=None,
+    ):
+        occurrence_metadata = occurrence_metadata or {}
         span_text = None
         if span_start is not None and span_end is not None:
             span_text = chunk_node.chunk_text[span_start:span_end]
@@ -594,6 +736,15 @@ class LiteSemRAG:
             span_start=span_start,
             span_end=span_end,
             span_text=span_text,
+            surface_text=occurrence_metadata.get("surface_text") or span_text,
+            surface_start=occurrence_metadata.get("surface_start", span_start),
+            surface_end=occurrence_metadata.get("surface_end", span_end),
+            phrase_type=occurrence_metadata.get("phrase_type"),
+            modifier_text=occurrence_metadata.get("modifier_text"),
+            modifier_texts=list(occurrence_metadata.get("modifier_texts", []) or []),
+            modifier_texts_norm=list(occurrence_metadata.get("modifier_texts_norm", []) or []),
+            modifier_spans=list(occurrence_metadata.get("modifier_spans", []) or []),
+            atomic_modifier_spans=list(occurrence_metadata.get("atomic_modifier_spans", []) or []),
         )
 
     # Record a token occurrence from a text embedding.
@@ -608,6 +759,15 @@ class LiteSemRAG:
             span_start=text_embedding.span_start,
             span_end=text_embedding.span_end,
             span_text=text_embedding.span_text,
+            surface_text=getattr(text_embedding, "surface_text", None),
+            surface_start=getattr(text_embedding, "surface_start", None),
+            surface_end=getattr(text_embedding, "surface_end", None),
+            phrase_type=getattr(text_embedding, "phrase_type", None),
+            modifier_text=getattr(text_embedding, "modifier_text", None),
+            modifier_texts=list(getattr(text_embedding, "modifier_texts", []) or []),
+            modifier_texts_norm=list(getattr(text_embedding, "modifier_texts_norm", []) or []),
+            modifier_spans=list(getattr(text_embedding, "modifier_spans", []) or []),
+            atomic_modifier_spans=list(getattr(text_embedding, "atomic_modifier_spans", []) or []),
         )
 
     # Return cloned retained embeddings, optionally downsampled.
@@ -795,6 +955,8 @@ class LiteSemRAG:
     def _ensure_backward_compatible_attrs(self):
         if getattr(self, "schema_version", None) == CURRENT_SCHEMA_VERSION:
             return
+        if not hasattr(self, "phrase_analyzer"):
+            self.phrase_analyzer = None
         if not hasattr(self, "sem_nodes") and hasattr(self, "proto_nodes"):
             self.sem_nodes = self.proto_nodes
         if not hasattr(self, "next_sem_node_id") and hasattr(self, "next_proto_node_id"):
@@ -883,21 +1045,13 @@ class LiteSemRAG:
         for token_node in getattr(self, "token_nodes", []):
             self._ensure_token_node_backward_compatible_attrs(token_node)
             for text_embedding in getattr(token_node, "embeds_buffer", []):
-                if not hasattr(text_embedding, "span_start"):
-                    text_embedding.span_start = None
-                if not hasattr(text_embedding, "span_end"):
-                    text_embedding.span_end = None
-                if not hasattr(text_embedding, "span_text"):
-                    text_embedding.span_text = None
+                self._ensure_occurrence_metadata_attrs(text_embedding)
+            for span_occurrence in getattr(token_node, "span_occurrences", []):
+                self._ensure_occurrence_metadata_attrs(span_occurrence)
             upgraded_anomaly_section = []
             for item in getattr(token_node, "anomaly_section", []):
                 if isinstance(item, AnomalyTextEmbedding):
-                    if not hasattr(item.text_embedding, "span_start"):
-                        item.text_embedding.span_start = None
-                    if not hasattr(item.text_embedding, "span_end"):
-                        item.text_embedding.span_end = None
-                    if not hasattr(item.text_embedding, "span_text"):
-                        item.text_embedding.span_text = None
+                    self._ensure_occurrence_metadata_attrs(item.text_embedding)
                     upgraded_anomaly_section.append(item)
                     continue
                 if isinstance(item, tuple) and len(item) == 4:
@@ -918,13 +1072,37 @@ class LiteSemRAG:
         for sem_node in getattr(self, "sem_nodes", []):
             self._ensure_sem_node_backward_compatible_attrs(sem_node)
             for text_embedding in sem_node.retained_text_embeddings:
-                if not hasattr(text_embedding, "span_start"):
-                    text_embedding.span_start = None
-                if not hasattr(text_embedding, "span_end"):
-                    text_embedding.span_end = None
-                if not hasattr(text_embedding, "span_text"):
-                    text_embedding.span_text = None
+                self._ensure_occurrence_metadata_attrs(text_embedding)
+            for span_occurrence in getattr(sem_node, "span_occurrences", []):
+                self._ensure_occurrence_metadata_attrs(span_occurrence)
         self.schema_version = CURRENT_SCHEMA_VERSION
+
+    # Populate occurrence metadata fields introduced for modifier-aware indexing.
+    def _ensure_occurrence_metadata_attrs(self, occurrence):
+        if not hasattr(occurrence, "span_start"):
+            occurrence.span_start = None
+        if not hasattr(occurrence, "span_end"):
+            occurrence.span_end = None
+        if not hasattr(occurrence, "span_text"):
+            occurrence.span_text = None
+        if not hasattr(occurrence, "surface_text"):
+            occurrence.surface_text = getattr(occurrence, "span_text", None)
+        if not hasattr(occurrence, "surface_start"):
+            occurrence.surface_start = getattr(occurrence, "span_start", None)
+        if not hasattr(occurrence, "surface_end"):
+            occurrence.surface_end = getattr(occurrence, "span_end", None)
+        if not hasattr(occurrence, "phrase_type"):
+            occurrence.phrase_type = None
+        if not hasattr(occurrence, "modifier_text"):
+            occurrence.modifier_text = None
+        if not hasattr(occurrence, "modifier_texts"):
+            occurrence.modifier_texts = []
+        if not hasattr(occurrence, "modifier_texts_norm"):
+            occurrence.modifier_texts_norm = []
+        if not hasattr(occurrence, "modifier_spans"):
+            occurrence.modifier_spans = []
+        if not hasattr(occurrence, "atomic_modifier_spans"):
+            occurrence.atomic_modifier_spans = []
 
     # Populate missing token fields introduced after older saved graph versions.
     def _ensure_token_node_backward_compatible_attrs(self, token_node):
@@ -2257,6 +2435,15 @@ class LiteSemRAG:
             span_start=start_char,
             span_end=end_char,
             span_text=span_text,
+            surface_text=getattr(span_occurrence, "surface_text", None),
+            surface_start=getattr(span_occurrence, "surface_start", None),
+            surface_end=getattr(span_occurrence, "surface_end", None),
+            phrase_type=getattr(span_occurrence, "phrase_type", None),
+            modifier_text=getattr(span_occurrence, "modifier_text", None),
+            modifier_texts=list(getattr(span_occurrence, "modifier_texts", []) or []),
+            modifier_texts_norm=list(getattr(span_occurrence, "modifier_texts_norm", []) or []),
+            modifier_spans=list(getattr(span_occurrence, "modifier_spans", []) or []),
+            atomic_modifier_spans=list(getattr(span_occurrence, "atomic_modifier_spans", []) or []),
         )
 
     # Rebuild the embedding and threshold for a semantic node created by splitting.
@@ -3036,12 +3223,15 @@ class LiteSemRAG:
 
     # Route extracted token embeddings into buffers, semantic nodes, or anomaly queues.
     def process_embeds(self, new_chunk_node, phrase_embs, token_embs):
-        for text, embed, span_start, span_end in phrase_embs + token_embs:
+        for embed_record in phrase_embs + token_embs:
+            text, embed, span_start, span_end, *metadata = embed_record
+            occurrence_metadata = metadata[0] if metadata else None
             text_embedding = self._make_text_embedding(
                 embed,
                 new_chunk_node,
                 span_start=span_start,
                 span_end=span_end,
+                occurrence_metadata=occurrence_metadata,
             )
             token_node = self.query_token_node(text)
             if token_node is None:
@@ -3091,6 +3281,7 @@ class LiteSemRAG:
             new_chunk_node = self.create_chunk_node(chunk, new_doc_node)
             phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2,
                                                       remove_duplicate=self.remove_duplicate_token)
+            phrases = self._prepare_index_phrase_spans(chunk, phrases)
             phrase_embs, token_embs = get_token_embeds(token_embeddings, offsets, phrases, tokens)
             self.process_embeds(new_chunk_node, phrase_embs, token_embs)
         self.solve_sem_nodes()
@@ -3107,6 +3298,7 @@ class LiteSemRAG:
             futures.append(self.executor.submit(self._encode_chunk_thread_safe, chunk))
             new_chunk_node = self.create_chunk_node(chunk, new_doc_node)
             phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2, remove_duplicate=self.remove_duplicate_token)
+            phrases = self._prepare_index_phrase_spans(chunk, phrases)
             chunk_meta.append((new_chunk_node, phrases, tokens))
 
         for i, future in enumerate(futures):
@@ -3355,6 +3547,7 @@ class LiteSemRAG:
                 min_tokens=2,
                 remove_duplicate=self.remove_duplicate_token
             )
+            phrases = self._prepare_index_phrase_spans(chunk_text, phrases)
 
             chunk_meta.append((new_chunk_node, phrases, tokens, chunk_text))
 
@@ -3891,6 +4084,7 @@ class LiteSemRAG:
             token_match=nlp.tokenizer.token_match,
         )
         self.nlp = nlp
+        self.phrase_analyzer = PhraseAnalyzer(self.nlp)
 
     # Load the tokenizer and transformer text encoder used for embeddings.
     def _load_text_encoder(self):
@@ -3951,6 +4145,7 @@ class LiteSemRAG:
         self.nlp = None
         self.reranker = None
         self.sem_description_model = None
+        self.phrase_analyzer = None
         self.encoder_lock = threading.Lock()
         self._ensure_backward_compatible_attrs()
 
@@ -3966,6 +4161,8 @@ class LiteSemRAG:
             self.encoder_lock = threading.Lock()
         if load_nlp and self.nlp is None:
             self._load_nlp()
+        if self.nlp is not None and self.phrase_analyzer is None:
+            self.phrase_analyzer = PhraseAnalyzer(self.nlp)
         if load_reranker and self.reranker is None:
             self.load_reranker()
         if self.sem_description_model is None:
@@ -4070,6 +4267,15 @@ class LiteSemRAG:
                             "span_start": text_embedding.span_start,
                             "span_end": text_embedding.span_end,
                             "span_text": text_embedding.span_text,
+                            "surface_text": getattr(text_embedding, "surface_text", None),
+                            "surface_start": getattr(text_embedding, "surface_start", None),
+                            "surface_end": getattr(text_embedding, "surface_end", None),
+                            "phrase_type": getattr(text_embedding, "phrase_type", None),
+                            "modifier_text": getattr(text_embedding, "modifier_text", None),
+                            "modifier_texts": list(getattr(text_embedding, "modifier_texts", []) or []),
+                            "modifier_texts_norm": list(getattr(text_embedding, "modifier_texts_norm", []) or []),
+                            "modifier_spans": list(getattr(text_embedding, "modifier_spans", []) or []),
+                            "atomic_modifier_spans": list(getattr(text_embedding, "atomic_modifier_spans", []) or []),
                         }
                         for text_embedding in getattr(p, "retained_text_embeddings", [])
                     ]
@@ -4092,6 +4298,15 @@ class LiteSemRAG:
                         span_start=text_embedding.span_start,
                         span_end=text_embedding.span_end,
                         span_text=text_embedding.span_text,
+                        surface_text=getattr(text_embedding, "surface_text", None),
+                        surface_start=getattr(text_embedding, "surface_start", None),
+                        surface_end=getattr(text_embedding, "surface_end", None),
+                        phrase_type=getattr(text_embedding, "phrase_type", None),
+                        modifier_text=getattr(text_embedding, "modifier_text", None),
+                        modifier_texts=list(getattr(text_embedding, "modifier_texts", []) or []),
+                        modifier_texts_norm=list(getattr(text_embedding, "modifier_texts_norm", []) or []),
+                        modifier_spans=list(getattr(text_embedding, "modifier_spans", []) or []),
+                        atomic_modifier_spans=list(getattr(text_embedding, "atomic_modifier_spans", []) or []),
                     )
                     for text_embedding in getattr(p, "retained_text_embeddings", [])
                 ]
@@ -4166,6 +4381,15 @@ class LiteSemRAG:
                     span_start=item.get("span_start"),
                     span_end=item.get("span_end"),
                     span_text=item.get("span_text"),
+                    surface_text=item.get("surface_text"),
+                    surface_start=item.get("surface_start"),
+                    surface_end=item.get("surface_end"),
+                    phrase_type=item.get("phrase_type"),
+                    modifier_text=item.get("modifier_text"),
+                    modifier_texts=list(item.get("modifier_texts", []) or []),
+                    modifier_texts_norm=list(item.get("modifier_texts_norm", []) or []),
+                    modifier_spans=list(item.get("modifier_spans", []) or []),
+                    atomic_modifier_spans=list(item.get("atomic_modifier_spans", []) or []),
                 )
                 for item in retained_pack
             ]
@@ -4329,6 +4553,7 @@ class LiteSemRAG:
                         remove_duplicate=self.remove_duplicate_token,
                         discard_no_word=self.discard_no_word
                     )
+                    phrases = self._prepare_index_phrase_spans(chunk["text"], phrases)
 
                     if not safe_queue_put(
                         preprocess_queue,

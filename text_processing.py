@@ -638,31 +638,35 @@ def get_token_embeds(token_embeddings, offsets, phrase_list, token_list):
                                                                                                          
                                                                                   
 
-    for phrase, start_char, end_char in phrase_list:
+    for phrase_item in phrase_list:
+        phrase, start_char, end_char, *extra_metadata = phrase_item
         token_idxs = get_token_indices_for_phrase(start_char, end_char, offsets)
         if not token_idxs:
             continue
-        phrase_embs.append(
-            (
-                phrase,
-                token_embeddings[token_idxs].mean(dim=0),
-                start_char,
-                end_char,
-            )
+        phrase_record = (
+            phrase,
+            token_embeddings[token_idxs].mean(dim=0),
+            start_char,
+            end_char,
         )
+        if extra_metadata:
+            phrase_record = phrase_record + (extra_metadata[0],)
+        phrase_embs.append(phrase_record)
 
-    for token, start_char, end_char in token_list:
+    for token_item in token_list:
+        token, start_char, end_char, *extra_metadata = token_item
         token_idxs = get_token_indices_for_phrase(start_char, end_char, offsets)
         if not token_idxs:
             continue
-        token_embs.append(
-            (
-                token,
-                token_embeddings[token_idxs].mean(dim=0),
-                start_char,
-                end_char,
-            )
+        token_record = (
+            token,
+            token_embeddings[token_idxs].mean(dim=0),
+            start_char,
+            end_char,
         )
+        if extra_metadata:
+            token_record = token_record + (extra_metadata[0],)
+        token_embs.append(token_record)
 
     return phrase_embs, token_embs
 
