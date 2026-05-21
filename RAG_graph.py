@@ -36,11 +36,13 @@ from text_processing import (
     get_embed_by_offest,
     get_num_tokens,
     get_token_embeds,
+    normalize_text,
     split_doc,
 )
 from phrase_analysis import (
     PHRASE_TYPE_ATOMIC,
     PHRASE_TYPE_COMPOSITIONAL,
+    PHRASE_TYPE_SINGLE_TOKEN,
     PHRASE_TYPE_UNKNOWN,
     PhraseAnalyzer,
 )
@@ -58,7 +60,7 @@ from utils import (
     sem_embed_sim,
 )
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 4
 RUNTIME_FIELD_NAMES = (
     "text_encoder",
     "tokenizer",
@@ -227,6 +229,14 @@ class TokenNode:
     idf: float = 0
     df: int = 0
     anomaly_section: list = field(default_factory=list)
+    is_placeholder: bool = False
+    compositional_head: object | None = None
+    compositional_head_text: str | None = None
+    compositional_head_text_norm: str | None = None
+    compositional_modifiers: list = field(default_factory=list)
+    compositional_modifier_texts: list = field(default_factory=list)
+    compositional_modifier_texts_norm: list = field(default_factory=list)
+    headed_phrase_records: dict = field(default_factory=dict)
 
     # Initialize optional token metadata after dataclass construction.
     def __post_init__(self):
@@ -415,7 +425,7 @@ class LiteSemRAG:
     # Initialize graph storage, model handles, retrieval settings, and runtime state.
     def __init__(self, text_embed_dim, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
                  anomaly_section_size=50,query_token_percentile=0.8,
-                 retrieve_top_k=5, chunk_size=300, remove_duplicate_token=True, device="cuda",
+                 retrieve_top_k=5, chunk_size=300, device="cuda",
                  discard_no_word=False, plot_embeds=False,
                  sem_description_prompt_context_mode="sentence_neighbors",
                  consensus_ratio_threshold=0.8,
@@ -445,8 +455,8 @@ class LiteSemRAG:
         self.chunk_size = chunk_size
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.start_time = None
-        self.remove_duplicate_token = remove_duplicate_token
         self.phrase_index = defaultdict(set)
+        self.modifier_postings = defaultdict(Counter)
         self.query_token_percentile = query_token_percentile
         self.nlp = None
         self.phrase_analyzer = None
@@ -610,14 +620,27 @@ class LiteSemRAG:
         return new_chunk_node
 
     # Create and register a token or phrase token node.
-    def create_token_node(self, token_text):
+    def create_token_node(self, token_text, is_placeholder=False):
         node_type = 'phrase' if len(token_text.split()) >= 2 else 'token'
         new_token_node = TokenNode(token_text, self._new_node_id("token"), node_type)
+        new_token_node.is_placeholder = bool(is_placeholder)
         self.token_nodes.append(new_token_node)
         if new_token_node.node_type == "phrase":
             self.phrase_token_nodes.append(new_token_node)
         self.token_node_query[token_text] = new_token_node
         return new_token_node
+
+    # Return an existing token node or create one, optionally as a temporary placeholder.
+    def _get_or_create_token_node(self, token_text, is_placeholder=False):
+        token_text = normalize_text(str(token_text).strip())
+        if not token_text:
+            return None
+        token_node = self.query_token_node(token_text)
+        if token_node is None:
+            return self.create_token_node(token_text, is_placeholder=is_placeholder)
+        if not is_placeholder:
+            token_node.is_placeholder = False
+        return token_node
 
     # Create and register a semantic node for a token node.
     def create_sem_node(self, token_node):
@@ -659,7 +682,130 @@ class LiteSemRAG:
             "atomic_modifier_spans": list(atomic_modifier_spans or []),
         }
 
-    # Route compositional phrase spans to their semantic head for indexing.
+    # Attach compositional phrase/head/modifier relation metadata to token nodes.
+    def _register_compositional_phrase_relation(self, phrase_token_node, occurrence_metadata, chunk_node):
+        if not occurrence_metadata:
+            return
+        if occurrence_metadata.get("compositional_role") != "phrase":
+            return
+        head_text_norm = normalize_text(occurrence_metadata.get("head_text_norm") or "")
+        if not head_text_norm:
+            return
+
+        head_node = self._get_or_create_token_node(head_text_norm, is_placeholder=True)
+        modifier_texts = list(occurrence_metadata.get("modifier_texts", []) or [])
+        modifier_texts_norm = [
+            normalize_text(modifier)
+            for modifier in list(occurrence_metadata.get("modifier_texts_norm", []) or [])
+            if normalize_text(modifier)
+        ]
+        modifier_nodes = [
+            self._get_or_create_token_node(modifier, is_placeholder=True)
+            for modifier in modifier_texts_norm
+        ]
+        modifier_nodes = [node for node in modifier_nodes if node is not None]
+
+        phrase_token_node.compositional_head = head_node
+        phrase_token_node.compositional_head_text = occurrence_metadata.get("head_text")
+        phrase_token_node.compositional_head_text_norm = head_text_norm
+        phrase_token_node.compositional_modifiers = modifier_nodes
+        phrase_token_node.compositional_modifier_texts = modifier_texts
+        phrase_token_node.compositional_modifier_texts_norm = modifier_texts_norm
+
+        if head_node is None:
+            return
+        record_key = normalize_text(phrase_token_node.token_text)
+        record = head_node.headed_phrase_records.setdefault(
+            record_key,
+            {
+                "phrase_token_node": phrase_token_node,
+                "phrase_text": phrase_token_node.token_text,
+                "count": 0,
+                "occurrences": [],
+            },
+        )
+        record["phrase_token_node"] = phrase_token_node
+        record["phrase_text"] = phrase_token_node.token_text
+        record["count"] = int(record.get("count", 0)) + 1
+        record.setdefault("occurrences", []).append(
+            {
+                "chunk_node": chunk_node,
+                "chunk_node_id": getattr(chunk_node, "chunk_node_id", None),
+                "chunk_text": getattr(chunk_node, "chunk_text", None),
+                "surface_text": occurrence_metadata.get("surface_text"),
+                "surface_start": occurrence_metadata.get("surface_start"),
+                "surface_end": occurrence_metadata.get("surface_end"),
+                "head_text": occurrence_metadata.get("head_text"),
+                "head_text_norm": head_text_norm,
+                "head_start": occurrence_metadata.get("head_start"),
+                "head_end": occurrence_metadata.get("head_end"),
+                "modifier_texts": modifier_texts,
+                "modifier_texts_norm": modifier_texts_norm,
+            }
+        )
+
+    # Return True when a placeholder node has no indexed evidence and can be removed.
+    def _is_empty_placeholder_token_node(self, token_node):
+        return (
+            bool(getattr(token_node, "is_placeholder", False))
+            and not getattr(token_node, "has_semantic", False)
+            and not getattr(token_node, "sem_node_list", [])
+            and not getattr(token_node, "embeds_buffer", [])
+            and not getattr(token_node, "span_occurrences", [])
+            and not getattr(token_node, "anomaly_section", [])
+        )
+
+    # Remove modifier-only placeholder token nodes from global token indexes.
+    def _cleanup_empty_placeholder_token_nodes(self):
+        removed_nodes = [
+            token_node
+            for token_node in self.token_nodes
+            if self._is_empty_placeholder_token_node(token_node)
+        ]
+        if not removed_nodes:
+            return 0
+        removed_ids = {id(token_node) for token_node in removed_nodes}
+
+        self.token_nodes = [
+            token_node for token_node in self.token_nodes
+            if id(token_node) not in removed_ids
+        ]
+        self.phrase_token_nodes = [
+            token_node for token_node in self.phrase_token_nodes
+            if id(token_node) not in removed_ids
+        ]
+        self.token_node_query = {
+            token_text: token_node
+            for token_text, token_node in self.token_node_query.items()
+            if id(token_node) not in removed_ids
+        }
+        self.build_sem_node_waitlist = [
+            token_node for token_node in self.build_sem_node_waitlist
+            if id(token_node) not in removed_ids
+        ]
+        self.anomaly_waitlist = [
+            token_node for token_node in self.anomaly_waitlist
+            if id(token_node) not in removed_ids
+        ]
+
+        for token_node in self.token_nodes:
+            if id(getattr(token_node, "compositional_head", None)) in removed_ids:
+                token_node.compositional_head = None
+            token_node.compositional_modifiers = [
+                modifier_node
+                for modifier_node in getattr(token_node, "compositional_modifiers", []) or []
+                if id(modifier_node) not in removed_ids
+            ]
+            for record in getattr(token_node, "headed_phrase_records", {}).values():
+                if id(record.get("phrase_token_node")) in removed_ids:
+                    record["phrase_token_node"] = None
+
+        for index, token_node in enumerate(self.token_nodes):
+            token_node.token_node_id = index
+        self.next_token_node_id = len(self.token_nodes)
+        return len(removed_nodes)
+
+    # Route compositional phrase spans to both the full phrase and semantic head for indexing.
     def _prepare_index_phrase_spans(self, chunk_text, phrases):
         if not phrases:
             return phrases
@@ -684,7 +830,7 @@ class LiteSemRAG:
                 and analysis.head_start is not None
                 and analysis.head_end is not None
             ):
-                metadata = self._build_occurrence_metadata(
+                phrase_metadata = self._build_occurrence_metadata(
                     phrase_type=PHRASE_TYPE_COMPOSITIONAL,
                     surface_text=surface_text,
                     surface_start=start_char,
@@ -694,12 +840,24 @@ class LiteSemRAG:
                     modifier_spans=analysis.modifier_spans,
                     atomic_modifier_spans=analysis.atomic_modifier_spans,
                 )
+                phrase_metadata.update(
+                    {
+                        "compositional_role": "phrase",
+                        "head_text": analysis.head_text,
+                        "head_text_norm": analysis.head_text_norm,
+                        "head_start": analysis.head_start,
+                        "head_end": analysis.head_end,
+                    }
+                )
+                routed_phrases.append((phrase, start_char, end_char, phrase_metadata))
+                head_metadata = dict(phrase_metadata)
+                head_metadata["compositional_role"] = "head"
                 routed_phrases.append(
                     (
                         analysis.head_text_norm,
                         analysis.head_start,
                         analysis.head_end,
-                        metadata,
+                        head_metadata,
                     )
                 )
                 continue
@@ -957,6 +1115,16 @@ class LiteSemRAG:
             return
         if not hasattr(self, "phrase_analyzer"):
             self.phrase_analyzer = None
+        if not hasattr(self, "modifier_postings"):
+            self.modifier_postings = defaultdict(Counter)
+        elif not isinstance(self.modifier_postings, defaultdict):
+            self.modifier_postings = defaultdict(
+                Counter,
+                {
+                    key: Counter(value)
+                    for key, value in self.modifier_postings.items()
+                },
+            )
         if not hasattr(self, "sem_nodes") and hasattr(self, "proto_nodes"):
             self.sem_nodes = self.proto_nodes
         if not hasattr(self, "next_sem_node_id") and hasattr(self, "next_proto_node_id"):
@@ -993,8 +1161,6 @@ class LiteSemRAG:
             self.sem_description_model_name = self.proto_description_model_name
         if not hasattr(self, "sem_description_model") and hasattr(self, "proto_description_model"):
             self.sem_description_model = self.proto_description_model
-        if not hasattr(self, "remove_duplicate_token"):
-            self.remove_duplicate_token = True
         if not hasattr(self, "discard_no_word"):
             self.discard_no_word = False
         if not hasattr(self, "plot_embeds"):
@@ -1118,6 +1284,22 @@ class LiteSemRAG:
             token_node.wikidata_info_loaded = None
         if not hasattr(token_node, "span_occurrences"):
             token_node.span_occurrences = []
+        if not hasattr(token_node, "is_placeholder"):
+            token_node.is_placeholder = False
+        if not hasattr(token_node, "compositional_head"):
+            token_node.compositional_head = None
+        if not hasattr(token_node, "compositional_head_text"):
+            token_node.compositional_head_text = None
+        if not hasattr(token_node, "compositional_head_text_norm"):
+            token_node.compositional_head_text_norm = None
+        if not hasattr(token_node, "compositional_modifiers"):
+            token_node.compositional_modifiers = []
+        if not hasattr(token_node, "compositional_modifier_texts"):
+            token_node.compositional_modifier_texts = []
+        if not hasattr(token_node, "compositional_modifier_texts_norm"):
+            token_node.compositional_modifier_texts_norm = []
+        if not hasattr(token_node, "headed_phrase_records"):
+            token_node.headed_phrase_records = {}
 
     # Populate missing semantic-node fields introduced after older saved graph versions.
     def _ensure_sem_node_backward_compatible_attrs(self, sem_node):
@@ -1137,7 +1319,6 @@ class LiteSemRAG:
         self,
         chunk,
         min_tokens=2,
-        remove_duplicate=None,
         discard_no_word=None,
         debug_mode=True,
         clean_input=False,
@@ -1146,9 +1327,6 @@ class LiteSemRAG:
 
         if self.nlp is None:
             self._load_nlp()
-
-        if remove_duplicate is None:
-            remove_duplicate = getattr(self, "remove_duplicate_token", True)
 
         if discard_no_word is None:
             discard_no_word = getattr(self, "discard_no_word", False)
@@ -1160,7 +1338,6 @@ class LiteSemRAG:
             chunk,
             self.nlp,
             min_tokens=min_tokens,
-            remove_duplicate=remove_duplicate,
             discard_no_word=discard_no_word,
             debug_mode=debug_mode,
         )
@@ -1184,17 +1361,196 @@ class LiteSemRAG:
         database = torch.stack(embeds_list).to(self.device)
         self.query_database = F.normalize(database, dim=1)
 
+    # Rebuild modifier-head postings from final semantic-node span occurrences.
+    def build_modifier_postings(self):
+        self.modifier_postings = defaultdict(Counter)
+        for sem_node in self.sem_nodes:
+            head = normalize_text(getattr(sem_node.token_node, "token_text", ""))
+            if not head:
+                continue
+            for occurrence in getattr(sem_node, "span_occurrences", []) or []:
+                for modifier in self._get_posting_modifier_units_norm(occurrence):
+                    if modifier:
+                        self.modifier_postings[(head, modifier)][sem_node.sem_node_id] += 1
+        return self.modifier_postings
+
+    # Return modifier postings as plain dictionaries for inspection or export.
+    def get_modifier_postings(self):
+        return {
+            key: dict(value)
+            for key, value in self.modifier_postings.items()
+        }
+
+    # Return modifier units for a compositional phrase analysis.
+    def _get_query_modifier_units(self, analysis):
+        atomic_spans = list(getattr(analysis, "atomic_modifier_spans", []) or [])
+        modifier_spans = list(getattr(analysis, "modifier_spans", []) or [])
+        modifier_texts = list(getattr(analysis, "modifier_texts", []) or [])
+        modifier_texts_norm = list(getattr(analysis, "modifier_texts_norm", []) or [])
+
+        atomic_ranges = []
+        modifier_units = []
+        modifier_units_norm = []
+
+        for atomic_span in atomic_spans:
+            text = str(atomic_span.get("text", "")).strip()
+            text_norm = normalize_text(atomic_span.get("text_norm") or text)
+            if not text_norm:
+                continue
+            modifier_units.append(text or text_norm)
+            modifier_units_norm.append(text_norm)
+            start = atomic_span.get("start")
+            end = atomic_span.get("end")
+            if start is not None and end is not None:
+                atomic_ranges.append((start, end))
+
+        for idx, text_norm in enumerate(modifier_texts_norm):
+            text_norm = normalize_text(text_norm)
+            if not text_norm:
+                continue
+            span = modifier_spans[idx] if idx < len(modifier_spans) else None
+            if span is not None:
+                start, end = span
+                if any(start >= atomic_start and end <= atomic_end for atomic_start, atomic_end in atomic_ranges):
+                    continue
+            text = modifier_texts[idx] if idx < len(modifier_texts) else text_norm
+            modifier_units.append(text)
+            modifier_units_norm.append(text_norm)
+
+        deduped_units = []
+        deduped_units_norm = []
+        seen = set()
+        for text, text_norm in zip(modifier_units, modifier_units_norm):
+            if text_norm in seen:
+                continue
+            seen.add(text_norm)
+            deduped_units.append(text)
+            deduped_units_norm.append(text_norm)
+        return deduped_units, deduped_units_norm
+
+    # Return True when a token span is fully covered by any query phrase span.
+    def _query_span_is_covered(self, start_char, end_char, covered_spans):
+        return any(start_char >= span_start and end_char <= span_end for span_start, span_end in covered_spans)
+
+    # Build a query-unit record used by exact, fuzzy, and similarity matching.
+    def _make_query_unit(
+        self,
+        *,
+        token_type,
+        search_key,
+        embedding_span_text,
+        embedding_start,
+        embedding_end,
+        query_surface=None,
+        surface_start=None,
+        surface_end=None,
+        phrase_type=None,
+        query_modifiers=None,
+        query_modifiers_norm=None,
+    ):
+        query_surface = query_surface or search_key
+        return {
+            "token_type": token_type,
+            "token": search_key,
+            "search_key": search_key,
+            "embedding_span_text": embedding_span_text,
+            "embedding_start": embedding_start,
+            "embedding_end": embedding_end,
+            "query_surface": query_surface,
+            "query_surface_norm": normalize_text(query_surface),
+            "surface_start": surface_start if surface_start is not None else embedding_start,
+            "surface_end": surface_end if surface_end is not None else embedding_end,
+            "phrase_type": phrase_type,
+            "query_modifiers": list(query_modifiers or []),
+            "query_modifiers_norm": [
+                normalize_text(modifier)
+                for modifier in list(query_modifiers_norm or [])
+                if normalize_text(modifier)
+            ],
+        }
+
     # Clean a query and extract token, phrase, and entity embeddings for matching.
     def _prepare_query_tokens(self, query_text, print_important_tokens=False):
         query_text = clean_text(query_text)
         token_embeddings, offsets = encode_text(query_text, self.text_encoder, self.tokenizer, self.device)
         important_phrases, num_ents = extract_important_phrases(query_text, self.nlp)
         important_tokens = extract_important_tokens(query_text, self.nlp)
-        tokens_for_processing = (
+        tokens_for_processing = []
+        covered_compositional_spans = []
+        analyzer = self._get_phrase_analyzer()
+        doc = self.nlp(query_text)
+
+        phrase_items = (
             [("ent", phrase, start_char, end_char) for phrase, start_char, end_char in important_phrases[:num_ents]] +
-            [("phrase", phrase, start_char, end_char) for phrase, start_char, end_char in important_phrases[num_ents:]] +
-            [("token", token, start_char, end_char) for token, start_char, end_char in important_tokens]
+            [("phrase", phrase, start_char, end_char) for phrase, start_char, end_char in important_phrases[num_ents:]]
         )
+        for token_type, phrase, start_char, end_char in phrase_items:
+            analysis = analyzer.analyze(
+                phrase,
+                chunk_text=query_text,
+                span_start=start_char,
+                span_end=end_char,
+                doc=doc,
+            )
+            query_surface = analysis.phrase_text or query_text[start_char:end_char]
+            if (
+                analysis.phrase_type == PHRASE_TYPE_COMPOSITIONAL
+                and analysis.head_text_norm
+                and analysis.head_start is not None
+                and analysis.head_end is not None
+            ):
+                modifier_units, modifier_units_norm = self._get_query_modifier_units(analysis)
+                tokens_for_processing.append(
+                    self._make_query_unit(
+                        token_type=token_type,
+                        search_key=analysis.head_text_norm,
+                        embedding_span_text=analysis.head_text_norm,
+                        embedding_start=analysis.head_start,
+                        embedding_end=analysis.head_end,
+                        query_surface=query_surface,
+                        surface_start=start_char,
+                        surface_end=end_char,
+                        phrase_type=PHRASE_TYPE_COMPOSITIONAL,
+                        query_modifiers=modifier_units,
+                        query_modifiers_norm=modifier_units_norm,
+                    )
+                )
+                covered_compositional_spans.append((start_char, end_char))
+                continue
+
+            phrase_type = analysis.phrase_type
+            if phrase_type == PHRASE_TYPE_UNKNOWN:
+                phrase_type = PHRASE_TYPE_ATOMIC
+            tokens_for_processing.append(
+                self._make_query_unit(
+                    token_type=token_type,
+                    search_key=phrase,
+                    embedding_span_text=phrase,
+                    embedding_start=start_char,
+                    embedding_end=end_char,
+                    query_surface=query_surface,
+                    surface_start=start_char,
+                    surface_end=end_char,
+                    phrase_type=phrase_type,
+                )
+            )
+
+        for token, start_char, end_char in important_tokens:
+            if self._query_span_is_covered(start_char, end_char, covered_compositional_spans):
+                continue
+            tokens_for_processing.append(
+                self._make_query_unit(
+                    token_type="token",
+                    search_key=token,
+                    embedding_span_text=token,
+                    embedding_start=start_char,
+                    embedding_end=end_char,
+                    query_surface=query_text[start_char:end_char],
+                    surface_start=start_char,
+                    surface_end=end_char,
+                    phrase_type=PHRASE_TYPE_SINGLE_TOKEN,
+                )
+            )
 
         if print_important_tokens:
             print(f"important ents: {[text for text, _, _ in important_phrases[:num_ents]]}")
@@ -1213,11 +1569,21 @@ class LiteSemRAG:
         tokens_in_phrase = []
         resolved_matches = []
 
-        for token_type, token, start_char, end_char in tokens_for_processing:
+        for query_unit in tokens_for_processing:
+            token_type = query_unit["token_type"]
+            token = query_unit["search_key"]
             if token_type == "token" and token in tokens_in_phrase:
                 continue
 
-            token_embed = get_embed_by_offest(token_embeddings, offsets, (token, start_char, end_char))
+            token_embed = get_embed_by_offest(
+                token_embeddings,
+                offsets,
+                (
+                    query_unit["embedding_span_text"],
+                    query_unit["embedding_start"],
+                    query_unit["embedding_end"],
+                ),
+            )
             token_node = self.query_token_node(token)
             exact_sem_node = None
             fuzzy_sem_nodes = []
@@ -1231,7 +1597,10 @@ class LiteSemRAG:
                 if token_type in {"phrase", "ent"} and search_mode != "broad":
                     tokens_in_phrase.extend(token.split(" "))
 
-            fuzzy_query_list = self.phrase_word_intersection_query(token)
+            if query_unit["phrase_type"] == PHRASE_TYPE_COMPOSITIONAL:
+                fuzzy_query_list = []
+            else:
+                fuzzy_query_list = self.phrase_word_intersection_query(token)
             if fuzzy_query_list:
                 fuzzy_sem_nodes = self.max_cosine_sem_nodes(token_embed, fuzzy_query_list, k=2)
 
@@ -1247,6 +1616,12 @@ class LiteSemRAG:
             resolved_matches.append({
                 "token_type": token_type,
                 "token": token,
+                "query_unit": query_unit,
+                "query_surface": query_unit["query_surface"],
+                "query_surface_norm": query_unit["query_surface_norm"],
+                "phrase_type": query_unit["phrase_type"],
+                "query_modifiers": list(query_unit["query_modifiers"]),
+                "query_modifiers_norm": list(query_unit["query_modifiers_norm"]),
                 "token_embed": token_embed,
                 "exact_sem_node": exact_sem_node,
                 "fuzzy_sem_nodes": fuzzy_sem_nodes,
@@ -1255,6 +1630,148 @@ class LiteSemRAG:
             })
 
         return query_text, query_tokens, resolved_matches
+
+    # Return the semantic-node candidates associated with one resolved query match.
+    def _get_match_sem_nodes(self, match):
+        sem_nodes = []
+        if match.get("exact_sem_node") is not None:
+            sem_nodes.append(match["exact_sem_node"])
+        sem_nodes.extend(match.get("fuzzy_sem_nodes") or [])
+        if match.get("retrieved_sem") is not None:
+            sem_nodes.append(match["retrieved_sem"])
+
+        deduped = []
+        seen = set()
+        for sem_node in sem_nodes:
+            key = id(sem_node)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(sem_node)
+        return deduped
+
+    # Normalize all modifier strings stored on an occurrence.
+    def _get_occurrence_modifier_units_norm(self, occurrence):
+        modifier_units = []
+        modifier_units.extend(getattr(occurrence, "modifier_texts_norm", []) or [])
+        modifier_text = getattr(occurrence, "modifier_text", None)
+        if modifier_text:
+            modifier_units.append(modifier_text)
+        for atomic_span in getattr(occurrence, "atomic_modifier_spans", []) or []:
+            if isinstance(atomic_span, dict):
+                modifier_units.append(atomic_span.get("text_norm") or atomic_span.get("text") or "")
+
+        deduped = []
+        seen = set()
+        for modifier in modifier_units:
+            modifier_norm = normalize_text(str(modifier).strip())
+            if not modifier_norm or modifier_norm in seen:
+                continue
+            seen.add(modifier_norm)
+            deduped.append(modifier_norm)
+        return deduped
+
+    # Normalize modifier strings used as modifier-posting keys.
+    def _get_posting_modifier_units_norm(self, occurrence):
+        modifier_units = list(getattr(occurrence, "modifier_texts_norm", []) or [])
+        if not modifier_units and getattr(occurrence, "modifier_text", None):
+            modifier_units.append(occurrence.modifier_text)
+        for atomic_span in getattr(occurrence, "atomic_modifier_spans", []) or []:
+            if isinstance(atomic_span, dict):
+                modifier_units.append(atomic_span.get("text_norm") or atomic_span.get("text") or "")
+
+        deduped = []
+        seen = set()
+        for modifier in modifier_units:
+            modifier_norm = normalize_text(str(modifier).strip())
+            if not modifier_norm or modifier_norm in seen:
+                continue
+            seen.add(modifier_norm)
+            deduped.append(modifier_norm)
+        return deduped
+
+    # Score one occurrence against query modifiers without filtering non-matches.
+    def _modifier_boost_for_occurrence(self, occurrence, match):
+        query_modifiers = [
+            normalize_text(modifier)
+            for modifier in match.get("query_modifiers_norm", [])
+            if normalize_text(modifier)
+        ]
+        if not query_modifiers:
+            return 0.0
+
+        boost = 0.0
+        query_surface = match.get("query_surface_norm") or normalize_text(match.get("query_surface", ""))
+        occurrence_surface = normalize_text(
+            getattr(occurrence, "surface_text", None)
+            or getattr(occurrence, "span_text", None)
+            or ""
+        )
+        if query_surface and occurrence_surface == query_surface:
+            boost = max(boost, 0.5)
+
+        occurrence_modifiers = self._get_occurrence_modifier_units_norm(occurrence)
+        occurrence_modifier_set = set(occurrence_modifiers)
+        if occurrence_modifier_set and all(modifier in occurrence_modifier_set for modifier in query_modifiers):
+            boost = max(boost, 0.3)
+        else:
+            occurrence_modifier_tokens = set()
+            for modifier in occurrence_modifiers:
+                occurrence_modifier_tokens.update(modifier.split())
+            query_modifier_tokens = set()
+            for modifier in query_modifiers:
+                query_modifier_tokens.update(modifier.split())
+
+            if occurrence_modifier_tokens and query_modifier_tokens:
+                overlap_ratio = len(query_modifier_tokens & occurrence_modifier_tokens) / len(query_modifier_tokens)
+                if overlap_ratio >= 1.0:
+                    boost = max(boost, 0.3)
+                elif overlap_ratio > 0:
+                    boost = max(boost, 0.1 + 0.1 * overlap_ratio)
+
+        return boost
+
+    # Compute the best modifier boost per chunk for the semantic nodes selected by the query.
+    def _score_chunk_modifier_boosts(self, resolved_matches):
+        chunk_boosts = defaultdict(float)
+        for match in resolved_matches:
+            if match.get("phrase_type") != PHRASE_TYPE_COMPOSITIONAL:
+                continue
+            if not match.get("query_modifiers_norm"):
+                continue
+            for sem_node in self._get_match_sem_nodes(match):
+                span_occurrences = list(getattr(sem_node, "span_occurrences", []) or [])
+                for occurrence in span_occurrences:
+                    chunk_node = getattr(occurrence, "chunk_node", None)
+                    if chunk_node is None:
+                        continue
+                    boost = self._modifier_boost_for_occurrence(occurrence, match)
+                    if boost > chunk_boosts[chunk_node.chunk_node_id]:
+                        chunk_boosts[chunk_node.chunk_node_id] = boost
+        return dict(chunk_boosts)
+
+    # Apply modifier boosts to scored chunk candidates while preserving base order on ties.
+    def _apply_modifier_boost_to_scored_chunks(self, scored_chunks, modifier_boosts):
+        boosted_chunks = [
+            (chunk_id, score * (1.0 + modifier_boosts.get(chunk_id, 0.0)))
+            for chunk_id, score in scored_chunks
+        ]
+        return sorted(boosted_chunks, key=lambda item: item[1], reverse=True)
+
+    # Rerank chunk id lists by modifier boost with stable fallback to the original order.
+    def _apply_modifier_boost_to_chunk_ids(self, chunk_ids, modifier_boosts):
+        return sorted(
+            chunk_ids,
+            key=lambda chunk_id: modifier_boosts.get(chunk_id, 0.0),
+            reverse=True,
+        )
+
+    # Rerank grouped BM25 chunk lists by modifier boost with stable fallback order.
+    def _apply_modifier_boost_to_ranked_groups(self, ranked_groups, modifier_boosts):
+        return [
+            self._apply_modifier_boost_to_chunk_ids(group, modifier_boosts)
+            for group in ranked_groups
+        ]
 
     # Retrieve and rerank chunks for a query using broad semantic-node matching.
     def broad_search_query(self, query_text, top_k=10,candidate=30):
@@ -1279,6 +1796,12 @@ class LiteSemRAG:
             for chunk_node in sem_node.chunk_node_list:
                 retrieved_chunk_ids.append(chunk_node.chunk_node_id)
         retrieved_chunk_ids = list(dict.fromkeys(retrieved_chunk_ids))
+        modifier_boosts = self._score_chunk_modifier_boosts(resolved_matches)
+        if modifier_boosts:
+            retrieved_chunk_ids = self._apply_modifier_boost_to_chunk_ids(
+                retrieved_chunk_ids,
+                modifier_boosts,
+            )
         candidate_chunk_ids = retrieved_chunk_ids[:candidate]
         retrieved_chunks = self.chunk_id2text(candidate_chunk_ids)
         if self.reranker is None:
@@ -1351,6 +1874,16 @@ class LiteSemRAG:
         co_occurrence_graph.assign_chunk_weight(self.chunk_avg_len,print_important_tokens)
         co_occurrence_graph.rank_sem_node()
         co_occurrence_graph.rank_chunk_by_BM25()
+        modifier_boosts = self._score_chunk_modifier_boosts(resolved_matches)
+        if modifier_boosts:
+            co_occurrence_graph.weighted_chunk_node_list = self._apply_modifier_boost_to_scored_chunks(
+                co_occurrence_graph.weighted_chunk_node_list,
+                modifier_boosts,
+            )
+            co_occurrence_graph.ranked_chunk_BM25 = self._apply_modifier_boost_to_ranked_groups(
+                co_occurrence_graph.ranked_chunk_BM25,
+                modifier_boosts,
+            )
 
         isolated_quota = math.floor(top_k_chunk * isolate_chunk_ratio)
         connected_quota = top_k_chunk - isolated_quota
@@ -1442,6 +1975,9 @@ class LiteSemRAG:
             raise ValueError("Cannot finalize an empty graph: no chunk nodes have been indexed.")
         self._recompute_chunk_avg_len()
         self.log_time("Computed average chunk length.")
+        removed_placeholder_count = self._cleanup_empty_placeholder_token_nodes()
+        if removed_placeholder_count:
+            self.log_time(f"Removed {removed_placeholder_count} empty placeholder token nodes.")
         self.finalize_token_nodes()
         self.log_time("Finished token node finalization.")
 
@@ -1449,6 +1985,8 @@ class LiteSemRAG:
         self.log_time("Finished merging sem nodes by description.")
         if not self.sem_nodes:
             raise ValueError("Cannot finalize graph: no semantic nodes were created.")
+        self.build_modifier_postings()
+        self.log_time("Finished building modifier postings.")
         for token_node in self.token_nodes:
             self.assign_idf(token_node)
         self.log_time("Finished assigning token and sem IDF.")
@@ -3145,7 +3683,7 @@ class LiteSemRAG:
         skip_field_names = set(RUNTIME_FIELD_NAMES) | {
             "doc_nodes", "chunk_nodes", "token_nodes", "phrase_token_nodes", "sem_nodes",
             "build_sem_node_waitlist", "anomaly_waitlist",
-            "token_node_query", "phrase_index", "query_database",
+            "token_node_query", "phrase_index", "modifier_postings", "query_database",
             "predicted_sem_description_logs", "deleted_merged_sem_logs",
             "sem_description_operation_logs", "wikidata_no_result_logs",
             "_wikidata_no_result_keys", "_sem_description_candidate_bank_cache",
@@ -3233,9 +3771,15 @@ class LiteSemRAG:
                 span_end=span_end,
                 occurrence_metadata=occurrence_metadata,
             )
-            token_node = self.query_token_node(text)
+            token_node = self._get_or_create_token_node(text, is_placeholder=False)
             if token_node is None:
-                token_node = self.create_token_node(text)
+                continue
+            self._register_compositional_phrase_relation(
+                token_node,
+                occurrence_metadata,
+                new_chunk_node,
+            )
+            if not token_node.embeds_buffer and not token_node.has_semantic:
                 token_node.embeds_buffer.append(text_embedding)
             else:
                 if token_node.has_semantic:
@@ -3279,13 +3823,13 @@ class LiteSemRAG:
         token_embeddings_list, offsets_list = encode_chunk_batch(chunk_list, self.text_encoder, self.tokenizer, self.device)
         for chunk, token_embeddings, offsets in zip(chunk_list, token_embeddings_list, offsets_list):
             new_chunk_node = self.create_chunk_node(chunk, new_doc_node)
-            phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2,
-                                                      remove_duplicate=self.remove_duplicate_token)
+            phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2)
             phrases = self._prepare_index_phrase_spans(chunk, phrases)
             phrase_embs, token_embs = get_token_embeds(token_embeddings, offsets, phrases, tokens)
             self.process_embeds(new_chunk_node, phrase_embs, token_embs)
         self.solve_sem_nodes()
         self.solve_anomaly()
+        self.build_modifier_postings()
 
     # Index one document by submitting chunk encoding work to the thread executor.
     def index_document_threaded(self, doc_name):
@@ -3297,7 +3841,7 @@ class LiteSemRAG:
         for chunk in chunk_list:
             futures.append(self.executor.submit(self._encode_chunk_thread_safe, chunk))
             new_chunk_node = self.create_chunk_node(chunk, new_doc_node)
-            phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2, remove_duplicate=self.remove_duplicate_token)
+            phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2)
             phrases = self._prepare_index_phrase_spans(chunk, phrases)
             chunk_meta.append((new_chunk_node, phrases, tokens))
 
@@ -3314,6 +3858,7 @@ class LiteSemRAG:
             self.process_embeds(node, phrase_embs, token_embs)
         self.solve_sem_nodes()
         self.solve_anomaly()
+        self.build_modifier_postings()
 
     # Backward-compatible name for the threaded indexing implementation.
     def index_document_multi_processing(self, doc_name):
@@ -3459,6 +4004,17 @@ class LiteSemRAG:
                 item for item in token_node.span_occurrences
                 if id(item.chunk_node) in valid_chunk_ids
             ]
+            for record_key, record in list(getattr(token_node, "headed_phrase_records", {}).items()):
+                occurrences = [
+                    occurrence
+                    for occurrence in record.get("occurrences", [])
+                    if id(occurrence.get("chunk_node")) in valid_chunk_ids
+                ]
+                if not occurrences:
+                    del token_node.headed_phrase_records[record_key]
+                    continue
+                record["occurrences"] = occurrences
+                record["count"] = len(occurrences)
             if token_node.has_semantic or token_node.embeds_buffer or token_node.anomaly_section:
                 valid_token_nodes.append(token_node)
                 token_node_query[token_node.token_text] = token_node
@@ -3471,6 +4027,7 @@ class LiteSemRAG:
         self.next_token_node_id = len(self.token_nodes)
         self.token_node_query = token_node_query
         self.phrase_token_nodes = phrase_token_nodes
+        self._cleanup_empty_placeholder_token_nodes()
 
         self.build_sem_node_waitlist = [
             token_node for token_node in self.build_sem_node_waitlist
@@ -3498,6 +4055,7 @@ class LiteSemRAG:
         self.build_chunk2sem_edge()
         self.phrase_index = defaultdict(set)
         self.build_phrase_query()
+        self.build_modifier_postings()
 
         if self.sem_nodes:
             self.build_query_database()
@@ -3532,6 +4090,7 @@ class LiteSemRAG:
 
             self.solve_sem_nodes()
             self.solve_anomaly()
+            self.build_modifier_postings()
             self.log_time(
                 f"File {doc_name} completed. Index time: {time.perf_counter() - document_start_time:.4f}s"
             )
@@ -3544,8 +4103,7 @@ class LiteSemRAG:
             phrases, tokens = extract_important_spans(
                 chunk_text,
                 self.nlp,
-                min_tokens=2,
-                remove_duplicate=self.remove_duplicate_token
+                min_tokens=2
             )
             phrases = self._prepare_index_phrase_spans(chunk_text, phrases)
 
@@ -3619,6 +4177,7 @@ class LiteSemRAG:
 
         self.solve_sem_nodes()
         self.solve_anomaly()
+        self.build_modifier_postings()
         self.log_time(
             f"File {doc_name} completed. Index time: {time.perf_counter() - document_start_time:.4f}s"
         )
@@ -4184,6 +4743,7 @@ class LiteSemRAG:
         with open(path, "rb") as f:
             obj= pickle.load(f)
         obj._restore_runtime_components(load_nlp=True, load_reranker=False)
+        obj.build_modifier_postings()
         return obj
 
     # Snapshot object references before temporary ID conversion for split serialization.
@@ -4211,7 +4771,22 @@ class LiteSemRAG:
                 for sem_node in self.sem_nodes
             ],
             "tokens": [
-                (token_node, list(token_node.sem_node_list))
+                (
+                    token_node,
+                    list(token_node.sem_node_list),
+                    getattr(token_node, "compositional_head", None),
+                    list(getattr(token_node, "compositional_modifiers", []) or []),
+                    {
+                        key: (
+                            record.get("phrase_token_node"),
+                            [
+                                (occurrence, occurrence.get("chunk_node"))
+                                for occurrence in record.get("occurrences", [])
+                            ],
+                        )
+                        for key, record in getattr(token_node, "headed_phrase_records", {}).items()
+                    },
+                )
                 for token_node in self.token_nodes
             ],
         }
@@ -4229,8 +4804,17 @@ class LiteSemRAG:
             sem_node.retained_text_embeddings = retained_list
             for text_embedding, chunk_node in retained_refs:
                 text_embedding.chunk_node = chunk_node
-        for token_node, sem_node_list in snapshot["tokens"]:
+        for token_node, sem_node_list, compositional_head, compositional_modifiers, headed_refs in snapshot["tokens"]:
             token_node.sem_node_list = sem_node_list
+            token_node.compositional_head = compositional_head
+            token_node.compositional_modifiers = compositional_modifiers
+            for key, (phrase_token_node, occurrence_refs) in headed_refs.items():
+                record = token_node.headed_phrase_records.get(key)
+                if record is None:
+                    continue
+                record["phrase_token_node"] = phrase_token_node
+                for occurrence, chunk_node in occurrence_refs:
+                    occurrence["chunk_node"] = chunk_node
 
     # Save graph structure and tensors into separate files.
     def save_data_split(self, pkl_path: str):
@@ -4400,6 +4984,7 @@ class LiteSemRAG:
 
         obj._restore_runtime_components(load_nlp=True, load_reranker=False)
         obj.node_id2instance()
+        obj.build_modifier_postings()
         if obj.query_database is None and obj.sem_nodes and all(p.embed is not None for p in obj.sem_nodes):
             obj.build_query_database()
         obj.load_reranker()
@@ -4419,6 +5004,21 @@ class LiteSemRAG:
             sem_node.token_node = sem_node.token_node.token_node_id
         for token_node in self.token_nodes:
             token_node.sem_node_list = [sem_node.sem_node_id for sem_node in token_node.sem_node_list]
+            if getattr(token_node, "compositional_head", None) is not None:
+                token_node.compositional_head = token_node.compositional_head.token_node_id
+            token_node.compositional_modifiers = [
+                modifier_node.token_node_id
+                for modifier_node in getattr(token_node, "compositional_modifiers", []) or []
+                if modifier_node is not None
+            ]
+            for record in getattr(token_node, "headed_phrase_records", {}).values():
+                phrase_token_node = record.get("phrase_token_node")
+                if phrase_token_node is not None:
+                    record["phrase_token_node"] = phrase_token_node.token_node_id
+                for occurrence in record.get("occurrences", []):
+                    chunk_node = occurrence.get("chunk_node")
+                    if chunk_node is not None:
+                        occurrence["chunk_node"] = chunk_node.chunk_node_id
 
     # Convert serialized integer IDs back into object references.
     def node_id2instance(self):
@@ -4443,6 +5043,21 @@ class LiteSemRAG:
         for token_node in self.token_nodes:
             token_node.sem_node_list = [self.sem_nodes[idx] for idx in token_node.sem_node_list]
             self._ensure_token_node_backward_compatible_attrs(token_node)
+            head_id = getattr(token_node, "compositional_head", None)
+            if isinstance(head_id, int):
+                token_node.compositional_head = self.token_nodes[head_id]
+            token_node.compositional_modifiers = [
+                self.token_nodes[idx] if isinstance(idx, int) else idx
+                for idx in getattr(token_node, "compositional_modifiers", []) or []
+            ]
+            for record in getattr(token_node, "headed_phrase_records", {}).values():
+                phrase_token_id = record.get("phrase_token_node")
+                if isinstance(phrase_token_id, int):
+                    record["phrase_token_node"] = self.token_nodes[phrase_token_id]
+                for occurrence in record.get("occurrences", []):
+                    chunk_id = occurrence.get("chunk_node")
+                    if isinstance(chunk_id, int):
+                        occurrence["chunk_node"] = self.chunk_nodes[chunk_id]
 
     # Index a list of document records with a staged CPU/GPU pipeline.
     def index_json(self, chunk_list, batch_size=8, queue_size=4):
@@ -4550,7 +5165,6 @@ class LiteSemRAG:
                         chunk["text"],
                         self.nlp,
                         min_tokens=2,
-                        remove_duplicate=self.remove_duplicate_token,
                         discard_no_word=self.discard_no_word
                     )
                     phrases = self._prepare_index_phrase_spans(chunk["text"], phrases)
@@ -4699,6 +5313,7 @@ class LiteSemRAG:
 
         self.solve_sem_nodes()
         self.solve_anomaly()
+        self.build_modifier_postings()
         print(
             "single-cluster semantic build: "
             f"built {self.sem_build_count} sem nodes"

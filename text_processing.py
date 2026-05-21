@@ -383,7 +383,7 @@ def _is_valid_token(token, debug_mode=False, debug_stage=None):
     return True
 
 # Extract important phrase and token spans from text using spaCy filtering rules.
-def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,discard_no_word=False,debug_mode=False):
+def extract_important_spans(chunk, nlp, min_tokens=2, discard_no_word=False,debug_mode=False):
     doc = nlp(chunk)
 
     if debug_mode:
@@ -444,27 +444,11 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         if not _is_valid_token(token, debug_mode=debug_mode, debug_stage="token_filter"):
             continue
 
-        if remove_duplicate:
-            inside_phrase = any(
-                token.i >= start and token.i < end
-                for start, end in phrase_token_spans
-            )
-
-            if inside_phrase:
-                if debug_mode:
-                    _debug_skip(
-                        "token",
-                        token,
-                        "token is inside an accepted entity or noun chunk span",
-                        stage="token_dedup",
-                    )
-                continue
-
         if debug_mode:
             _debug_keep(
                 "token",
                 token,
-                "passed token filters and is not covered by a larger accepted span",
+                "passed token filters",
                 stage="token_output",
             )
 
