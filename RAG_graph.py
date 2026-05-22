@@ -71,7 +71,12 @@ RUNTIME_FIELD_NAMES = (
     "encoder_lock",
     "phrase_analyzer",
 )
-CO_OCCURRENCE_NODE_QUERY_WEIGHT = (1.2, 1, 0.8, 0.5)
+CO_OCCURRENCE_NODE_QUERY_WEIGHT = (1.2, 1, 0.6, 0.3)
+COMPOSITIONAL_QUERY_ROLE_WEIGHT = {
+    "phrase": 1.0,
+    "head": 0.7,
+    "modifier": 0.2,
+}
 
 # Compute the co-occurrence edge weight between two semantic nodes.
 def get_COG_edge_weight(node_a, node_b):
@@ -108,14 +113,97 @@ class CoOccurrenceGraph:
                 node_b.neighbor_node_list.append((node_a, weight))
 
         for node in self.node_list:
-            if len(node.neighbor_node_list) > 0:
+            unique_neighbor_weights = {}
+            for neighbor_node, weight in node.neighbor_node_list:
+                if neighbor_node.sem_node is node.sem_node:
+                    continue
+                neighbor_key = id(neighbor_node.sem_node)
+                unique_neighbor_weights[neighbor_key] = max(
+                    weight,
+                    unique_neighbor_weights.get(neighbor_key, 0),
+                )
+
+            if len(unique_neighbor_weights) > 0:
                 self.connected_node_list.append(node)
-                for _, weight in node.neighbor_node_list:
+                for weight in unique_neighbor_weights.values():
                     node.node_weight += weight
 
                 node.node_weight = node.node_weight * node.node_level_weight
             else:
                 self.isolate_node_list.append(node)
+
+    # Add one semantic-node contribution to a chunk score map.
+    def _add_chunk_contribution(
+        self,
+        *,
+        node,
+        chunk_node_id,
+        score,
+        weight_map,
+        token_weight_map,
+        used_sem_node_ids,
+    ):
+        sem_node_id = id(node.sem_node)
+        if sem_node_id in used_sem_node_ids:
+            return False
+        weight_map[chunk_node_id] = weight_map.get(chunk_node_id, 0) + score
+        token_weight_map.setdefault(chunk_node_id, []).append(
+            f"Token:{node.sem_node.token_node.token_text},Score:{score:.4f}"
+        )
+        used_sem_node_ids.add(sem_node_id)
+        return True
+
+    # Aggregate compositional phrase/head/modifier groups under their chunk constraints.
+    def _assign_grouped_chunk_weight(self, grouped_nodes, weight_map, token_weight_map):
+        chunk_group_candidates = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+        for node in grouped_nodes:
+            for chunk_node in node.sem_node.chunk_node_list:
+                chunk_node_id = chunk_node.chunk_node_id
+                bm25_score = node.node_weight * node.sem_node.BM25[chunk_node_id]
+                chunk_group_candidates[chunk_node_id][node.query_group_id][node.query_group_role].append(
+                    (node, bm25_score)
+                )
+
+        for chunk_node_id, group_candidates in chunk_group_candidates.items():
+            consumed_member_keys = set()
+            used_sem_node_ids = set()
+            groups_with_phrase = set()
+
+            for group_id in sorted(group_candidates):
+                phrase_candidates = group_candidates[group_id].get("phrase", [])
+                if not phrase_candidates:
+                    continue
+                groups_with_phrase.add(group_id)
+                for node, bm25_score in phrase_candidates:
+                    self._add_chunk_contribution(
+                        node=node,
+                        chunk_node_id=chunk_node_id,
+                        score=bm25_score,
+                        weight_map=weight_map,
+                        token_weight_map=token_weight_map,
+                        used_sem_node_ids=used_sem_node_ids,
+                    )
+                    consumed_member_keys.update(node.query_group_member_keys)
+
+            for group_id in sorted(group_candidates):
+                if group_id in groups_with_phrase:
+                    continue
+                for role in ("head", "modifier"):
+                    for node, bm25_score in group_candidates[group_id].get(role, []):
+                        member_key = node.query_member_key
+                        if member_key and member_key in consumed_member_keys:
+                            continue
+                        added = self._add_chunk_contribution(
+                            node=node,
+                            chunk_node_id=chunk_node_id,
+                            score=bm25_score,
+                            weight_map=weight_map,
+                            token_weight_map=token_weight_map,
+                            used_sem_node_ids=used_sem_node_ids,
+                        )
+                        if added and member_key:
+                            consumed_member_keys.add(member_key)
 
     # Aggregate semantic node weights into chunk-level retrieval scores.
     def assign_chunk_weight(self, avg_chunk_len, debug_mode=False):
@@ -124,7 +212,11 @@ class CoOccurrenceGraph:
         token_weight_map = {}
 
         if len(self.connected_node_list) > 0 :
+            grouped_nodes = []
             for node in self.connected_node_list:
+                if node.query_group_id is not None:
+                    grouped_nodes.append(node)
+                    continue
                 for chunk_node in node.sem_node.chunk_node_list:
                     chunk_node_id = chunk_node.chunk_node_id
                     if node.sem_node.token_node.token_text not in token_record_map[chunk_node_id]:
@@ -134,6 +226,7 @@ class CoOccurrenceGraph:
                         token_weight_map.setdefault(chunk_node_id, []).append(f"Token:{node.sem_node.token_node.token_text},Score:{(bm25_score ):.4f}")
                         token_record_map[chunk_node_id].add(node.sem_node.token_node.token_text)
 
+            self._assign_grouped_chunk_weight(grouped_nodes, weight_map, token_weight_map)
             self.weighted_chunk_node_list = sorted(weight_map.items(), key=lambda x: x[1], reverse=True)
         if debug_mode:
             print(token_weight_map)
@@ -195,9 +288,23 @@ class CoOccurrenceNode:
         self.node_query_weight = sem_node_info[2]
         if self.node_level < 0 or self.node_level >= len(CO_OCCURRENCE_NODE_QUERY_WEIGHT):
             raise ValueError(f"Unsupported co-occurrence node level: {self.node_level}")
+        self.query_group_id = None
+        self.query_group_role = None
+        self.query_member_key = None
+        self.query_group_member_keys = set()
+        role_weight = None
+        if len(sem_node_info) > 3:
+            self.query_group_id = sem_node_info[3]
+            self.query_group_role = sem_node_info[4]
+            self.query_member_key = sem_node_info[5]
+            self.query_group_member_keys = set(sem_node_info[6] or [])
+            role_weight = sem_node_info[7]
         self.neighbor_node_list = []
         self.node_weight = 0
-        self.node_level_weight = CO_OCCURRENCE_NODE_QUERY_WEIGHT[self.node_level]
+        if role_weight is None:
+            self.node_level_weight = CO_OCCURRENCE_NODE_QUERY_WEIGHT[self.node_level]
+        else:
+            self.node_level_weight = role_weight
 
 @dataclass
 class DocumentNode:
@@ -1383,26 +1490,39 @@ class LiteSemRAG:
 
     # Return modifier units for a compositional phrase analysis.
     def _get_query_modifier_units(self, analysis):
+        modifier_records = self._get_query_modifier_unit_records(analysis)
+        return (
+            [record["text"] for record in modifier_records],
+            [record["text_norm"] for record in modifier_records],
+        )
+
+    # Return modifier units with offsets so each modifier can become a query group member.
+    def _get_query_modifier_unit_records(self, analysis):
         atomic_spans = list(getattr(analysis, "atomic_modifier_spans", []) or [])
         modifier_spans = list(getattr(analysis, "modifier_spans", []) or [])
         modifier_texts = list(getattr(analysis, "modifier_texts", []) or [])
         modifier_texts_norm = list(getattr(analysis, "modifier_texts_norm", []) or [])
 
         atomic_ranges = []
-        modifier_units = []
-        modifier_units_norm = []
+        modifier_records = []
 
         for atomic_span in atomic_spans:
             text = str(atomic_span.get("text", "")).strip()
             text_norm = normalize_text(atomic_span.get("text_norm") or text)
             if not text_norm:
                 continue
-            modifier_units.append(text or text_norm)
-            modifier_units_norm.append(text_norm)
             start = atomic_span.get("start")
             end = atomic_span.get("end")
             if start is not None and end is not None:
                 atomic_ranges.append((start, end))
+            modifier_records.append(
+                {
+                    "text": text or text_norm,
+                    "text_norm": text_norm,
+                    "start": start,
+                    "end": end,
+                }
+            )
 
         for idx, text_norm in enumerate(modifier_texts_norm):
             text_norm = normalize_text(text_norm)
@@ -1413,20 +1533,28 @@ class LiteSemRAG:
                 start, end = span
                 if any(start >= atomic_start and end <= atomic_end for atomic_start, atomic_end in atomic_ranges):
                     continue
+            else:
+                start = None
+                end = None
             text = modifier_texts[idx] if idx < len(modifier_texts) else text_norm
-            modifier_units.append(text)
-            modifier_units_norm.append(text_norm)
+            modifier_records.append(
+                {
+                    "text": text,
+                    "text_norm": text_norm,
+                    "start": start,
+                    "end": end,
+                }
+            )
 
-        deduped_units = []
-        deduped_units_norm = []
+        deduped_records = []
         seen = set()
-        for text, text_norm in zip(modifier_units, modifier_units_norm):
+        for record in modifier_records:
+            text_norm = record["text_norm"]
             if text_norm in seen:
                 continue
             seen.add(text_norm)
-            deduped_units.append(text)
-            deduped_units_norm.append(text_norm)
-        return deduped_units, deduped_units_norm
+            deduped_records.append(record)
+        return deduped_records
 
     # Return True when a token span is fully covered by any query phrase span.
     def _query_span_is_covered(self, start_char, end_char, covered_spans):
@@ -1447,6 +1575,11 @@ class LiteSemRAG:
         phrase_type=None,
         query_modifiers=None,
         query_modifiers_norm=None,
+        query_group_id=None,
+        query_group_role=None,
+        query_member_key=None,
+        query_group_member_keys=None,
+        query_role_weight=None,
     ):
         query_surface = query_surface or search_key
         return {
@@ -1467,10 +1600,19 @@ class LiteSemRAG:
                 for modifier in list(query_modifiers_norm or [])
                 if normalize_text(modifier)
             ],
+            "query_group_id": query_group_id,
+            "query_group_role": query_group_role,
+            "query_member_key": normalize_text(query_member_key or search_key),
+            "query_group_member_keys": [
+                normalize_text(member_key)
+                for member_key in list(query_group_member_keys or [])
+                if normalize_text(member_key)
+            ],
+            "query_role_weight": query_role_weight,
         }
 
     # Clean a query and extract token, phrase, and entity embeddings for matching.
-    def _prepare_query_tokens(self, query_text, print_important_tokens=False):
+    def _prepare_query_tokens(self, query_text, print_important_tokens=False, expand_compositional=False):
         query_text = clean_text(query_text)
         token_embeddings, offsets = encode_text(query_text, self.text_encoder, self.tokenizer, self.device)
         important_phrases, num_ents = extract_important_phrases(query_text, self.nlp)
@@ -1499,7 +1641,82 @@ class LiteSemRAG:
                 and analysis.head_start is not None
                 and analysis.head_end is not None
             ):
-                modifier_units, modifier_units_norm = self._get_query_modifier_units(analysis)
+                modifier_records = self._get_query_modifier_unit_records(analysis)
+                modifier_units = [record["text"] for record in modifier_records]
+                modifier_units_norm = [record["text_norm"] for record in modifier_records]
+                if expand_compositional:
+                    group_id = f"{start_char}:{end_char}:{analysis.phrase_text_norm}"
+                    group_member_keys = [analysis.head_text_norm] + modifier_units_norm
+                    tokens_for_processing.append(
+                        self._make_query_unit(
+                            token_type=token_type,
+                            search_key=analysis.phrase_text_norm,
+                            embedding_span_text=analysis.phrase_text_norm,
+                            embedding_start=start_char,
+                            embedding_end=end_char,
+                            query_surface=query_surface,
+                            surface_start=start_char,
+                            surface_end=end_char,
+                            phrase_type=PHRASE_TYPE_COMPOSITIONAL,
+                            query_modifiers=modifier_units,
+                            query_modifiers_norm=modifier_units_norm,
+                            query_group_id=group_id,
+                            query_group_role="phrase",
+                            query_member_key=analysis.phrase_text_norm,
+                            query_group_member_keys=group_member_keys,
+                            query_role_weight=COMPOSITIONAL_QUERY_ROLE_WEIGHT["phrase"],
+                        )
+                    )
+                    tokens_for_processing.append(
+                        self._make_query_unit(
+                            token_type="token",
+                            search_key=analysis.head_text_norm,
+                            embedding_span_text=analysis.head_text_norm,
+                            embedding_start=analysis.head_start,
+                            embedding_end=analysis.head_end,
+                            query_surface=analysis.head_text,
+                            surface_start=analysis.head_start,
+                            surface_end=analysis.head_end,
+                            phrase_type=PHRASE_TYPE_SINGLE_TOKEN,
+                            query_group_id=group_id,
+                            query_group_role="head",
+                            query_member_key=analysis.head_text_norm,
+                            query_group_member_keys=group_member_keys,
+                            query_role_weight=COMPOSITIONAL_QUERY_ROLE_WEIGHT["head"],
+                        )
+                    )
+                    for modifier_record in modifier_records:
+                        if modifier_record["start"] is None or modifier_record["end"] is None:
+                            continue
+                        modifier_token_type = (
+                            "phrase" if count_words(modifier_record["text_norm"]) >= 2 else "token"
+                        )
+                        modifier_phrase_type = (
+                            PHRASE_TYPE_ATOMIC
+                            if modifier_token_type == "phrase"
+                            else PHRASE_TYPE_SINGLE_TOKEN
+                        )
+                        tokens_for_processing.append(
+                            self._make_query_unit(
+                                token_type=modifier_token_type,
+                                search_key=modifier_record["text_norm"],
+                                embedding_span_text=modifier_record["text_norm"],
+                                embedding_start=modifier_record["start"],
+                                embedding_end=modifier_record["end"],
+                                query_surface=modifier_record["text"],
+                                surface_start=modifier_record["start"],
+                                surface_end=modifier_record["end"],
+                                phrase_type=modifier_phrase_type,
+                                query_group_id=group_id,
+                                query_group_role="modifier",
+                                query_member_key=modifier_record["text_norm"],
+                                query_group_member_keys=group_member_keys,
+                                query_role_weight=COMPOSITIONAL_QUERY_ROLE_WEIGHT["modifier"],
+                            )
+                        )
+                    covered_compositional_spans.append((start_char, end_char))
+                    continue
+
                 tokens_for_processing.append(
                     self._make_query_unit(
                         token_type=token_type,
@@ -1560,10 +1777,17 @@ class LiteSemRAG:
         return query_text, token_embeddings, offsets, tokens_for_processing
 
     # Resolve exact, fuzzy, and embedding-based semantic node matches for a query.
-    def _resolve_query_matches(self, query_text, search_mode="broad", print_important_tokens=False):
+    def _resolve_query_matches(
+        self,
+        query_text,
+        search_mode="broad",
+        print_important_tokens=False,
+        expand_compositional=False,
+    ):
         query_text, token_embeddings, offsets, tokens_for_processing = self._prepare_query_tokens(
             query_text,
             print_important_tokens=print_important_tokens,
+            expand_compositional=expand_compositional,
         )
         query_tokens = []
         tokens_in_phrase = []
@@ -1572,7 +1796,11 @@ class LiteSemRAG:
         for query_unit in tokens_for_processing:
             token_type = query_unit["token_type"]
             token = query_unit["search_key"]
-            if token_type == "token" and token in tokens_in_phrase:
+            if (
+                query_unit["query_group_id"] is None
+                and token_type == "token"
+                and token in tokens_in_phrase
+            ):
                 continue
 
             token_embed = get_embed_by_offest(
@@ -1597,7 +1825,7 @@ class LiteSemRAG:
                 if token_type in {"phrase", "ent"} and search_mode != "broad":
                     tokens_in_phrase.extend(token.split(" "))
 
-            if query_unit["phrase_type"] == PHRASE_TYPE_COMPOSITIONAL:
+            if query_unit["phrase_type"] == PHRASE_TYPE_COMPOSITIONAL and query_unit["query_group_id"] is None:
                 fuzzy_query_list = []
             else:
                 fuzzy_query_list = self.phrase_word_intersection_query(token)
@@ -1622,6 +1850,11 @@ class LiteSemRAG:
                 "phrase_type": query_unit["phrase_type"],
                 "query_modifiers": list(query_unit["query_modifiers"]),
                 "query_modifiers_norm": list(query_unit["query_modifiers_norm"]),
+                "query_group_id": query_unit["query_group_id"],
+                "query_group_role": query_unit["query_group_role"],
+                "query_member_key": query_unit["query_member_key"],
+                "query_group_member_keys": list(query_unit["query_group_member_keys"]),
+                "query_role_weight": query_unit["query_role_weight"],
                 "token_embed": token_embed,
                 "exact_sem_node": exact_sem_node,
                 "fuzzy_sem_nodes": fuzzy_sem_nodes,
@@ -1817,6 +2050,7 @@ class LiteSemRAG:
             query_text,
             search_mode=search_mode,
             print_important_tokens=print_important_tokens,
+            expand_compositional=True,
         )
         query_tokens = []
         low_level_tokens = []
@@ -1824,10 +2058,25 @@ class LiteSemRAG:
         low_level_sems = []
         high_level_sems = []
         tokens_in_phrase = []
+
+        def make_sem_info(sem_node, node_level, node_query_weight, match):
+            if match.get("query_group_id") is None:
+                return (sem_node, node_level, node_query_weight)
+            return (
+                sem_node,
+                node_level,
+                node_query_weight,
+                match.get("query_group_id"),
+                match.get("query_group_role"),
+                match.get("query_member_key"),
+                tuple(match.get("query_group_member_keys") or ()),
+                match.get("query_role_weight"),
+            )
+
         for match in resolved_matches:
             token_type = match["token_type"]
             token = match["token"]
-            if token_type == "token" and token in tokens_in_phrase:
+            if match.get("query_group_id") is None and token_type == "token" and token in tokens_in_phrase:
                 continue
             query_tokens.append(token)
             exact_match = match["exact_sem_node"] is not None
@@ -1836,9 +2085,9 @@ class LiteSemRAG:
                 max_sem_node = match["exact_sem_node"]
                 low_level_tokens.append(token + f"(exact matched)")
                 if token_type == 'ent':
-                    low_level_sems.append((max_sem_node, 0, 1))
+                    low_level_sems.append(make_sem_info(max_sem_node, 0, 1, match))
                 else:
-                    low_level_sems.append((max_sem_node, 1, 1))
+                    low_level_sems.append(make_sem_info(max_sem_node, 1, 1, match))
                 if (token_type == 'phrase' or token_type == 'ent') and search_mode != 'broad':
                     tokens_in_phrase.extend(token.split(" "))
             if fuzzy_match:
@@ -1846,20 +2095,22 @@ class LiteSemRAG:
                     weight = count_words(token) / count_words(sem_node.token_node.token_text)
                     if exact_match:
                         if token_type == 'ent':
-                            high_level_sems.append((sem_node,1, weight))
+                            high_level_sems.append(make_sem_info(sem_node, 1, weight, match))
                         else:
-                            high_level_sems.append((sem_node, 2, weight))
+                            high_level_sems.append(make_sem_info(sem_node, 2, weight, match))
                         high_level_tokens.append(
                             sem_node.token_node.token_text + f"(partial matched)")
                     else:
                         if token_type == 'ent':
-                            low_level_sems.append((sem_node,1, weight))
+                            low_level_sems.append(make_sem_info(sem_node, 1, weight, match))
                         else:
-                            low_level_sems.append((sem_node,2, weight))
+                            low_level_sems.append(make_sem_info(sem_node, 2, weight, match))
                         low_level_tokens.append(
                             sem_node.token_node.token_text + f"(partial matched)")
             if not (exact_match or fuzzy_match):
-                low_level_sems.append((match["retrieved_sem"], 3, match["semantic_weight"]))
+                low_level_sems.append(
+                    make_sem_info(match["retrieved_sem"], 3, match["semantic_weight"], match)
+                )
                 low_level_tokens.append(match["retrieved_sem"].token_node.token_text + f"(sim matched)")
 
                 high_level_tokens.append(['N/A'])
@@ -1874,16 +2125,6 @@ class LiteSemRAG:
         co_occurrence_graph.assign_chunk_weight(self.chunk_avg_len,print_important_tokens)
         co_occurrence_graph.rank_sem_node()
         co_occurrence_graph.rank_chunk_by_BM25()
-        modifier_boosts = self._score_chunk_modifier_boosts(resolved_matches)
-        if modifier_boosts:
-            co_occurrence_graph.weighted_chunk_node_list = self._apply_modifier_boost_to_scored_chunks(
-                co_occurrence_graph.weighted_chunk_node_list,
-                modifier_boosts,
-            )
-            co_occurrence_graph.ranked_chunk_BM25 = self._apply_modifier_boost_to_ranked_groups(
-                co_occurrence_graph.ranked_chunk_BM25,
-                modifier_boosts,
-            )
 
         isolated_quota = math.floor(top_k_chunk * isolate_chunk_ratio)
         connected_quota = top_k_chunk - isolated_quota
@@ -3806,63 +4047,24 @@ class LiteSemRAG:
             ):
                 self.build_sem_node_waitlist.append(token_node)
 
-    # Index one document using the selected single or multi-processing path.
+    # Index one document through the shared staged indexing pipeline.
     def index_document(self, doc_name, multiprocessing=True):
-        self.start_time = time.perf_counter()
-        document_start_time = time.perf_counter()
-        if multiprocessing:
-            self.index_document_threaded(doc_name)
-        else:
-            self.index_document_single_processing(doc_name)
-        self.log_time(f"File {doc_name} completed. Index time: {time.perf_counter() - document_start_time:.4f}s")
+        # multiprocessing is retained for API compatibility; all document
+        # indexing now uses the shared staged pipeline.
+        _ = multiprocessing
+        return self.index_document_parallel(doc_name)
 
-    # Index one document by encoding chunks in a single processing flow.
+    # Backward-compatible wrapper for the shared document indexing pipeline.
     def index_document_single_processing(self, doc_name):
-        new_doc_node = self.create_doc_node(doc_name)
-        chunk_list = split_doc(doc_name, self.nlp, max_tokens=self.chunk_size)
-        token_embeddings_list, offsets_list = encode_chunk_batch(chunk_list, self.text_encoder, self.tokenizer, self.device)
-        for chunk, token_embeddings, offsets in zip(chunk_list, token_embeddings_list, offsets_list):
-            new_chunk_node = self.create_chunk_node(chunk, new_doc_node)
-            phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2)
-            phrases = self._prepare_index_phrase_spans(chunk, phrases)
-            phrase_embs, token_embs = get_token_embeds(token_embeddings, offsets, phrases, tokens)
-            self.process_embeds(new_chunk_node, phrase_embs, token_embs)
-        self.solve_sem_nodes()
-        self.solve_anomaly()
-        self.build_modifier_postings()
+        return self.index_document_parallel(doc_name)
 
-    # Index one document by submitting chunk encoding work to the thread executor.
+    # Backward-compatible wrapper for the shared document indexing pipeline.
     def index_document_threaded(self, doc_name):
-        new_doc_node = self.create_doc_node(doc_name)
-        chunk_list = split_doc(doc_name, self.nlp, max_tokens=self.chunk_size)
-        chunk_meta = []
-        futures = []
+        return self.index_document_parallel(doc_name)
 
-        for chunk in chunk_list:
-            futures.append(self.executor.submit(self._encode_chunk_thread_safe, chunk))
-            new_chunk_node = self.create_chunk_node(chunk, new_doc_node)
-            phrases, tokens = extract_important_spans(chunk, self.nlp, min_tokens=2)
-            phrases = self._prepare_index_phrase_spans(chunk, phrases)
-            chunk_meta.append((new_chunk_node, phrases, tokens))
-
-        for i, future in enumerate(futures):
-            token_embeddings, offsets = future.result()
-            node, phrases, tokens = chunk_meta[i]
-            phrase_embs, token_embs = get_token_embeds(
-                token_embeddings,
-                offsets,
-                phrases,
-                tokens
-            )
-
-            self.process_embeds(node, phrase_embs, token_embs)
-        self.solve_sem_nodes()
-        self.solve_anomaly()
-        self.build_modifier_postings()
-
-    # Backward-compatible name for the threaded indexing implementation.
+    # Backward-compatible wrapper for the shared document indexing pipeline.
     def index_document_multi_processing(self, doc_name):
-        return self.index_document_threaded(doc_name)
+        return self.index_document_parallel(doc_name)
 
     # Plot a token node embedding distribution for clustered embeddings.
     def plot_embed_distribution(self, token_node, clusters):
@@ -4077,109 +4279,293 @@ class LiteSemRAG:
         q = embeds.unsqueeze(0).expand_as(x)
         return sem_indices[int(F.cosine_similarity(x, q, dim=1).argmax().item())]
 
-    # Index one document with staged CPU preprocessing, GPU encoding, and CPU consumption.
-    def index_document_parallel(self, doc_name, batch_size=8, queue_size=4):
-        self.start_time = time.perf_counter()
-        document_start_time = time.perf_counter()
+    # Index prepared chunk records with staged CPU preprocessing, GPU encoding, and CPU consumption.
+    def _index_chunk_records_pipeline(
+        self,
+        chunk_records,
+        batch_size=8,
+        queue_size=4,
+        *,
+        completion_message=None,
+        print_sem_build_summary=False,
+        reset_sem_build_stats=True,
+    ):
+        """Index records shaped as {"doc_name": str, "text": str}."""
+        if self.start_time is None:
+            self.start_time = time.perf_counter()
+        if reset_sem_build_stats:
+            self._reset_sem_build_stats()
 
-        new_doc_node = self.create_doc_node(doc_name)
-        chunk_list = split_doc(doc_name, self.nlp, max_tokens=self.chunk_size)
-        total_chunks = len(chunk_list)
+        total_chunks = len(chunk_records)
+        doc_node_map = {}
 
-        if total_chunks == 0:
-
-            self.solve_sem_nodes()
-            self.solve_anomaly()
-            self.build_modifier_postings()
-            self.log_time(
-                f"File {doc_name} completed. Index time: {time.perf_counter() - document_start_time:.4f}s"
-            )
-            return
-
-        chunk_meta = []
-        for chunk_text in chunk_list:
-            new_chunk_node = self.create_chunk_node(chunk_text, new_doc_node)
-
-            phrases, tokens = extract_important_spans(
-                chunk_text,
-                self.nlp,
-                min_tokens=2
-            )
-            phrases = self._prepare_index_phrase_spans(chunk_text, phrases)
-
-            chunk_meta.append((new_chunk_node, phrases, tokens, chunk_text))
-
-        batches = []
-        for i in range(0, total_chunks, batch_size):
-            batch_indices = list(range(i, min(i + batch_size, total_chunks)))
-            batch_texts = [chunk_meta[idx][3] for idx in batch_indices]
-            batches.append((batch_texts, batch_indices))
-
+        preprocess_queue = queue.Queue(maxsize=queue_size)
         result_queue = queue.Queue(maxsize=queue_size)
 
+        progress_lock = threading.Lock()
+        preprocess_done = 0
         gpu_done = 0
         cpu_done = 0
 
-        # Encode prepared chunk batches on the GPU worker thread.
-        def gpu_worker():
+        worker_errors = []
+        stop_event = threading.Event()
+
+        # Capture the first worker exception and its stage name.
+        def record_error(stage_name, exc):
+            if worker_errors:
+                return
+            worker_errors.append(
+                (
+                    stage_name,
+                    "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                )
+            )
+            stop_event.set()
+
+        # Return a thread-safe snapshot of indexing progress counters.
+        def get_progress_snapshot():
+            with progress_lock:
+                return preprocess_done, gpu_done, cpu_done
+
+        # Increment the preprocessing progress counter.
+        def inc_preprocess_done(n=1):
+            nonlocal preprocess_done
+            with progress_lock:
+                preprocess_done += n
+
+        # Increment the GPU encoding progress counter.
+        def inc_gpu_done(n=1):
             nonlocal gpu_done
+            with progress_lock:
+                gpu_done += n
+
+        # Increment the CPU consumption progress counter.
+        def inc_cpu_done(n=1):
+            nonlocal cpu_done
+            with progress_lock:
+                cpu_done += n
+
+        last_progress_update_time = [0.0]
+
+        # Print throttled progress for the staged indexing pipeline.
+        def print_progress(force=False):
+            p_done, g_done, c_done = get_progress_snapshot()
+            now = time.perf_counter()
+            if not force and c_done < total_chunks and (now - last_progress_update_time[0]) < 0.2:
+                return
+            last_progress_update_time[0] = now
+            print(
+                f"\rCPU preprocessed: {p_done}/{total_chunks} | "
+                f"GPU encoded: {g_done}/{total_chunks} | "
+                f"CPU processed: {c_done}/{total_chunks}",
+                end="",
+                flush=True
+            )
+
+        # Put an item into a queue while respecting a recorded worker error.
+        def safe_queue_put(target_queue, item):
+            while not stop_event.is_set():
+                try:
+                    target_queue.put(item, timeout=0.2)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        # Create graph nodes and extract spans before GPU encoding.
+        def cpu_preprocess_worker():
             try:
-                for batch_texts, batch_indices in batches:
-                    token_embeddings_batch, offsets_batch = encode_chunk_batch(batch_texts, self.text_encoder, self.tokenizer, self.device)
+                for idx, chunk in enumerate(chunk_records):
+                    if stop_event.is_set():
+                        break
 
-                    result_queue.put((token_embeddings_batch, offsets_batch, batch_indices))
-                    gpu_done += len(batch_indices)
+                    doc_name = chunk["doc_name"]
+                    chunk_text = chunk["text"]
+                    new_doc_node = doc_node_map.get(doc_name)
+                    if new_doc_node is None:
+                        new_doc_node = self.create_doc_node(doc_name)
+                        doc_node_map[doc_name] = new_doc_node
+                    new_chunk_node = self.create_chunk_node(
+                        chunk_text, new_doc_node
+                    )
 
-                result_queue.put(None)
+                    phrases, tokens = extract_important_spans(
+                        chunk_text,
+                        self.nlp,
+                        min_tokens=2,
+                        discard_no_word=self.discard_no_word
+                    )
+                    phrases = self._prepare_index_phrase_spans(chunk_text, phrases)
 
-            except Exception as e:
+                    if not safe_queue_put(
+                        preprocess_queue,
+                        (
+                            idx,
+                            new_chunk_node,
+                            phrases,
+                            tokens,
+                            chunk_text
+                        )
+                    ):
+                        break
 
-                result_queue.put(("__EXCEPTION__", e))
-                result_queue.put(None)
+                    inc_preprocess_done(1)
+                    print_progress()
 
-        gpu_thread = threading.Thread(target=gpu_worker, daemon=True)
+            except Exception as exc:
+                record_error("cpu_preprocess_worker", exc)
+
+            finally:
+                safe_queue_put(preprocess_queue, None)
+
+        # Batch preprocessed chunks and encode them on the GPU.
+        def gpu_worker():
+            # Encode and emit one accumulated GPU batch.
+            def flush_batch(batch_buffer):
+                if not batch_buffer:
+                    return True
+
+                batch_texts = [item[4] for item in batch_buffer]
+                batch_items = [
+                    (item[0], item[1], item[2], item[3])
+                    for item in batch_buffer
+                ]
+
+                token_embeddings_batch, offsets_batch = encode_chunk_batch(
+                    batch_texts,
+                    self.text_encoder,
+                    self.tokenizer,
+                    self.device
+                )
+
+                if not safe_queue_put(
+                    result_queue,
+                    (
+                        batch_items,
+                        token_embeddings_batch,
+                        offsets_batch
+                    )
+                ):
+                    return False
+
+                inc_gpu_done(len(batch_buffer))
+                print_progress()
+                return True
+
+            batch_buffer = []
+
+            try:
+                while True:
+                    if stop_event.is_set() and preprocess_queue.empty():
+                        break
+
+                    try:
+                        item = preprocess_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+
+                    if item is None:
+                        break
+
+                    batch_buffer.append(item)
+
+                    if len(batch_buffer) >= batch_size:
+                        if not flush_batch(batch_buffer):
+                            break
+                        batch_buffer = []
+
+                if batch_buffer:
+                    flush_batch(batch_buffer)
+
+            except Exception as exc:
+                record_error("gpu_worker", exc)
+
+            finally:
+                safe_queue_put(result_queue, None)
+
+        preprocess_thread = threading.Thread(target=cpu_preprocess_worker)
+        gpu_thread = threading.Thread(target=gpu_worker)
+
+        print_progress(force=True)
+        preprocess_thread.start()
         gpu_thread.start()
 
-        while True:
-            item = result_queue.get()
+        try:
+            while True:
+                if stop_event.is_set() and result_queue.empty() and not gpu_thread.is_alive():
+                    break
 
-            if item is None:
-                break
+                try:
+                    item = result_queue.get(timeout=0.2)
+                except queue.Empty:
+                    print_progress()
+                    continue
 
-            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__EXCEPTION__":
+                if item is None:
+                    break
 
-                raise item[1]
+                batch_items, token_embeddings_batch, offsets_batch = item
 
-            token_embeddings_batch, offsets_batch, batch_indices = item
+                for i_in_batch, meta in enumerate(batch_items):
+                    _, node, phrases, tokens = meta
 
-            for i_in_batch, original_idx in enumerate(batch_indices):
-                node, phrases, tokens, _ = chunk_meta[original_idx]
+                    phrase_embs, token_embs = get_token_embeds(
+                        token_embeddings_batch[i_in_batch],
+                        offsets_batch[i_in_batch],
+                        phrases,
+                        tokens
+                    )
 
-                phrase_embs, token_embs = get_token_embeds(
-                    token_embeddings_batch[i_in_batch],
-                    offsets_batch[i_in_batch],
-                    phrases,
-                    tokens
-                )
+                    self.process_embeds(node, phrase_embs, token_embs)
+                    inc_cpu_done(1)
+                    print_progress()
 
-                self.process_embeds(node, phrase_embs, token_embs)
-                cpu_done += 1
+        finally:
+            stop_event.set()
+            preprocess_thread.join(timeout=1.0)
+            gpu_thread.join(timeout=1.0)
 
-                print(
-                    f"\rGPU encoded: {gpu_done}/{total_chunks} | "
-                    f"CPU processed: {cpu_done}/{total_chunks}",
-                    end="",
-                    flush=True
-                )
-
-        gpu_thread.join()
+        print_progress(force=True)
         print()
+
+        if worker_errors:
+            stage_name, error_text = worker_errors[0]
+            raise RuntimeError(
+                f"Error in {stage_name}:\n{error_text}"
+            )
 
         self.solve_sem_nodes()
         self.solve_anomaly()
         self.build_modifier_postings()
-        self.log_time(
-            f"File {doc_name} completed. Index time: {time.perf_counter() - document_start_time:.4f}s"
+
+        if completion_message is not None:
+            self.log_time(completion_message())
+
+        if print_sem_build_summary:
+            print(
+                "single-cluster semantic build: "
+                f"built {self.sem_build_count} sem nodes"
+            )
+
+    # Index one document with staged CPU preprocessing, GPU encoding, and CPU consumption.
+    def index_document_parallel(self, doc_name, batch_size=8, queue_size=4):
+        self.start_time = time.perf_counter()
+        document_start_time = time.perf_counter()
+        chunk_records = [
+            {
+                "doc_name": doc_name,
+                "text": chunk_text,
+            }
+            for chunk_text in split_doc(doc_name, self.nlp, max_tokens=self.chunk_size)
+        ]
+        self._index_chunk_records_pipeline(
+            chunk_records,
+            batch_size=batch_size,
+            queue_size=queue_size,
+            completion_message=lambda: (
+                f"File {doc_name} completed. "
+                f"Index time: {time.perf_counter() - document_start_time:.4f}s"
+            ),
         )
 
     # Map chunk IDs to their stored chunk texts.
@@ -5061,262 +5447,32 @@ class LiteSemRAG:
 
     # Index a list of document records with a staged CPU/GPU pipeline.
     def index_json(self, chunk_list, batch_size=8, queue_size=4):
-        """Index JSON chunk records with one CPU preprocessor and one GPU encoder.
-
-        The CPU preprocessing worker is the only writer that creates document and
-        chunk nodes. The GPU worker owns the shared encoder in this pipeline.
-        Adding more workers requires locking or partitioning those shared states.
-        """
+        """Index JSON chunk records shaped as {"title": str, "text": str}."""
         self.start_time = time.perf_counter()
-        self._reset_sem_build_stats()
-        total_chunks = len(chunk_list)
-        doc_node_map = {}
-
-        preprocess_queue = queue.Queue(maxsize=queue_size)
-        result_queue = queue.Queue(maxsize=queue_size)
-
-        progress_lock = threading.Lock()
-        preprocess_done = 0
-        gpu_done = 0
-        cpu_done = 0
-
-        worker_errors = []
-        stop_event = threading.Event()
-
-        # Capture the first worker exception and its stage name.
-        def record_error(stage_name, exc):
-            if worker_errors:
-                return
-            worker_errors.append(
-                (
-                    stage_name,
-                    "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        chunk_records = []
+        for idx, chunk in enumerate(chunk_list):
+            missing_keys = {"title", "text"} - set(chunk)
+            if missing_keys:
+                missing = ", ".join(sorted(missing_keys))
+                raise ValueError(
+                    f"JSON chunk record at index {idx} is missing required key(s): {missing}"
                 )
-            )
-            stop_event.set()
-
-        # Return a thread-safe snapshot of indexing progress counters.
-        def get_progress_snapshot():
-            with progress_lock:
-                return preprocess_done, gpu_done, cpu_done
-
-        # Increment the preprocessing progress counter.
-        def inc_preprocess_done(n=1):
-            nonlocal preprocess_done
-            with progress_lock:
-                preprocess_done += n
-
-        # Increment the GPU encoding progress counter.
-        def inc_gpu_done(n=1):
-            nonlocal gpu_done
-            with progress_lock:
-                gpu_done += n
-
-        # Increment the CPU consumption progress counter.
-        def inc_cpu_done(n=1):
-            nonlocal cpu_done
-            with progress_lock:
-                cpu_done += n
-
-        last_progress_update_time = [0.0]
-
-        # Print throttled progress for the staged indexing pipeline.
-        def print_progress(force=False):
-            p_done, g_done, c_done = get_progress_snapshot()
-            now = time.perf_counter()
-            if not force and c_done < total_chunks and (now - last_progress_update_time[0]) < 0.2:
-                return
-            last_progress_update_time[0] = now
-            print(
-                f"\rCPU preprocessed: {p_done}/{total_chunks} | "
-                f"GPU encoded: {g_done}/{total_chunks} | "
-                f"CPU processed: {c_done}/{total_chunks}",
-                end="",
-                flush=True
+            chunk_records.append(
+                {
+                    "doc_name": chunk["title"],
+                    "text": chunk["text"],
+                }
             )
 
-        # Put an item into a queue while respecting a recorded worker error.
-        def safe_queue_put(target_queue, item):
-            while not stop_event.is_set():
-                try:
-                    target_queue.put(item, timeout=0.2)
-                    return True
-                except queue.Full:
-                    continue
-            return False
-
-        # Create graph nodes and extract spans before GPU encoding.
-        def cpu_preprocess_worker():
-            try:
-                for idx, chunk in enumerate(chunk_list):
-                    if stop_event.is_set():
-                        break
-
-                    title = chunk["title"]
-                    new_doc_node = doc_node_map.get(title)
-                    if new_doc_node is None:
-                        new_doc_node = self.create_doc_node(title)
-                        doc_node_map[title] = new_doc_node
-                    new_chunk_node = self.create_chunk_node(
-                        chunk["text"], new_doc_node
-                    )
-
-                    phrases, tokens = extract_important_spans(
-                        chunk["text"],
-                        self.nlp,
-                        min_tokens=2,
-                        discard_no_word=self.discard_no_word
-                    )
-                    phrases = self._prepare_index_phrase_spans(chunk["text"], phrases)
-
-                    if not safe_queue_put(
-                        preprocess_queue,
-                        (
-                            idx,
-                            new_chunk_node,
-                            phrases,
-                            tokens,
-                            chunk["text"]
-                        )
-                    ):
-                        break
-
-                    inc_preprocess_done(1)
-                    print_progress()
-
-            except Exception as exc:
-                record_error("cpu_preprocess_worker", exc)
-
-            finally:
-                safe_queue_put(preprocess_queue, None)
-
-        # Batch preprocessed chunks and encode them on the GPU.
-        def gpu_worker():
-            # Encode and emit one accumulated GPU batch.
-            def flush_batch(batch_buffer):
-                if not batch_buffer:
-                    return True
-
-                batch_texts = [item[4] for item in batch_buffer]
-                batch_items = [
-                    (item[0], item[1], item[2], item[3])
-                    for item in batch_buffer
-                ]
-
-                token_embeddings_batch, offsets_batch = encode_chunk_batch(
-                    batch_texts,
-                    self.text_encoder,
-                    self.tokenizer,
-                    self.device
-                )
-
-                if not safe_queue_put(
-                    result_queue,
-                    (
-                        batch_items,
-                        token_embeddings_batch,
-                        offsets_batch
-                    )
-                ):
-                    return False
-
-                inc_gpu_done(len(batch_buffer))
-                print_progress()
-                return True
-
-            batch_buffer = []
-
-            try:
-                while True:
-                    if stop_event.is_set() and preprocess_queue.empty():
-                        break
-
-                    try:
-                        item = preprocess_queue.get(timeout=0.2)
-                    except queue.Empty:
-                        continue
-
-                    if item is None:
-                        break
-
-                    batch_buffer.append(item)
-
-                    if len(batch_buffer) >= batch_size:
-                        if not flush_batch(batch_buffer):
-                            break
-                        batch_buffer = []
-
-                if batch_buffer:
-                    flush_batch(batch_buffer)
-
-            except Exception as exc:
-                record_error("gpu_worker", exc)
-
-            finally:
-                safe_queue_put(result_queue, None)
-
-        preprocess_thread = threading.Thread(target=cpu_preprocess_worker)
-        gpu_thread = threading.Thread(target=gpu_worker)
-
-        print_progress(force=True)
-        preprocess_thread.start()
-        gpu_thread.start()
-
-        try:
-            while True:
-                if stop_event.is_set() and result_queue.empty() and not gpu_thread.is_alive():
-                    break
-
-                try:
-                    item = result_queue.get(timeout=0.2)
-                except queue.Empty:
-                    print_progress()
-                    continue
-
-                if item is None:
-                    break
-
-                batch_items, token_embeddings_batch, offsets_batch = item
-
-                for i_in_batch, meta in enumerate(batch_items):
-                    _, node, phrases, tokens = meta
-
-                    phrase_embs, token_embs = get_token_embeds(
-                        token_embeddings_batch[i_in_batch],
-                        offsets_batch[i_in_batch],
-                        phrases,
-                        tokens
-                    )
-
-                    self.process_embeds(node, phrase_embs, token_embs)
-                    inc_cpu_done(1)
-                    print_progress()
-
-        finally:
-            stop_event.set()
-            preprocess_thread.join(timeout=1.0)
-            gpu_thread.join(timeout=1.0)
-
-        print_progress(force=True)
-        print()
-
-        if worker_errors:
-            stage_name, error_text = worker_errors[0]
-            raise RuntimeError(
-                f"Error in {stage_name}:\n{error_text}"
-            )
-
-        self.log_time(
-            f"Index {total_chunks} documents. "
-            f"Index time: {time.perf_counter() - self.start_time:.4f}s"
-        )
-
-        self.solve_sem_nodes()
-        self.solve_anomaly()
-        self.build_modifier_postings()
-        print(
-            "single-cluster semantic build: "
-            f"built {self.sem_build_count} sem nodes"
+        self._index_chunk_records_pipeline(
+            chunk_records,
+            batch_size=batch_size,
+            queue_size=queue_size,
+            completion_message=lambda: (
+                f"Index {len(chunk_records)} documents. "
+                f"Index time: {time.perf_counter() - self.start_time:.4f}s"
+            ),
+            print_sem_build_summary=True,
         )
 
 class ListBatchExtractor:
