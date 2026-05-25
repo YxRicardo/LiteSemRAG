@@ -337,6 +337,7 @@ class TokenNode:
     df: int = 0
     anomaly_section: list = field(default_factory=list)
     is_placeholder: bool = False
+    force_single_semantic: bool = False
     compositional_head: object | None = None
     compositional_head_text: str | None = None
     compositional_head_text_norm: str | None = None
@@ -530,14 +531,15 @@ def _find_description_match_span(chunk_text, token_text):
 
 class LiteSemRAG:
     # Initialize graph storage, model handles, retrieval settings, and runtime state.
-    def __init__(self, text_embed_dim, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
-                 anomaly_section_size=50,query_token_percentile=0.8,
+    def __init__(self, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
+                 anomaly_section_size=50,
                  retrieve_top_k=5, chunk_size=300, device="cuda",
-                 discard_no_word=False, plot_embeds=False,
+                 discard_no_word=False,
                  sem_description_prompt_context_mode="sentence_neighbors",
                  consensus_ratio_threshold=0.8,
-                 min_description_candidates=3):
-        self.text_embed_dim = text_embed_dim
+                 min_description_candidates=3,
+                 phrase_audit_enabled=False,
+                 phrase_audit_cache_path="cache/phrase_protection_audit.jsonl"):
         self.df_ratio = df_ratio
         self.doc_nodes = []
         self.chunk_nodes = []
@@ -562,9 +564,10 @@ class LiteSemRAG:
         self.chunk_size = chunk_size
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.start_time = None
+        self.index_session_start_time = None
+        self.index_session_document_count = 0
         self.phrase_index = defaultdict(set)
         self.modifier_postings = defaultdict(Counter)
-        self.query_token_percentile = query_token_percentile
         self.nlp = None
         self.phrase_analyzer = None
         self.text_encoder = None
@@ -590,7 +593,6 @@ class LiteSemRAG:
         self.sem_description_log_path = "sem_description_logs.txt"
         self.chunk_avg_len = None
         self.discard_no_word = discard_no_word
-        self.plot_embeds = plot_embeds
         self.sem_description_prompt_context_mode = sem_description_prompt_context_mode
         # Minimum agreement ratio (top predicted description / total samples) required
         # to accept a cross-encoder prediction as the semantic node's description.
@@ -605,6 +607,9 @@ class LiteSemRAG:
         self._wikidata_no_result_keys = set()
         self._sem_description_candidate_bank_cache = {}
         self.sem_build_count = 0
+        self.phrase_audit_enabled = bool(phrase_audit_enabled)
+        self.phrase_audit_cache_path = phrase_audit_cache_path
+        self._phrase_audit_session_id = None
         self.schema_version = CURRENT_SCHEMA_VERSION
 
     # Recompute the average chunk length used by BM25 scoring.
@@ -677,6 +682,56 @@ class LiteSemRAG:
                 **payload,
             }
         )
+
+    # Configure phrase protection audit logging for future indexing calls.
+    def enable_phrase_audit(self, cache_path=None):
+        if cache_path is not None:
+            self.phrase_audit_cache_path = cache_path
+        self.phrase_audit_enabled = True
+        return self.phrase_audit_cache_path
+
+    # Disable phrase protection audit logging.
+    def disable_phrase_audit(self):
+        self.phrase_audit_enabled = False
+
+    # Prepare the JSONL audit cache and return this indexing session ID.
+    def _start_phrase_audit_session(self):
+        if not getattr(self, "phrase_audit_enabled", False):
+            self._phrase_audit_session_id = None
+            return None
+
+        cache_path = getattr(
+            self,
+            "phrase_audit_cache_path",
+            "cache/phrase_protection_audit.jsonl",
+        )
+        cache_dir = os.path.dirname(cache_path)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+        self._phrase_audit_session_id = time.strftime("%Y%m%d_%H%M%S")
+        return self._phrase_audit_session_id
+
+    # Append phrase protection audit records as JSONL.
+    def _append_phrase_audit_records(self, records, doc_name, chunk_node, chunk_index):
+        if not getattr(self, "phrase_audit_enabled", False) or not records:
+            return
+
+        cache_path = getattr(
+            self,
+            "phrase_audit_cache_path",
+            "cache/phrase_protection_audit.jsonl",
+        )
+        session_id = getattr(self, "_phrase_audit_session_id", None)
+        with open(cache_path, "a", encoding="utf-8") as handle:
+            for record in records:
+                payload = {
+                    "session_id": session_id,
+                    "doc_name": doc_name,
+                    "chunk_index": chunk_index,
+                    "chunk_node_id": getattr(chunk_node, "chunk_node_id", None),
+                    **record,
+                }
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     # Build a compact snapshot for a semantic node before it is merged away.
     def _build_sem_node_merge_snapshot(self, sem_node):
@@ -756,6 +811,12 @@ class LiteSemRAG:
         self.sem_nodes.append(new_sem_node)
         token_node.has_semantic = True
         return new_sem_node
+
+    # Keep semantic node IDs aligned with the current semantic-node list.
+    def _reset_sem_node_ids(self):
+        for index, sem_node in enumerate(self.sem_nodes):
+            sem_node.sem_node_id = index
+        self.next_sem_node_id = len(self.sem_nodes)
 
     # Return the runtime phrase analyzer used by indexing.
     def _get_phrase_analyzer(self):
@@ -1146,7 +1207,9 @@ class LiteSemRAG:
 
     # Build semantic nodes from buffered token embeddings.
     def build_sem_node(self, token_node):
-        if token_node.node_type == "token" and not self.semantic_type_cls(token_node):
+        if getattr(token_node, "force_single_semantic", False):
+            self.create_basic_sem_node(token_node)
+        elif token_node.node_type == "token" and not self.semantic_type_cls(token_node):
             self.create_basic_sem_node(token_node)
         else:
             self._build_sem_node_from_cluster(token_node, list(token_node.embeds_buffer))
@@ -1171,6 +1234,28 @@ class LiteSemRAG:
     # Print an elapsed-time progress message for the current operation.
     def log_time(self, msg):
         print(f"[{time.perf_counter() - self.start_time:.4f}s] {msg}")
+
+    # Start the wall-clock timer for one indexing session.
+    def _start_index_session_timer(
+        self,
+        indexed_document_count,
+        start_time=None,
+    ):
+        start_time = time.perf_counter() if start_time is None else start_time
+        self.start_time = start_time
+        self.index_session_start_time = start_time
+        self.index_session_document_count = indexed_document_count
+
+    # Print total index-through-finalize time and average time per indexed document.
+    def _print_index_session_timing(self):
+        if self.index_session_start_time is None:
+            return
+
+        elapsed = time.perf_counter() - self.index_session_start_time
+        print(f"Index + finalize elapsed time: {elapsed:.2f}s")
+        if self.index_session_document_count > 0:
+            avg_seconds = elapsed / self.index_session_document_count
+            print(f"Average time per indexed document: {avg_seconds:.4f}s")
 
     # Create a throttled console progress updater for long loops.
     def _make_progress_updater(self, label, total, min_interval=0.2):
@@ -1218,6 +1303,24 @@ class LiteSemRAG:
 
     # Populate missing attributes when loading graphs saved by older code versions.
     def _ensure_backward_compatible_attrs(self):
+        if not hasattr(self, "index_session_start_time"):
+            self.index_session_start_time = None
+        if not hasattr(self, "index_session_document_count"):
+            self.index_session_document_count = getattr(
+                self,
+                "index_session_record_count",
+                None,
+            )
+            if self.index_session_document_count is None:
+                self.index_session_document_count = getattr(
+                    self,
+                    "index_session_sample_count",
+                    0,
+                ) or 0
+        if hasattr(self, "index_session_record_count"):
+            del self.index_session_record_count
+        if hasattr(self, "index_session_sample_count"):
+            del self.index_session_sample_count
         if getattr(self, "schema_version", None) == CURRENT_SCHEMA_VERSION:
             return
         if not hasattr(self, "phrase_analyzer"):
@@ -1270,8 +1373,6 @@ class LiteSemRAG:
             self.sem_description_model = self.proto_description_model
         if not hasattr(self, "discard_no_word"):
             self.discard_no_word = False
-        if not hasattr(self, "plot_embeds"):
-            self.plot_embeds = False
         if not hasattr(self, "encoder_lock") or self.encoder_lock is None:
             self.encoder_lock = threading.Lock()
         if not hasattr(self, "sem_description_prompt_context_mode"):
@@ -1304,6 +1405,12 @@ class LiteSemRAG:
             self._wikidata_no_result_keys = set()
         if not hasattr(self, "_sem_description_candidate_bank_cache"):
             self._sem_description_candidate_bank_cache = {}
+        if not hasattr(self, "phrase_audit_enabled"):
+            self.phrase_audit_enabled = False
+        if not hasattr(self, "phrase_audit_cache_path"):
+            self.phrase_audit_cache_path = "cache/phrase_protection_audit.jsonl"
+        if not hasattr(self, "_phrase_audit_session_id"):
+            self._phrase_audit_session_id = None
         if not hasattr(self, "sem_description_model_name"):
             self.sem_description_model_name = "cross-encoder/nli-deberta-v3-large"
         if not hasattr(self, "sem_description_model"):
@@ -1393,6 +1500,8 @@ class LiteSemRAG:
             token_node.span_occurrences = []
         if not hasattr(token_node, "is_placeholder"):
             token_node.is_placeholder = False
+        if not hasattr(token_node, "force_single_semantic"):
+            token_node.force_single_semantic = False
         if not hasattr(token_node, "compositional_head"):
             token_node.compositional_head = None
         if not hasattr(token_node, "compositional_head_text"):
@@ -2243,6 +2352,7 @@ class LiteSemRAG:
         log_path = self._save_sem_description_logs_to_timestamped_file()
         self.log_time(f"Saved sem description logs to {log_path}.")
         self.log_time("Finalizing completed.")
+        self._print_index_session_timing()
 
     # Persist sem description logs to a timestamped file under <project_root>/logs/.
     def _save_sem_description_logs_to_timestamped_file(self):
@@ -2265,6 +2375,20 @@ class LiteSemRAG:
             if not token_node.has_semantic:
                 self.create_basic_sem_node(token_node)
             elif len(token_node.anomaly_section) > 0:
+                if (
+                    getattr(token_node, "force_single_semantic", False)
+                    and token_node.sem_node_list
+                ):
+                    for item in token_node.anomaly_section:
+                        self._append_sem_occurrence(
+                            token_node.sem_node_list[0],
+                            item.text_embedding,
+                            edge_weight=1.0,
+                        )
+                    token_node.anomaly_section.clear()
+                    token_node.embeds_buffer.clear()
+                    progress_update(index)
+                    continue
                 for item in token_node.anomaly_section:
                     self._append_sem_occurrence(
                         token_node.sem_node_list[item.max_idx],
@@ -3128,6 +3252,7 @@ class LiteSemRAG:
             self._log_sem_description_operation(event_type, **log_payload)
 
         token_node.has_semantic = bool(new_sem_nodes)
+        self._reset_sem_node_ids()
 
         if recorder is not None and record_snapshot is not None:
             te_to_index = {id(te): idx for idx, te in enumerate(cluster_text_embeddings)}
@@ -3449,9 +3574,7 @@ class LiteSemRAG:
             sem_node for sem_node in self.sem_nodes
             if id(sem_node) not in redundant_sem_ids
         ]
-        for index, sem_node in enumerate(self.sem_nodes):
-            sem_node.sem_node_id = index
-        self.next_sem_node_id = len(self.sem_nodes)
+        self._reset_sem_node_ids()
         if total_token_nodes > 0:
             progress_update(total_token_nodes, force=True)
             print()
@@ -4015,6 +4138,11 @@ class LiteSemRAG:
             token_node = self._get_or_create_token_node(text, is_placeholder=False)
             if token_node is None:
                 continue
+            if (
+                occurrence_metadata
+                and occurrence_metadata.get("phrase_type") == PHRASE_TYPE_ATOMIC
+            ):
+                token_node.force_single_semantic = True
             self._register_compositional_phrase_relation(
                 token_node,
                 occurrence_metadata,
@@ -4024,6 +4152,17 @@ class LiteSemRAG:
                 token_node.embeds_buffer.append(text_embedding)
             else:
                 if token_node.has_semantic:
+                    if (
+                        getattr(token_node, "force_single_semantic", False)
+                        and token_node.sem_node_list
+                    ):
+                        self._append_sem_occurrence(
+                            token_node.sem_node_list[0],
+                            text_embedding,
+                            edge_weight=1.0,
+                        )
+                        self._append_token_occurrence(token_node, text_embedding)
+                        continue
                     max_val, max_idx = inspect_sem_nodes(embed, token_node.sem_node_list)
                     if max_val >= token_node.sem_node_list[max_idx].anomaly_threshold:
                         self._append_sem_occurrence(
@@ -4183,9 +4322,7 @@ class LiteSemRAG:
                 valid_sem_nodes.append(sem_node)
 
         self.sem_nodes = valid_sem_nodes
-        for index, sem_node in enumerate(self.sem_nodes):
-            sem_node.sem_node_id = index
-        self.next_sem_node_id = len(self.sem_nodes)
+        self._reset_sem_node_ids()
 
         valid_sem_ids = {id(sem_node) for sem_node in self.sem_nodes}
         valid_token_nodes = []
@@ -4295,6 +4432,7 @@ class LiteSemRAG:
             self.start_time = time.perf_counter()
         if reset_sem_build_stats:
             self._reset_sem_build_stats()
+        self._start_phrase_audit_session()
 
         total_chunks = len(chunk_records)
         doc_node_map = {}
@@ -4389,12 +4527,27 @@ class LiteSemRAG:
                         chunk_text, new_doc_node
                     )
 
-                    phrases, tokens = extract_important_spans(
-                        chunk_text,
-                        self.nlp,
-                        min_tokens=2,
-                        discard_no_word=self.discard_no_word
-                    )
+                    if getattr(self, "phrase_audit_enabled", False):
+                        phrases, tokens, phrase_audit_records = extract_important_spans(
+                            chunk_text,
+                            self.nlp,
+                            min_tokens=2,
+                            discard_no_word=self.discard_no_word,
+                            return_phrase_audit=True,
+                        )
+                        self._append_phrase_audit_records(
+                            phrase_audit_records,
+                            doc_name,
+                            new_chunk_node,
+                            idx,
+                        )
+                    else:
+                        phrases, tokens = extract_important_spans(
+                            chunk_text,
+                            self.nlp,
+                            min_tokens=2,
+                            discard_no_word=self.discard_no_word,
+                        )
                     phrases = self._prepare_index_phrase_spans(chunk_text, phrases)
 
                     if not safe_queue_put(
@@ -4549,8 +4702,7 @@ class LiteSemRAG:
 
     # Index one document with staged CPU preprocessing, GPU encoding, and CPU consumption.
     def index_document_parallel(self, doc_name, batch_size=8, queue_size=4):
-        self.start_time = time.perf_counter()
-        document_start_time = time.perf_counter()
+        index_start_time = time.perf_counter()
         chunk_records = [
             {
                 "doc_name": doc_name,
@@ -4558,13 +4710,17 @@ class LiteSemRAG:
             }
             for chunk_text in split_doc(doc_name, self.nlp, max_tokens=self.chunk_size)
         ]
+        self._start_index_session_timer(
+            indexed_document_count=1,
+            start_time=index_start_time,
+        )
         self._index_chunk_records_pipeline(
             chunk_records,
             batch_size=batch_size,
             queue_size=queue_size,
             completion_message=lambda: (
                 f"File {doc_name} completed. "
-                f"Index time: {time.perf_counter() - document_start_time:.4f}s"
+                f"Index pipeline time: {time.perf_counter() - index_start_time:.4f}s"
             ),
         )
 
@@ -5408,14 +5564,19 @@ class LiteSemRAG:
 
     # Convert serialized integer IDs back into object references.
     def node_id2instance(self):
+        doc_by_id = {doc_node.doc_node_id: doc_node for doc_node in self.doc_nodes}
+        chunk_by_id = {chunk_node.chunk_node_id: chunk_node for chunk_node in self.chunk_nodes}
+        sem_by_id = {sem_node.sem_node_id: sem_node for sem_node in self.sem_nodes}
+        token_by_id = {token_node.token_node_id: token_node for token_node in self.token_nodes}
+
         for chunk_node in self.chunk_nodes:
-            chunk_node.doc_node = self.doc_nodes[chunk_node.doc_node]
-            chunk_node.sem_node_list = [self.sem_nodes[idx] for idx in chunk_node.sem_node_list]
+            chunk_node.doc_node = doc_by_id[chunk_node.doc_node]
+            chunk_node.sem_node_list = [sem_by_id[idx] for idx in chunk_node.sem_node_list]
         for doc_node in self.doc_nodes:
-            doc_node.chunk_node_list = [self.chunk_nodes[idx] for idx in doc_node.chunk_node_list]
+            doc_node.chunk_node_list = [chunk_by_id[idx] for idx in doc_node.chunk_node_list]
         for sem_node in self.sem_nodes:
-            sem_node.chunk_node_list = [self.chunk_nodes[idx] for idx in sem_node.chunk_node_list]
-            sem_node.token_node = self.token_nodes[sem_node.token_node]
+            sem_node.chunk_node_list = [chunk_by_id[idx] for idx in sem_node.chunk_node_list]
+            sem_node.token_node = token_by_id[sem_node.token_node]
             if not hasattr(sem_node, "description"):
                 sem_node.description = self._get_initial_sem_description(sem_node.token_node)
             self._ensure_sem_node_backward_compatible_attrs(sem_node)
@@ -5425,37 +5586,42 @@ class LiteSemRAG:
                     for chunk_node in sem_node.chunk_node_list
                 ]
             for text_embedding in sem_node.retained_text_embeddings:
-                text_embedding.chunk_node = self.chunk_nodes[text_embedding.chunk_node]
+                text_embedding.chunk_node = chunk_by_id[text_embedding.chunk_node]
         for token_node in self.token_nodes:
-            token_node.sem_node_list = [self.sem_nodes[idx] for idx in token_node.sem_node_list]
+            token_node.sem_node_list = [sem_by_id[idx] for idx in token_node.sem_node_list]
             self._ensure_token_node_backward_compatible_attrs(token_node)
             head_id = getattr(token_node, "compositional_head", None)
             if isinstance(head_id, int):
-                token_node.compositional_head = self.token_nodes[head_id]
+                token_node.compositional_head = token_by_id[head_id]
             token_node.compositional_modifiers = [
-                self.token_nodes[idx] if isinstance(idx, int) else idx
+                token_by_id[idx] if isinstance(idx, int) else idx
                 for idx in getattr(token_node, "compositional_modifiers", []) or []
             ]
             for record in getattr(token_node, "headed_phrase_records", {}).values():
                 phrase_token_id = record.get("phrase_token_node")
                 if isinstance(phrase_token_id, int):
-                    record["phrase_token_node"] = self.token_nodes[phrase_token_id]
+                    record["phrase_token_node"] = token_by_id[phrase_token_id]
                 for occurrence in record.get("occurrences", []):
                     chunk_id = occurrence.get("chunk_node")
                     if isinstance(chunk_id, int):
-                        occurrence["chunk_node"] = self.chunk_nodes[chunk_id]
+                        occurrence["chunk_node"] = chunk_by_id[chunk_id]
+        self._reset_sem_node_ids()
 
     # Index a list of document records with a staged CPU/GPU pipeline.
-    def index_json(self, chunk_list, batch_size=8, queue_size=4):
-        """Index JSON chunk records shaped as {"title": str, "text": str}."""
-        self.start_time = time.perf_counter()
+    def index_json(self, chunk_list, batch_size=8, queue_size=4, sample_count=None):
+        """Index JSON document records shaped as {"title": str, "text": str}.
+
+        Timing summaries always report the average per indexed document.
+        sample_count is accepted for backward compatibility and ignored.
+        """
+        index_start_time = time.perf_counter()
         chunk_records = []
         for idx, chunk in enumerate(chunk_list):
             missing_keys = {"title", "text"} - set(chunk)
             if missing_keys:
                 missing = ", ".join(sorted(missing_keys))
                 raise ValueError(
-                    f"JSON chunk record at index {idx} is missing required key(s): {missing}"
+                    f"JSON document record at index {idx} is missing required key(s): {missing}"
                 )
             chunk_records.append(
                 {
@@ -5464,13 +5630,18 @@ class LiteSemRAG:
                 }
             )
 
+        indexed_document_count = len({record["doc_name"] for record in chunk_records})
+        self._start_index_session_timer(
+            indexed_document_count=indexed_document_count,
+            start_time=index_start_time,
+        )
         self._index_chunk_records_pipeline(
             chunk_records,
             batch_size=batch_size,
             queue_size=queue_size,
             completion_message=lambda: (
-                f"Index {len(chunk_records)} documents. "
-                f"Index time: {time.perf_counter() - self.start_time:.4f}s"
+                f"Index {indexed_document_count} documents. "
+                f"Index pipeline time: {time.perf_counter() - index_start_time:.4f}s"
             ),
             print_sem_build_summary=True,
         )

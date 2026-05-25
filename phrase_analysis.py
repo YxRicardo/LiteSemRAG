@@ -117,18 +117,18 @@ class PhraseAnalyzer:
         """
         raw_text = self._resolve_raw_text(span_text, chunk_text, span_start, span_end)
         phrase_text_norm = normalize_text(span_text or raw_text)
-        if self._token_count(phrase_text_norm) <= 1:
+        doc = self._ensure_doc(chunk_text, raw_text, doc)
+        span = self._resolve_spacy_span(doc, raw_text, span_start, span_end)
+        ent = self._find_matching_entity(doc, raw_text, span_start, span_end)
+
+        atomic_reason = self._atomic_reason(phrase_text_norm, ent)
+        if self._token_count(phrase_text_norm) <= 1 and atomic_reason is None:
             return PhraseAnalysis(
                 phrase_text=raw_text,
                 phrase_text_norm=phrase_text_norm,
                 phrase_type=PHRASE_TYPE_SINGLE_TOKEN,
             )
 
-        doc = self._ensure_doc(chunk_text, raw_text, doc)
-        span = self._resolve_spacy_span(doc, raw_text, span_start, span_end)
-        ent = self._find_matching_entity(doc, raw_text, span_start, span_end)
-
-        atomic_reason = self._atomic_reason(phrase_text_norm, ent)
         if span is not None:
             head_info = self._head_and_modifiers(span, doc)
         else:
