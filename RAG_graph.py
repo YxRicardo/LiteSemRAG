@@ -551,6 +551,8 @@ class LiteSemRAG:
                  llm_semantic_labeler_cache_path="cache/llm_semantic_label_cache.sqlite3",
                  llm_semantic_labeler_context_word_window=20,
                  llm_semantic_labeler_max_tokens=256,
+                 fft_knn_check_k=5,
+                 fft_danger_neighbor_m=10,
                  phrase_audit_enabled=False,
                  phrase_audit_cache_path="cache/phrase_protection_audit.jsonl"):
         self.df_ratio = df_ratio
@@ -619,6 +621,8 @@ class LiteSemRAG:
         self.llm_semantic_label_cache_hits = 0
         self.llm_semantic_label_cache_misses = 0
         self.fft_propagation_wall_time = 0.0
+        self.fft_knn_check_k = max(0, int(fft_knn_check_k))
+        self.fft_danger_neighbor_m = max(0, int(fft_danger_neighbor_m))
         self.sem_description_batch_size = 32
         self.sem_description_use_detailed_description = False
         self.sem_description_require_detailed_description = True
@@ -1564,6 +1568,10 @@ class LiteSemRAG:
             self.llm_semantic_label_cache_misses = 0
         if not hasattr(self, "fft_propagation_wall_time"):
             self.fft_propagation_wall_time = 0.0
+        if not hasattr(self, "fft_knn_check_k"):
+            self.fft_knn_check_k = 5
+        if not hasattr(self, "fft_danger_neighbor_m"):
+            self.fft_danger_neighbor_m = 10
         if not hasattr(self, "sem_description_batch_size"):
             self.sem_description_batch_size = 32
         if not hasattr(self, "sem_description_use_detailed_description"):
@@ -3131,6 +3139,20 @@ class LiteSemRAG:
         total = dists.sum(dim=1)
         return int(torch.argmin(total).item())
 
+    # Return nearest text-embedding indices by cosine distance inside one FFT cluster.
+    def _nearest_cluster_text_embedding_indices(self, cluster_text_embeddings, target_idx, count):
+        if count <= 0 or len(cluster_text_embeddings) <= 1:
+            return []
+        target_embed = cluster_text_embeddings[target_idx].embed
+        target_vec = F.normalize(target_embed, p=2, dim=0).unsqueeze(0)
+        embed_stack = torch.stack(
+            [F.normalize(te.embed, p=2, dim=0) for te in cluster_text_embeddings]
+        )
+        dists = (1.0 - (target_vec @ embed_stack.T).squeeze(0)).clamp(min=0.0)
+        dists[target_idx] = float("inf")
+        neighbor_count = min(int(count), len(cluster_text_embeddings) - 1)
+        return [int(idx.item()) for idx in torch.argsort(dists)[:neighbor_count]]
+
     # Create a new sem node initialized from a subset of cluster text embeddings (build-time path).
     def _create_sem_node_from_cluster_subset(self, token_node, description, text_embeddings):
         new_sem_node = self.create_sem_node(token_node)
@@ -3214,6 +3236,8 @@ class LiteSemRAG:
             "token_node_id": getattr(token_node, "token_node_id", None),
             "sem_node_id": sem_node.sem_node_id,
             "consensus_ratio_threshold": self.consensus_ratio_threshold,
+            "fft_knn_check_k": self.fft_knn_check_k,
+            "fft_danger_neighbor_m": self.fft_danger_neighbor_m,
             "all_text_embeddings": all_text_embeddings,
             "sampled_indices": sampled_indices,
             "candidate_bank": candidate_bank_snapshot,
@@ -3434,82 +3458,36 @@ class LiteSemRAG:
             self._get_span_occurrence_key(te.to_span_occurrence()): te
             for te in cluster_text_embeddings
         }
-        initial_sample_keys = {
-            self._get_span_occurrence_key(record["span_occurrence"])
+        te_to_index = {id(te): idx for idx, te in enumerate(cluster_text_embeddings)}
+        prediction_cache = {
+            self._get_span_occurrence_key(record["span_occurrence"]): record
             for record in sample_records
         }
 
-        final_groups = defaultdict(list)
-        class_medoid_embeds = {}
-        sample_assignments = []
+        def _prediction_record_from_candidate(te, top_candidate):
+            span_occurrence = te.to_span_occurrence()
+            return {
+                "span_occurrence": span_occurrence,
+                "chunk_node_id": te.chunk_node.chunk_node_id,
+                "span_start": te.span_start,
+                "span_end": te.span_end,
+                "context_text": None,
+                "matched_text": te.span_text,
+                "predicted_entity_id": top_candidate.get("entity_id"),
+                "predicted_label": top_candidate.get("label"),
+                "predicted_description": top_candidate.get("description"),
+                "predicted_definition": top_candidate.get("definition"),
+                "prediction_score": top_candidate.get("score"),
+                "prediction_method": top_candidate.get("prediction_method", "cross_encoder"),
+                "llm_reason": top_candidate.get("llm_reason"),
+                "llm_cache_hit": top_candidate.get("llm_cache_hit"),
+            }
 
-        for description, records in valid_classes.items():
-            class_tes = []
-            for record in records:
-                key = self._get_span_occurrence_key(record["span_occurrence"])
-                te = embedding_lookup.get(key)
-                if te is None:
-                    continue
-                class_tes.append(te)
-            if len(class_tes) < 2:
-                raise ValueError(
-                    f"Valid class {description!r} lost members during embedding lookup for "
-                    f"sem_node {sem_node.sem_node_id} (token={token_node.token_text!r})."
-                )
-            medoid_idx = self._compute_medoid_index([te.embed for te in class_tes])
-            class_medoid_embeds[description] = class_tes[medoid_idx].embed
-            final_groups[description].extend(class_tes)
-            for te in class_tes:
-                sample_assignments.append({
-                    "provenance": "class_seed",
-                    "description": description,
-                    "text_embedding": te,
-                })
-
-        unclassified_records = []
-        for record in sample_records:
-            if record["predicted_description"] in valid_classes:
-                continue
-            key = self._get_span_occurrence_key(record["span_occurrence"])
-            te = embedding_lookup.get(key)
-            if te is None:
-                continue
-            unclassified_records.append((te, record["predicted_description"]))
-        for te in cluster_text_embeddings:
+        def _get_or_predict_record(te):
             key = self._get_span_occurrence_key(te.to_span_occurrence())
-            if key not in initial_sample_keys:
-                unclassified_records.append((te, None))
-
-        medoid_descriptions = list(class_medoid_embeds.keys())
-        medoid_stack = torch.stack(
-            [F.normalize(class_medoid_embeds[d], p=2, dim=0) for d in medoid_descriptions]
-        )
-
-        model_judgment_records = []
-        for te, singleton_description in unclassified_records:
-            sample_vec = F.normalize(te.embed, p=2, dim=0).unsqueeze(0)
-            sims = (sample_vec @ medoid_stack.T).squeeze(0)
-            dists = (1.0 - sims).clamp(min=0.0)
-            sorted_dists, sorted_idx = torch.sort(dists)
-            d1 = float(sorted_dists[0].item())
-            d2 = float(sorted_dists[1].item())
-            ratio = (d1 / d2) if d2 > 0 else float("inf")
-            if d2 > 0 and ratio <= 0.8:
-                chosen_desc = medoid_descriptions[int(sorted_idx[0].item())]
-                final_groups[chosen_desc].append(te)
-                sample_assignments.append({
-                    "provenance": "d1_d2",
-                    "description": chosen_desc,
-                    "text_embedding": te,
-                    "d1": d1,
-                    "d2": d2,
-                    "ratio": ratio,
-                    "singleton_class_description": singleton_description,
-                })
-            else:
-                model_judgment_records.append((te, singleton_description, d1, d2, ratio))
-
-        for te, singleton_description, d1, d2, ratio in model_judgment_records:
+            cached = prediction_cache.get(key)
+            if cached is not None:
+                return cached
             span_occurrence = te.to_span_occurrence()
             if getattr(self, "use_llm_semantic_labeler", False):
                 top_candidate = self._predict_description_for_span_occurrence_with_llm(
@@ -3525,6 +3503,167 @@ class LiteSemRAG:
                     self.sem_description_model,
                 )
             if top_candidate is None:
+                return None
+            record = _prediction_record_from_candidate(te, top_candidate)
+            prediction_cache[key] = record
+            return record
+
+        final_groups = defaultdict(list)
+        class_medoid_embeds = {}
+        sample_assignments = []
+        danger_indices = set()
+        safety_checks = []
+        safe_class_tes = defaultdict(list)
+
+        for description, records in valid_classes.items():
+            for record in records:
+                key = self._get_span_occurrence_key(record["span_occurrence"])
+                te = embedding_lookup.get(key)
+                if te is None:
+                    continue
+                seed_idx = te_to_index.get(id(te))
+                if seed_idx is None:
+                    continue
+                neighbor_indices = self._nearest_cluster_text_embedding_indices(
+                    cluster_text_embeddings,
+                    seed_idx,
+                    self.fft_knn_check_k,
+                )
+                neighbor_descriptions = []
+                is_safe = bool(neighbor_indices)
+                for neighbor_idx in neighbor_indices:
+                    neighbor_te = cluster_text_embeddings[neighbor_idx]
+                    neighbor_record = _get_or_predict_record(neighbor_te)
+                    neighbor_description = (
+                        neighbor_record.get("predicted_description")
+                        if neighbor_record is not None
+                        else None
+                    )
+                    neighbor_descriptions.append(neighbor_description)
+                    if neighbor_description != description:
+                        is_safe = False
+
+                danger_neighbor_indices = []
+                if is_safe:
+                    safe_class_tes[description].append(te)
+                else:
+                    danger_indices.add(seed_idx)
+                    danger_neighbor_indices = self._nearest_cluster_text_embedding_indices(
+                        cluster_text_embeddings,
+                        seed_idx,
+                        self.fft_danger_neighbor_m,
+                    )
+                    danger_indices.update(danger_neighbor_indices)
+
+                safety_checks.append(
+                    {
+                        "seed_index": seed_idx,
+                        "description": description,
+                        "is_safe": bool(is_safe),
+                        "knn_neighbor_indices": neighbor_indices,
+                        "knn_neighbor_descriptions": neighbor_descriptions,
+                        "danger_neighbor_indices": danger_neighbor_indices,
+                    }
+                )
+
+        safe_class_tes = {
+            description: [
+                te for te in tes
+                if te_to_index.get(id(te)) not in danger_indices
+            ]
+            for description, tes in safe_class_tes.items()
+        }
+        safe_class_tes = {
+            description: tes
+            for description, tes in safe_class_tes.items()
+            if tes
+        }
+
+        assigned_keys = set()
+        for description, class_tes in safe_class_tes.items():
+            medoid_idx = self._compute_medoid_index([te.embed for te in class_tes])
+            class_medoid_embeds[description] = class_tes[medoid_idx].embed
+            final_groups[description].extend(class_tes)
+            for te in class_tes:
+                assigned_keys.add(self._get_span_occurrence_key(te.to_span_occurrence()))
+                sample_assignments.append({
+                    "provenance": "class_seed",
+                    "description": description,
+                    "text_embedding": te,
+                    "safety": "safe",
+                })
+
+        medoid_descriptions = list(class_medoid_embeds.keys())
+        medoid_stack = None
+        if medoid_descriptions:
+            medoid_stack = torch.stack(
+                [F.normalize(class_medoid_embeds[d], p=2, dim=0) for d in medoid_descriptions]
+            )
+
+        unclassified_records = []
+        for te in cluster_text_embeddings:
+            key = self._get_span_occurrence_key(te.to_span_occurrence())
+            if key in assigned_keys:
+                continue
+            te_idx = te_to_index.get(id(te))
+            cached_record = prediction_cache.get(key)
+            singleton_description = (
+                cached_record.get("predicted_description")
+                if cached_record is not None
+                else None
+            )
+            is_danger_zone = te_idx in danger_indices
+            unclassified_records.append((te, singleton_description, is_danger_zone))
+
+        model_judgment_records = []
+        if len(medoid_descriptions) == 1:
+            only_desc = medoid_descriptions[0]
+            for te, singleton_description, is_danger_zone in unclassified_records:
+                if is_danger_zone:
+                    model_judgment_records.append((te, singleton_description, None, None, None))
+                    continue
+                final_groups[only_desc].append(te)
+                sample_assignments.append({
+                    "provenance": "single_safe_class",
+                    "description": only_desc,
+                    "text_embedding": te,
+                    "singleton_class_description": singleton_description,
+                })
+        elif len(medoid_descriptions) >= 2:
+            for te, singleton_description, is_danger_zone in unclassified_records:
+                if is_danger_zone:
+                    model_judgment_records.append((te, singleton_description, None, None, None))
+                    continue
+                sample_vec = F.normalize(te.embed, p=2, dim=0).unsqueeze(0)
+                sims = (sample_vec @ medoid_stack.T).squeeze(0)
+                dists = (1.0 - sims).clamp(min=0.0)
+                sorted_dists, sorted_idx = torch.sort(dists)
+                d1 = float(sorted_dists[0].item())
+                d2 = float(sorted_dists[1].item())
+                ratio = (d1 / d2) if d2 > 0 else float("inf")
+                if d2 > 0 and ratio <= 0.8:
+                    chosen_desc = medoid_descriptions[int(sorted_idx[0].item())]
+                    final_groups[chosen_desc].append(te)
+                    sample_assignments.append({
+                        "provenance": "d1_d2",
+                        "description": chosen_desc,
+                        "text_embedding": te,
+                        "d1": d1,
+                        "d2": d2,
+                        "ratio": ratio,
+                        "singleton_class_description": singleton_description,
+                    })
+                else:
+                    model_judgment_records.append((te, singleton_description, d1, d2, ratio))
+        else:
+            for te, singleton_description, _is_danger_zone in unclassified_records:
+                model_judgment_records.append((te, singleton_description, None, None, None))
+
+        for te, singleton_description, d1, d2, ratio in model_judgment_records:
+            prediction_record = _get_or_predict_record(te)
+            if prediction_record is None:
+                if medoid_stack is None:
+                    continue
                 sample_vec = F.normalize(te.embed, p=2, dim=0).unsqueeze(0)
                 sims = (sample_vec @ medoid_stack.T).squeeze(0)
                 dists = (1.0 - sims).clamp(min=0.0)
@@ -3542,18 +3681,18 @@ class LiteSemRAG:
                     "singleton_class_description": singleton_description,
                 })
             else:
-                final_groups[top_candidate["description"]].append(te)
+                final_groups[prediction_record["predicted_description"]].append(te)
                 sample_assignments.append({
                     "provenance": "model_judgment",
-                    "description": top_candidate["description"],
+                    "description": prediction_record["predicted_description"],
                     "text_embedding": te,
-                    "predicted_entity_id": top_candidate.get("entity_id"),
-                    "predicted_label": top_candidate.get("label"),
-                    "predicted_definition": top_candidate.get("definition"),
-                    "score": top_candidate.get("score"),
-                    "prediction_method": top_candidate.get("prediction_method", "cross_encoder"),
-                    "llm_reason": top_candidate.get("llm_reason"),
-                    "llm_cache_hit": top_candidate.get("llm_cache_hit"),
+                    "predicted_entity_id": prediction_record.get("predicted_entity_id"),
+                    "predicted_label": prediction_record.get("predicted_label"),
+                    "predicted_definition": prediction_record.get("predicted_definition"),
+                    "score": prediction_record.get("prediction_score"),
+                    "prediction_method": prediction_record.get("prediction_method", "cross_encoder"),
+                    "llm_reason": prediction_record.get("llm_reason"),
+                    "llm_cache_hit": prediction_record.get("llm_cache_hit"),
                     "d1": d1,
                     "d2": d2,
                     "ratio": ratio,
@@ -3568,13 +3707,22 @@ class LiteSemRAG:
             "cluster_sample_count": len(cluster_text_embeddings),
             "initial_prediction_sample_count": len(sample_records),
             "valid_class_count": len(valid_classes),
+            "safe_class_count": len(safe_class_tes),
+            "safe_seed_count": sum(len(tes) for tes in safe_class_tes.values()),
+            "danger_seed_count": sum(1 for item in safety_checks if not item["is_safe"]),
+            "danger_zone_count": len(danger_indices),
             "singleton_class_count": len(description_groups) - len(valid_classes),
             "class_seed_sample_count": provenance_counts.get("class_seed", 0),
+            "single_safe_class_assigned_count": provenance_counts.get("single_safe_class", 0),
             "d1_d2_assigned_count": provenance_counts.get("d1_d2", 0),
             "model_judgment_count": provenance_counts.get("model_judgment", 0),
             "medoid_fallback_count": provenance_counts.get("medoid_fallback", 0),
             "description_counts": {d: len(tes) for d, tes in final_groups.items()},
             "initial_class_sizes": {d: len(r) for d, r in description_groups.items()},
+            "safe_class_sizes": {d: len(tes) for d, tes in safe_class_tes.items()},
+            "fft_knn_check_k": self.fft_knn_check_k,
+            "fft_danger_neighbor_m": self.fft_danger_neighbor_m,
+            "safety_checks": safety_checks,
         }
         self._log_sem_description_operation(
             "split_sem_node_by_sample_labels",
@@ -3641,6 +3789,9 @@ class LiteSemRAG:
                 log_payload["d1"] = entry["d1"]
                 log_payload["d2"] = entry["d2"]
                 log_payload["ratio"] = entry["ratio"]
+                log_payload["singleton_class_description"] = entry["singleton_class_description"]
+            elif provenance == "single_safe_class":
+                event_type = "assign_sample_by_single_safe_class"
                 log_payload["singleton_class_description"] = entry["singleton_class_description"]
             elif provenance == "model_judgment":
                 event_type = "assign_sample_by_model_judgment"
@@ -3996,6 +4147,7 @@ class LiteSemRAG:
         sample_assignment_event_types = {
             "assign_sample_as_class_seed",
             "assign_sample_by_d1_d2",
+            "assign_sample_by_single_safe_class",
             "assign_sample_by_model_judgment",
             "assign_sample_by_medoid_fallback",
         }
@@ -4033,6 +4185,8 @@ class LiteSemRAG:
                 f"token={event.get('token_text')!r} | source_chunk_count={event.get('source_chunk_count')} | "
                 f"cluster_samples={event.get('cluster_sample_count')} | "
                 f"valid_classes={event.get('valid_class_count')} | "
+                f"safe_classes={event.get('safe_class_count')} | "
+                f"danger_zone={event.get('danger_zone_count')} | "
                 f"singleton_classes={event.get('singleton_class_count')} | "
                 f"initial_class_sizes={{{initial_repr}}} | final_description_counts={{{final_repr}}}"
             )
@@ -4179,11 +4333,18 @@ class LiteSemRAG:
                     )
                 )
                 lines.append(
-                    "    valid_classes={} | singleton_classes={} | "
-                    "class_seed={} | d1_d2={} | model_judgment={} | medoid_fallback={}".format(
+                    "    valid_classes={} | safe_classes={} | safe_seeds={} | "
+                    "danger_seeds={} | danger_zone={} | singleton_classes={} | "
+                    "class_seed={} | single_safe_class={} | d1_d2={} | "
+                    "model_judgment={} | medoid_fallback={}".format(
                         event.get("valid_class_count"),
+                        event.get("safe_class_count"),
+                        event.get("safe_seed_count"),
+                        event.get("danger_seed_count"),
+                        event.get("danger_zone_count"),
                         event.get("singleton_class_count"),
                         event.get("class_seed_sample_count"),
+                        event.get("single_safe_class_assigned_count"),
                         event.get("d1_d2_assigned_count"),
                         event.get("model_judgment_count"),
                         event.get("medoid_fallback_count"),
@@ -4200,6 +4361,12 @@ class LiteSemRAG:
                     lines.append(
                         "    final_description_counts: "
                         + ", ".join(f"{desc!r}={count}" for desc, count in final_sizes.items())
+                    )
+                safe_sizes = event.get("safe_class_sizes") or {}
+                if safe_sizes:
+                    lines.append(
+                        "    safe_class_sizes: "
+                        + ", ".join(f"{desc!r}={count}" for desc, count in safe_sizes.items())
                     )
                 created_events = create_split_by_source.get(source_id, [])
                 if created_events:
@@ -4312,9 +4479,10 @@ class LiteSemRAG:
                             for entry in target_assignment_events
                         )
                         lines.append(
-                            "        assignment_summary: class_seed={} | d1_d2={} | "
-                            "model_judgment={} | medoid_fallback={}".format(
+                            "        assignment_summary: class_seed={} | single_safe_class={} | "
+                            "d1_d2={} | model_judgment={} | medoid_fallback={}".format(
                                 assignment_counts.get("assign_sample_as_class_seed", 0),
+                                assignment_counts.get("assign_sample_by_single_safe_class", 0),
                                 assignment_counts.get("assign_sample_by_d1_d2", 0),
                                 assignment_counts.get("assign_sample_by_model_judgment", 0),
                                 assignment_counts.get("assign_sample_by_medoid_fallback", 0),
@@ -4392,6 +4560,12 @@ class LiteSemRAG:
                 f"[d1_d2]     target_sem_node_id={target} | description={description!r} | "
                 f"d1={self._safe_float(event.get('d1')):.4f} | d2={self._safe_float(event.get('d2')):.4f} | "
                 f"ratio={self._safe_float(event.get('ratio')):.4f} | "
+                f"singleton_class_description={event.get('singleton_class_description')!r} | "
+                f"{span_repr}"
+            )
+        if event_type == "assign_sample_by_single_safe_class":
+            return (
+                f"[single]    target_sem_node_id={target} | description={description!r} | "
                 f"singleton_class_description={event.get('singleton_class_description')!r} | "
                 f"{span_repr}"
             )
