@@ -488,7 +488,7 @@ def _select_wikidata_candidates_by_span_rules(
         lambda value: _alias_exact_match(value, query_text)
     )
     label_word_count_mask = candidates_df["label"].map(
-        lambda value: _word_count(value) <= query_word_count + 1
+        lambda value: _word_count(value) <= query_word_count + 2
     )
     selected = candidates_df[
         definition_mask
@@ -525,10 +525,11 @@ def load_wikidata_definition_candidates(
     llm_filter=None,
     llm_filter_use_api: bool = False,
     llm_filter_use_cache: bool = True,
+    llm_filter_write_cache: bool = True,
 ):
-    # When use_llm_filter is enabled, defer entirely to WikidataDefinitionFilter:
-    # no rule-based filtering or reranking, no exact-match logic — the LLM's
-    # returned definitions are used as-is.
+    # When use_llm_filter is enabled, WikidataDefinitionFilter first applies
+    # the same span-aware candidate rules, then lets the LLM merge/rerank the
+    # remaining definitions.
     if use_llm_filter:
         from wikidata_definition_filter import WikidataDefinitionFilter
 
@@ -538,6 +539,7 @@ def load_wikidata_definition_candidates(
             query_text,
             num_candidates=int(target_candidate_count or limit),
             use_cache=llm_filter_use_cache,
+            write_cache=llm_filter_write_cache,
         )
         if not result.definitions:
             raise ValueError(
@@ -545,9 +547,20 @@ def load_wikidata_definition_candidates(
             )
 
         rows = []
-        for defn in result.definitions:
-            primary_id = defn.source_entity_ids[0] if defn.source_entity_ids else ""
-            primary_label = defn.source_labels[0] if defn.source_labels else query_text
+        for rank, defn in enumerate(result.definitions, start=1):
+            primary_id = (
+                defn.source_entity_ids[0]
+                if defn.source_entity_ids
+                else f"llm:{query_text}:{rank}"
+            )
+            primary_label = (
+                defn.canonical_label
+                or (
+                    defn.source_labels[0]
+                    if defn.source_labels
+                    else f"{query_text} sense {rank}"
+                )
+            )
             text = defn.definition.strip()
             rows.append(
                 {
@@ -560,8 +573,12 @@ def load_wikidata_definition_candidates(
                     "concepturi": "",
                     "source_entity_ids": tuple(defn.source_entity_ids),
                     "source_labels": tuple(defn.source_labels),
+                    "source_candidate_ids": tuple(defn.source_candidate_ids),
+                    "canonical_label": defn.canonical_label,
+                    "merge_rationale": defn.merge_rationale,
                     "is_merged": defn.is_merged,
                     "is_rewritten": defn.is_rewritten,
+                    "llm_filter_metadata": result.metadata,
                 }
             )
         return pd.DataFrame(rows), "description"

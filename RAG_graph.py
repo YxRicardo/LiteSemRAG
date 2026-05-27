@@ -68,6 +68,8 @@ RUNTIME_FIELD_NAMES = (
     "nlp",
     "reranker",
     "sem_description_model",
+    "llm_candidate_filter",
+    "llm_semantic_label_client",
     "encoder_lock",
     "phrase_analyzer",
 )
@@ -538,6 +540,17 @@ class LiteSemRAG:
                  sem_description_prompt_context_mode="sentence_neighbors",
                  consensus_ratio_threshold=0.8,
                  min_description_candidates=3,
+                 use_llm_candidate_filter=False,
+                 llm_candidate_filter_use_api=True,
+                 llm_candidate_filter_api_model=None,
+                 llm_candidate_filter_cache_path="cache/wikidata_definition_filter_cache.sqlite3",
+                 use_llm_semantic_labeler=False,
+                 llm_semantic_labeler_provider="openai",
+                 llm_semantic_labeler_model="gpt-5.4-mini",
+                 llm_semantic_labeler_api_key_file="API_KEY",
+                 llm_semantic_labeler_cache_path="cache/llm_semantic_label_cache.sqlite3",
+                 llm_semantic_labeler_context_word_window=20,
+                 llm_semantic_labeler_max_tokens=256,
                  phrase_audit_enabled=False,
                  phrase_audit_cache_path="cache/phrase_protection_audit.jsonl"):
         self.df_ratio = df_ratio
@@ -583,6 +596,29 @@ class LiteSemRAG:
         self.sem_description_model = None
         self._load_sem_description_model()
         self.sem_description_candidate_limit = 5
+        self.llm_candidate_filter_candidate_limit = 10
+        self.use_llm_candidate_filter = bool(use_llm_candidate_filter)
+        self.llm_candidate_filter_use_api = bool(llm_candidate_filter_use_api)
+        self.llm_candidate_filter_api_model = llm_candidate_filter_api_model
+        self.llm_candidate_filter_cache_path = llm_candidate_filter_cache_path
+        self.llm_candidate_filter = None
+        self.llm_candidate_filter_total_tokens = 0
+        self.llm_candidate_filter_prompt_tokens = 0
+        self.llm_candidate_filter_completion_tokens = 0
+        self.llm_candidate_filter_total_wall_time = 0.0
+        self.llm_candidate_filter_api_wait_wall_time = 0.0
+        self.use_llm_semantic_labeler = bool(use_llm_semantic_labeler)
+        self.llm_semantic_labeler_provider = llm_semantic_labeler_provider
+        self.llm_semantic_labeler_model = llm_semantic_labeler_model
+        self.llm_semantic_labeler_api_key_file = llm_semantic_labeler_api_key_file
+        self.llm_semantic_labeler_cache_path = llm_semantic_labeler_cache_path
+        self.llm_semantic_labeler_context_word_window = int(llm_semantic_labeler_context_word_window)
+        self.llm_semantic_labeler_max_tokens = int(llm_semantic_labeler_max_tokens)
+        self.llm_semantic_label_client = None
+        self.llm_semantic_label_total_tokens = 0
+        self.llm_semantic_label_cache_hits = 0
+        self.llm_semantic_label_cache_misses = 0
+        self.fft_propagation_wall_time = 0.0
         self.sem_description_batch_size = 32
         self.sem_description_use_detailed_description = False
         self.sem_description_require_detailed_description = True
@@ -605,7 +641,11 @@ class LiteSemRAG:
         self.sem_description_operation_logs = []
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
+        self.llm_semantic_label_total_tokens = 0
+        self.llm_semantic_label_cache_hits = 0
+        self.llm_semantic_label_cache_misses = 0
         self._sem_description_candidate_bank_cache = {}
+        self.llm_candidate_filter_result_cache = {}
         self.sem_build_count = 0
         self.phrase_audit_enabled = bool(phrase_audit_enabled)
         self.phrase_audit_cache_path = phrase_audit_cache_path
@@ -632,6 +672,50 @@ class LiteSemRAG:
         from sentence_transformers import CrossEncoder
 
         self.sem_description_model = CrossEncoder(self.sem_description_model_name)
+
+    # Lazily construct the LLM-backed Wikidata candidate filter.
+    def _get_llm_candidate_filter(self):
+        if self.llm_candidate_filter is None:
+            from wikidata_definition_filter import WikidataDefinitionFilter
+
+            self.llm_candidate_filter = WikidataDefinitionFilter(
+                use_api=self.llm_candidate_filter_use_api,
+                api_model=self.llm_candidate_filter_api_model,
+                cache_path=self.llm_candidate_filter_cache_path,
+            )
+        return self.llm_candidate_filter
+
+    # Lazily construct the LLM client used for per-span semantic labeling.
+    def _get_llm_semantic_label_client(self):
+        if self.llm_semantic_label_client is None:
+            from local_llm import LocalLLMClient, LocalLLMConfig
+
+            config = LocalLLMConfig.from_env(
+                provider=self.llm_semantic_labeler_provider,
+                model=self.llm_semantic_labeler_model,
+                api_key_file=self.llm_semantic_labeler_api_key_file,
+            )
+            self.llm_semantic_label_client = LocalLLMClient(config)
+        return self.llm_semantic_label_client
+
+    # Accumulate token usage from one LLM candidate-filter call.
+    def _record_llm_candidate_filter_usage(self, metadata):
+        metadata = metadata or {}
+        usage = metadata.get("token_usage") or {}
+        total_tokens = usage.get("total_tokens")
+        if total_tokens is None:
+            total_tokens = usage.get("total_tokens_delta")
+        if isinstance(total_tokens, int):
+            self.llm_candidate_filter_total_tokens += total_tokens
+        prompt_tokens = usage.get("prompt_tokens")
+        if isinstance(prompt_tokens, int):
+            self.llm_candidate_filter_prompt_tokens += prompt_tokens
+        completion_tokens = usage.get("completion_tokens")
+        if isinstance(completion_tokens, int):
+            self.llm_candidate_filter_completion_tokens += completion_tokens
+        api_wait_wall_time = metadata.get("api_wait_wall_time")
+        if isinstance(api_wait_wall_time, (int, float)):
+            self.llm_candidate_filter_api_wait_wall_time += float(api_wait_wall_time)
 
     # Keep stored semantic-node embeddings on CPU; move them to self.device only for computation.
     def _store_sem_embed(self, embed):
@@ -1217,8 +1301,22 @@ class LiteSemRAG:
 
     # Build semantic nodes for all token nodes waiting in the build queue.
     def solve_sem_nodes(self):
-        for token_node in self.build_sem_node_waitlist:
+        total_token_nodes = len(self.build_sem_node_waitlist)
+        if total_token_nodes == 0:
+            print("semantic_node_build: total=0 | remaining=0")
+            return
+
+        progress_update = self._make_progress_updater(
+            "semantic_node_build",
+            total_token_nodes,
+            show_remaining=True,
+        )
+        progress_update(0, force=True)
+        for index, token_node in enumerate(self.build_sem_node_waitlist, start=1):
             self.build_sem_node(token_node)
+            progress_update(index)
+        progress_update(total_token_nodes, force=True)
+        print()
         self.build_sem_node_waitlist = []
 
     # Cluster or reassign anomaly embeddings collected during semantic node creation.
@@ -1245,6 +1343,15 @@ class LiteSemRAG:
         self.start_time = start_time
         self.index_session_start_time = start_time
         self.index_session_document_count = indexed_document_count
+        self.llm_candidate_filter_total_tokens = 0
+        self.llm_candidate_filter_prompt_tokens = 0
+        self.llm_candidate_filter_completion_tokens = 0
+        self.llm_candidate_filter_total_wall_time = 0.0
+        self.llm_candidate_filter_api_wait_wall_time = 0.0
+        self.llm_semantic_label_total_tokens = 0
+        self.llm_semantic_label_cache_hits = 0
+        self.llm_semantic_label_cache_misses = 0
+        self.fft_propagation_wall_time = 0.0
 
     # Print total index-through-finalize time and average time per indexed document.
     def _print_index_session_timing(self):
@@ -1256,9 +1363,29 @@ class LiteSemRAG:
         if self.index_session_document_count > 0:
             avg_seconds = elapsed / self.index_session_document_count
             print(f"Average time per indexed document: {avg_seconds:.4f}s")
+        if getattr(self, "use_llm_candidate_filter", False):
+            print(
+                "LLM candidate filter tokens: "
+                f"total={self.llm_candidate_filter_total_tokens}, "
+                f"prompt={self.llm_candidate_filter_prompt_tokens}, "
+                f"completion={self.llm_candidate_filter_completion_tokens}"
+            )
+            print(
+                "LLM candidate filter wall time: "
+                f"total={self.llm_candidate_filter_total_wall_time:.2f}s, "
+                f"api_wait={self.llm_candidate_filter_api_wait_wall_time:.2f}s"
+            )
+        if getattr(self, "use_llm_semantic_labeler", False):
+            print(
+                "LLM semantic labeler tokens: "
+                f"total={self.llm_semantic_label_total_tokens}, "
+                f"cache_hits={self.llm_semantic_label_cache_hits}, "
+                f"cache_misses={self.llm_semantic_label_cache_misses}"
+            )
+        print(f"FFT propagation wall time: {self.fft_propagation_wall_time:.2f}s")
 
     # Create a throttled console progress updater for long loops.
-    def _make_progress_updater(self, label, total, min_interval=0.2):
+    def _make_progress_updater(self, label, total, min_interval=0.2, show_remaining=False):
         last_update_time = [0.0]
 
         # Print progress when enough time has elapsed or a forced update is requested.
@@ -1267,13 +1394,25 @@ class LiteSemRAG:
             if not force and processed < total and (now - last_update_time[0]) < min_interval:
                 return
             last_update_time[0] = now
+            remaining_text = f" | remaining: {max(total - processed, 0)}" if show_remaining else ""
             print(
-                f"\r{label}: {processed}/{total}",
+                f"\r{label}: {processed}/{total}{remaining_text}",
                 end="",
                 flush=True,
             )
 
         return update
+
+    # Run farthest-first traversal while accumulating total FFT sampling time.
+    def _run_farthest_first_traversal(self, *args, **kwargs):
+        fft_start = time.perf_counter()
+        try:
+            return farthest_first_traversal(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - fft_start
+            self.fft_propagation_wall_time = (
+                getattr(self, "fft_propagation_wall_time", 0.0) + elapsed
+            )
 
     # Compute document-frequency and IDF values for a token node and its semantic nodes.
     def assign_idf(self, token_node):
@@ -1379,6 +1518,52 @@ class LiteSemRAG:
             self.sem_description_prompt_context_mode = "sentence_neighbors"
         if not hasattr(self, "sem_description_candidate_limit"):
             self.sem_description_candidate_limit = 5
+        if not hasattr(self, "llm_candidate_filter_candidate_limit"):
+            self.llm_candidate_filter_candidate_limit = 10
+        if not hasattr(self, "use_llm_candidate_filter"):
+            self.use_llm_candidate_filter = False
+        if not hasattr(self, "llm_candidate_filter_use_api"):
+            self.llm_candidate_filter_use_api = True
+        if not hasattr(self, "llm_candidate_filter_api_model"):
+            self.llm_candidate_filter_api_model = None
+        if not hasattr(self, "llm_candidate_filter_cache_path"):
+            self.llm_candidate_filter_cache_path = "cache/wikidata_definition_filter_cache.sqlite3"
+        if not hasattr(self, "llm_candidate_filter"):
+            self.llm_candidate_filter = None
+        if not hasattr(self, "llm_candidate_filter_total_tokens"):
+            self.llm_candidate_filter_total_tokens = 0
+        if not hasattr(self, "llm_candidate_filter_prompt_tokens"):
+            self.llm_candidate_filter_prompt_tokens = 0
+        if not hasattr(self, "llm_candidate_filter_completion_tokens"):
+            self.llm_candidate_filter_completion_tokens = 0
+        if not hasattr(self, "llm_candidate_filter_total_wall_time"):
+            self.llm_candidate_filter_total_wall_time = 0.0
+        if not hasattr(self, "llm_candidate_filter_api_wait_wall_time"):
+            self.llm_candidate_filter_api_wait_wall_time = 0.0
+        if not hasattr(self, "use_llm_semantic_labeler"):
+            self.use_llm_semantic_labeler = False
+        if not hasattr(self, "llm_semantic_labeler_provider"):
+            self.llm_semantic_labeler_provider = "openai"
+        if not hasattr(self, "llm_semantic_labeler_model"):
+            self.llm_semantic_labeler_model = "gpt-5.4-mini"
+        if not hasattr(self, "llm_semantic_labeler_api_key_file"):
+            self.llm_semantic_labeler_api_key_file = "API_KEY"
+        if not hasattr(self, "llm_semantic_labeler_cache_path"):
+            self.llm_semantic_labeler_cache_path = "cache/llm_semantic_label_cache.sqlite3"
+        if not hasattr(self, "llm_semantic_labeler_context_word_window"):
+            self.llm_semantic_labeler_context_word_window = 20
+        if not hasattr(self, "llm_semantic_labeler_max_tokens"):
+            self.llm_semantic_labeler_max_tokens = 256
+        if not hasattr(self, "llm_semantic_label_client"):
+            self.llm_semantic_label_client = None
+        if not hasattr(self, "llm_semantic_label_total_tokens"):
+            self.llm_semantic_label_total_tokens = 0
+        if not hasattr(self, "llm_semantic_label_cache_hits"):
+            self.llm_semantic_label_cache_hits = 0
+        if not hasattr(self, "llm_semantic_label_cache_misses"):
+            self.llm_semantic_label_cache_misses = 0
+        if not hasattr(self, "fft_propagation_wall_time"):
+            self.fft_propagation_wall_time = 0.0
         if not hasattr(self, "sem_description_batch_size"):
             self.sem_description_batch_size = 32
         if not hasattr(self, "sem_description_use_detailed_description"):
@@ -1405,6 +1590,8 @@ class LiteSemRAG:
             self._wikidata_no_result_keys = set()
         if not hasattr(self, "_sem_description_candidate_bank_cache"):
             self._sem_description_candidate_bank_cache = {}
+        if not hasattr(self, "llm_candidate_filter_result_cache"):
+            self.llm_candidate_filter_result_cache = {}
         if not hasattr(self, "phrase_audit_enabled"):
             self.phrase_audit_enabled = False
         if not hasattr(self, "phrase_audit_cache_path"):
@@ -2369,7 +2556,11 @@ class LiteSemRAG:
         if total_token_nodes == 0:
             return
 
-        progress_update = self._make_progress_updater("finalize_token_nodes", total_token_nodes)
+        progress_update = self._make_progress_updater(
+            "finalize_token_nodes",
+            total_token_nodes,
+            show_remaining=True,
+        )
         progress_update(0, force=True)
         for index, token_node in enumerate(self.token_nodes, start=1):
             if not token_node.has_semantic:
@@ -2419,7 +2610,7 @@ class LiteSemRAG:
         if len(unique_chunk_nodes) <= max_samples:
             return unique_chunk_nodes
         if len(unique_embeds) == len(unique_chunk_nodes):
-            selected_idx = farthest_first_traversal(unique_embeds, max_samples)
+            selected_idx = self._run_farthest_first_traversal(unique_embeds, max_samples)
             return [unique_chunk_nodes[i] for i in selected_idx]
         return unique_chunk_nodes[:max_samples]
 
@@ -2433,7 +2624,7 @@ class LiteSemRAG:
                 return span_occurrences
             chunk_embeds = list(getattr(sem_node, "chunk_node_embed", []) or [])
             if len(chunk_embeds) == len(span_occurrences):
-                selected_idx = farthest_first_traversal(chunk_embeds, max_samples)
+                selected_idx = self._run_farthest_first_traversal(chunk_embeds, max_samples)
                 return [span_occurrences[i] for i in selected_idx]
             return span_occurrences[:max_samples]
 
@@ -2604,12 +2795,29 @@ class LiteSemRAG:
             max_candidate_count,
             self.min_description_candidates,
         )
+        use_llm_filter = bool(getattr(self, "use_llm_candidate_filter", False))
+        if use_llm_filter:
+            max_candidate_count = self.llm_candidate_filter_candidate_limit
+        filter_start = time.perf_counter() if use_llm_filter else None
         try:
             candidates_df, definition_column = load_wikidata_definition_candidates(
                 token_text,
                 use_detailed_description=self.sem_description_use_detailed_description,
-                limit=self.sem_description_candidate_limit,
+                limit=(
+                    self.llm_candidate_filter_candidate_limit
+                    if use_llm_filter
+                    else self.sem_description_candidate_limit
+                ),
                 target_candidate_count=max_candidate_count,
+                use_llm_filter=use_llm_filter,
+                llm_filter=(
+                    self._get_llm_candidate_filter()
+                    if use_llm_filter
+                    else None
+                ),
+                llm_filter_use_api=self.llm_candidate_filter_use_api,
+                llm_filter_use_cache=False,
+                llm_filter_write_cache=False,
             )
         except ValueError:
             candidate_bank_cache[token_text] = []
@@ -2619,16 +2827,45 @@ class LiteSemRAG:
                 "no_candidate_definitions",
             )
             return []
+        finally:
+            if filter_start is not None:
+                self.llm_candidate_filter_total_wall_time += time.perf_counter() - filter_start
 
         candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column=definition_column)
         candidate_bank_cache[token_text] = candidate_bank
+        llm_metadata = None
+        if use_llm_filter and not candidates_df.empty and "llm_filter_metadata" in candidates_df:
+            llm_metadata = candidates_df["llm_filter_metadata"].iloc[0]
+            self._record_llm_candidate_filter_usage(llm_metadata)
+            self.llm_candidate_filter_result_cache[token_text] = {
+                "candidate_bank": candidate_bank,
+                "definitions": [
+                    {
+                        "entity_id": candidate.get("entity_id"),
+                        "label": candidate.get("label"),
+                        "description": candidate.get("description"),
+                        "definition": candidate.get("definition"),
+                    }
+                    for candidate in candidate_bank
+                ],
+                "metadata": llm_metadata,
+            }
         if candidate_bank:
             self._log_sem_description_operation(
-                "wikidata_candidate_lookup",
+                (
+                    "llm_filtered_wikidata_candidate_lookup"
+                    if use_llm_filter
+                    else "wikidata_candidate_lookup"
+                ),
                 token_text=token_text,
-                candidate_limit=self.sem_description_candidate_limit,
+                candidate_limit=(
+                    self.llm_candidate_filter_candidate_limit
+                    if use_llm_filter
+                    else self.sem_description_candidate_limit
+                ),
                 max_candidate_count=max_candidate_count,
                 candidate_count=len(candidate_bank),
+                llm_token_usage=(llm_metadata or {}).get("token_usage") if llm_metadata else None,
             )
             return candidate_bank
 
@@ -2676,26 +2913,33 @@ class LiteSemRAG:
             if prompt_info is None:
                 continue
 
-            pairs = [(prompt_info["prompt_text"], candidate["hypothesis"]) for candidate in candidate_bank]
-            raw_scores = model.predict(
-                pairs,
-                batch_size=min(self.sem_description_batch_size, len(pairs)),
-                show_progress_bar=False,
-            )
-            scores = extract_cross_encoder_scores(raw_scores, model)
-            ranked_candidates = sorted(
-                [
-                    {
-                        **candidate,
-                        "score": float(score),
-                    }
-                    for candidate, score in zip(candidate_bank, scores)
-                ],
-                key=lambda item: item["score"],
-                reverse=True,
-            )
-            if ranked_candidates:
-                top_candidate = ranked_candidates[0]
+            if getattr(self, "use_llm_semantic_labeler", False):
+                top_candidate = self._predict_description_from_prompt_with_llm(
+                    token_text,
+                    prompt_info,
+                    candidate_bank,
+                )
+            else:
+                pairs = [(prompt_info["prompt_text"], candidate["hypothesis"]) for candidate in candidate_bank]
+                raw_scores = model.predict(
+                    pairs,
+                    batch_size=min(self.sem_description_batch_size, len(pairs)),
+                    show_progress_bar=False,
+                )
+                scores = extract_cross_encoder_scores(raw_scores, model)
+                ranked_candidates = sorted(
+                    [
+                        {
+                            **candidate,
+                            "score": float(score),
+                        }
+                        for candidate, score in zip(candidate_bank, scores)
+                    ],
+                    key=lambda item: item["score"],
+                    reverse=True,
+                )
+                top_candidate = ranked_candidates[0] if ranked_candidates else None
+            if top_candidate is not None:
                 description = top_candidate["description"]
                 state = description_vote_map.setdefault(
                     description,
@@ -2707,8 +2951,10 @@ class LiteSemRAG:
                         "score_count": 0,
                     },
                 )
+                raw_score = top_candidate.get("score")
+                score = 0.0 if raw_score is None else self._safe_float(raw_score)
                 state["count"] += 1
-                state["score_sum"] += top_candidate["score"]
+                state["score_sum"] += score
                 state["score_count"] += 1
                 sample_prediction_records.append(
                     {
@@ -2723,7 +2969,10 @@ class LiteSemRAG:
                         "predicted_label": top_candidate["label"],
                         "predicted_description": top_candidate["description"],
                         "predicted_definition": top_candidate["definition"],
-                        "prediction_score": top_candidate["score"],
+                        "prediction_score": top_candidate.get("score"),
+                        "prediction_method": top_candidate.get("prediction_method", "cross_encoder"),
+                        "llm_reason": top_candidate.get("llm_reason"),
+                        "llm_cache_hit": top_candidate.get("llm_cache_hit"),
                     }
                 )
 
@@ -2769,6 +3018,38 @@ class LiteSemRAG:
             ),
         }
 
+    # Run one LLM semantic judgment for one prompt/context. This is intentionally
+    # single-record, so FFT samples are not combined into a shared prompt.
+    def _predict_description_from_prompt_with_llm(self, token_text, prompt_info, candidate_bank):
+        from llm_semantic_labeler import choose_wikidata_candidate_with_llm
+
+        client = self._get_llm_semantic_label_client()
+        total_before = getattr(client, "total_tokens", 0)
+        result = choose_wikidata_candidate_with_llm(
+            span_text=token_text,
+            context_text=prompt_info["context_text"],
+            matched_text=prompt_info.get("matched_text") or token_text,
+            local_span=prompt_info.get("local_span"),
+            candidate_bank=candidate_bank,
+            cache_path=self.llm_semantic_labeler_cache_path,
+            context_word_window=self.llm_semantic_labeler_context_word_window,
+            client=client,
+            max_tokens=self.llm_semantic_labeler_max_tokens,
+        )
+        total_after = getattr(client, "total_tokens", total_before)
+        self.llm_semantic_label_total_tokens += max(0, int(total_after - total_before))
+        if result.get("cache_hit"):
+            self.llm_semantic_label_cache_hits += 1
+        else:
+            self.llm_semantic_label_cache_misses += 1
+
+        candidate = dict(result["selected_candidate"])
+        candidate["score"] = None
+        candidate["prediction_method"] = "llm_semantic_label"
+        candidate["llm_reason"] = result.get("reason")
+        candidate["llm_cache_hit"] = bool(result.get("cache_hit"))
+        return candidate
+
     # Run cross-encoder prediction for a single span occurrence; return the top candidate or None.
     def _predict_description_for_span_occurrence(
         self,
@@ -2811,6 +3092,32 @@ class LiteSemRAG:
         if not ranked_candidates:
             return None
         return ranked_candidates[0]
+
+    # Run single-prompt LLM prediction for a single span occurrence.
+    def _predict_description_for_span_occurrence_with_llm(
+        self,
+        token_text,
+        span_occurrence,
+        candidate_bank,
+    ):
+        chunk_node = span_occurrence.chunk_node
+        prompt_info = self._build_sem_node_description_prompt(
+            chunk_node.chunk_text,
+            token_text,
+            match_span=span_occurrence.get_span_tuple(),
+        )
+        if prompt_info is None:
+            prompt_info = self._build_fallback_sem_description_prompt(
+                chunk_node.chunk_text,
+                token_text,
+            )
+        if prompt_info is None:
+            return None
+        return self._predict_description_from_prompt_with_llm(
+            token_text,
+            prompt_info,
+            candidate_bank,
+        )
 
     # Pick the medoid index from a list of embedding tensors using cosine distance.
     def _compute_medoid_index(self, embeds):
@@ -2881,12 +3188,12 @@ class LiteSemRAG:
 
         sampled_indices = []
         if embeds_for_fft and len(embeds_for_fft) > 10:
-            sampled_indices = list(farthest_first_traversal(embeds_for_fft, 10))
+            sampled_indices = list(self._run_farthest_first_traversal(embeds_for_fft, 10))
         elif embeds_for_fft:
             sampled_indices = list(range(len(embeds_for_fft)))
 
         candidate_bank_snapshot = []
-        if self.sem_description_model is not None:
+        if self.sem_description_model is not None or getattr(self, "use_llm_semantic_labeler", False):
             try:
                 bank = self._load_sem_description_candidate_bank(
                     sem_node, self._sem_description_candidate_bank_cache
@@ -2947,7 +3254,58 @@ class LiteSemRAG:
             except Exception as exc:
                 print(f"[fft_recorder] hook raised {exc!r}; skipping record")
 
-        if self.sem_description_model is None:
+        if getattr(self, "use_llm_candidate_filter", False):
+            candidate_bank = self._load_sem_description_candidate_bank(
+                sem_node,
+                self._sem_description_candidate_bank_cache,
+            )
+            if len(candidate_bank) == 1:
+                only_candidate = candidate_bank[0]
+                sem_node.description = only_candidate["description"]
+                self.predicted_sem_description_logs.append(
+                    {
+                        "sem_node_id": sem_node.sem_node_id,
+                        "token_text": token_node.token_text,
+                        "description": sem_node.description,
+                        "predicted_entity_id": only_candidate.get("entity_id"),
+                        "predicted_label": only_candidate.get("label"),
+                        "predicted_definition": only_candidate.get("definition"),
+                        "prediction_score_mean": None,
+                        "chunk_count": len(sem_node.chunk_node_list),
+                        "sample_count": 0,
+                        "top_description_count": 0,
+                        "top_description_ratio": 1.0,
+                        "sample_predictions": [],
+                    }
+                )
+                self._log_sem_description_operation(
+                    "assign_single_llm_candidate_description",
+                    token_text=token_node.token_text,
+                    sem_node_id=sem_node.sem_node_id,
+                    description=sem_node.description,
+                    candidate_count=1,
+                    predicted_entity_id=only_candidate.get("entity_id"),
+                    predicted_label=only_candidate.get("label"),
+                )
+                _emit(
+                    "single_llm_candidate",
+                    final_assignments=[
+                        {
+                            "te_index": idx,
+                            "assigned_description": sem_node.description,
+                            "provenance": "single_llm_candidate",
+                        }
+                        for idx in range(len(cluster_text_embeddings))
+                    ],
+                    extra={"candidate_count": 1},
+                )
+                sem_node.chunk_node_embed.clear()
+                return [sem_node]
+
+        if (
+            self.sem_description_model is None
+            and not getattr(self, "use_llm_semantic_labeler", False)
+        ):
             _emit("no_model")
             sem_node.chunk_node_embed.clear()
             return [sem_node]
@@ -3023,12 +3381,54 @@ class LiteSemRAG:
             if len(records) >= 2
         }
         if len(valid_classes) < 2:
-            raise ValueError(
-                "Consensus failed but fewer than 2 valid classes with >=2 samples were "
-                f"found for sem_node {sem_node.sem_node_id} "
-                f"(token={token_node.token_text!r}); "
-                f"class sizes={{{', '.join(f'{d!r}: {len(r)}' for d, r in description_groups.items())}}}"
+            fallback_description = prediction_result["description"]
+            sem_node.description = fallback_description
+            self.predicted_sem_description_logs.append(
+                {
+                    "sem_node_id": sem_node.sem_node_id,
+                    "token_text": token_node.token_text,
+                    "description": fallback_description,
+                    "predicted_entity_id": prediction_result.get("predicted_entity_id"),
+                    "predicted_label": prediction_result.get("predicted_label"),
+                    "predicted_definition": prediction_result.get("predicted_definition"),
+                    "prediction_score_mean": prediction_result.get("prediction_score_mean"),
+                    "chunk_count": len(sem_node.chunk_node_list),
+                    "sample_count": prediction_result.get("sample_count"),
+                    "top_description_count": prediction_result.get("top_description_count"),
+                    "top_description_ratio": prediction_result.get("top_description_ratio"),
+                    "sample_predictions": prediction_result["sample_predictions"],
+                }
             )
+            self._log_sem_description_operation(
+                "assign_description_by_fallback_top_vote",
+                token_text=token_node.token_text,
+                sem_node_id=sem_node.sem_node_id,
+                description=fallback_description,
+                sample_count=prediction_result.get("sample_count"),
+                top_description_count=prediction_result.get("top_description_count"),
+                top_description_ratio=prediction_result.get("top_description_ratio"),
+                valid_class_count=len(valid_classes),
+                description_counts=prediction_result.get("description_counts"),
+            )
+            fallback_assignments = [
+                {
+                    "te_index": idx,
+                    "assigned_description": fallback_description,
+                    "provenance": "fallback_top_vote",
+                }
+                for idx in range(len(cluster_text_embeddings))
+            ]
+            _emit(
+                "fallback_top_vote",
+                final_assignments=fallback_assignments,
+                prediction_result=prediction_result,
+                extra={
+                    "valid_class_count": len(valid_classes),
+                    "description_counts": prediction_result.get("description_counts"),
+                },
+            )
+            sem_node.chunk_node_embed.clear()
+            return [sem_node]
 
         embedding_lookup = {
             self._get_span_occurrence_key(te.to_span_occurrence()): te
@@ -3111,12 +3511,19 @@ class LiteSemRAG:
 
         for te, singleton_description, d1, d2, ratio in model_judgment_records:
             span_occurrence = te.to_span_occurrence()
-            top_candidate = self._predict_description_for_span_occurrence(
-                token_node.token_text,
-                span_occurrence,
-                candidate_bank,
-                self.sem_description_model,
-            )
+            if getattr(self, "use_llm_semantic_labeler", False):
+                top_candidate = self._predict_description_for_span_occurrence_with_llm(
+                    token_node.token_text,
+                    span_occurrence,
+                    candidate_bank,
+                )
+            else:
+                top_candidate = self._predict_description_for_span_occurrence(
+                    token_node.token_text,
+                    span_occurrence,
+                    candidate_bank,
+                    self.sem_description_model,
+                )
             if top_candidate is None:
                 sample_vec = F.normalize(te.embed, p=2, dim=0).unsqueeze(0)
                 sims = (sample_vec @ medoid_stack.T).squeeze(0)
@@ -3143,7 +3550,10 @@ class LiteSemRAG:
                     "predicted_entity_id": top_candidate.get("entity_id"),
                     "predicted_label": top_candidate.get("label"),
                     "predicted_definition": top_candidate.get("definition"),
-                    "score": float(top_candidate.get("score", 0.0)),
+                    "score": top_candidate.get("score"),
+                    "prediction_method": top_candidate.get("prediction_method", "cross_encoder"),
+                    "llm_reason": top_candidate.get("llm_reason"),
+                    "llm_cache_hit": top_candidate.get("llm_cache_hit"),
                     "d1": d1,
                     "d2": d2,
                     "ratio": ratio,
@@ -3598,6 +4008,14 @@ class LiteSemRAG:
                 f"token={event.get('token_text')!r} | description={event.get('description')!r} | "
                 f"samples={event.get('sample_count')} | top_count={event.get('top_description_count')} | "
                 f"top_ratio={self._safe_float(event.get('top_description_ratio')):.3f}"
+            )
+        if event_type == "assign_description_by_fallback_top_vote":
+            return (
+                f"[{event_type}] sem_node_id={event.get('sem_node_id')} | "
+                f"token={event.get('token_text')!r} | description={event.get('description')!r} | "
+                f"samples={event.get('sample_count')} | top_count={event.get('top_description_count')} | "
+                f"top_ratio={self._safe_float(event.get('top_description_ratio')):.3f} | "
+                f"valid_classes={event.get('valid_class_count')}"
             )
         if event_type == "split_sem_node_by_sample_labels":
             initial_sizes = event.get("initial_class_sizes") or {}
@@ -5246,6 +5664,8 @@ class LiteSemRAG:
         self.nlp = None
         self.reranker = None
         self.sem_description_model = None
+        self.llm_candidate_filter = None
+        self.llm_semantic_label_client = None
         self.phrase_analyzer = None
         self.encoder_lock = threading.Lock()
         self._ensure_backward_compatible_attrs()

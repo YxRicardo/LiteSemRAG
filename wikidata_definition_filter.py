@@ -1,18 +1,18 @@
-"""LLM-driven Wikidata definition filtering, merging, and frequency reranking.
+"""LLM-driven Wikidata definition filtering, merging, and reranking.
 
 Given a term, this module fetches a fixed number of candidate senses from
-Wikidata (no client-side filtering), then asks an LLM (local server or the
-OpenAI API) to:
+Wikidata, applies the same span-aware candidate rules used by the non-LLM
+semantic-description path, then asks an LLM (local server or the OpenAI API)
+to produce the same cleaned candidate set shape as
+``jupyter_notebooks/wikidata_llm_candidate_merge_experiment.ipynb``:
 
-1. Drop candidates that are clearly unrelated to the term itself.
-2. Merge candidates whose meanings substantially overlap.
-3. Reorder the surviving senses from most to least common in everyday usage.
+1. Drop candidates that are not plausible senses of the term.
+2. Merge candidates whose hypotheses would behave the same for retrieval.
+3. Keep senses separate when they imply meaningfully different contexts.
 
-LLM judgments use the rich Wikipedia-derived ``detailed_description``; the
-returned senses use the short Wikidata ``description`` (or a concise rewrite
-when several candidates were merged). Results are cached in SQLite keyed
-solely by the normalized term: once a term has been answered, the cached
-answer is reused regardless of model, language, or candidate count.
+Results are cached in SQLite keyed solely by the normalized term: once a term
+has been answered, the cached answer is reused regardless of model, language,
+or candidate count.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from local_llm import LocalLLMClient, LocalLLMConfig
-from utils import search_wikidata
+from utils import build_wikidata_candidate_bank, load_wikidata_definition_candidates
 
 
 DEFAULT_CACHE_PATH = Path("cache/wikidata_definition_filter_cache.sqlite3")
@@ -33,173 +33,39 @@ DEFAULT_NUM_CANDIDATES = 10
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_TOKENS = 1024
 
-DEFAULT_API_MODEL = "gpt-4o-mini"
+DEFAULT_API_MODEL = "gpt-5.4-mini"
 DEFAULT_API_KEY_FILE = "API_KEY"
+WIKIDATA_CANDIDATE_FILTER_VERSION = "merge_prompt_v4_label_window_plus2"
 
 
-SYSTEM_PROMPT = """You are a precise lexicographer with strict semantic judgment.
+SYSTEM_PROMPT = """You are a careful lexical semantics annotator.
+Your task is to clean candidate word senses from Wikidata for a semantic retrieval system.
+Merge candidates when they refer to the same or nearly the same meaning, even if their labels or wording differ.
+Keep candidates separate when they would lead to different retrieval behavior in context.
+Prefer concise, concrete sense descriptions.
+Return only valid JSON."""
 
-You distinguish carefully between:
-- core meanings of a word
-- entities that the word directly refers to in common usage
-- things merely named using the word
+USER_PROMPT_TEMPLATE = """Merge near-duplicate candidate senses for the target word.
 
-You prefer general, conceptually clean definitions over narrow or domain-specific ones.
+Rules:
+1. Merge candidates only when their hypotheses mean the same or nearly the same thing for retrieval.
+2. Keep candidates separate when they describe meaningfully different contextual senses.
+3. Discard candidates that are too vague, redundant, or not a plausible sense of the target word.
+4. Output only valid JSON with keys: word, merged_senses, discarded_candidates, notes.
 
-You are conservative:
-- do not drop important meanings
-- do not merge unrelated meanings
-- do not keep irrelevant named entities
+Each merged_senses item must contain:
+- sense_id: a short stable id such as s1, s2, s3
+- canonical_label: short label for the merged sense
+- merged_description: one sentence describing the merged meaning
+- source_candidate_ids: list of integer candidate_id values that were merged
+- merge_rationale: one short sentence
 
-You always return valid JSON only.
-"""
+Each discarded_candidates item must contain:
+- candidate_id
+- reason
 
-USER_PROMPT_TEMPLATE = """Target term: {term}
-
-Candidate senses:
-{candidate_block}
-
----
-
-Examples of correct behavior:
-
-### Example 1
-Target term: apple
-
-Candidates:
-0. apple — edible fruit of the apple tree
-1. Apple — American multinational technology company
-2. Apple Music — music streaming service
-3. Apple Records — record label
-4. Apple — a unisex given name
-
-Correct output:
-{{
-  "definitions": [
-    {{"source_indices": [0], "rewritten": ""}},
-    {{"source_indices": [1], "rewritten": ""}}
-  ]
-}}
-
-Explanation:
-- Keep fruit (core meaning)
-- Keep Apple Inc. (commonly referred to as "Apple")
-- Drop sub-brands and named entities that cannot be called just "apple"
-- Drop given name
-
----
-
-### Example 2
-Target term: director
-
-Candidates:
-0. film director — directs a film
-1. theatrical director — directs a stage production
-2. director — a manager in a company
-
-Correct output:
-{{
-  "definitions": [
-    {{
-      "source_indices": [0, 1],
-      "rewritten": "a person who directs the artistic or dramatic aspects of a performance or production"
-    }},
-    {{
-      "source_indices": [2],
-      "rewritten": ""
-    }}
-  ]
-}}
-
-Explanation:
-- Merge film and theatre directors (same core function, different domains)
-- Keep business meaning separate
-
----
-
-### Example 3
-Target term: amazon
-
-Candidates:
-0. Amazon — tropical rainforest
-1. Amazon — American e-commerce company
-2. Amazon River — river in South America
-3. Amazon Prime — subscription service
-
-Correct output:
-{{
-  "definitions": [
-    {{"source_indices": [0], "rewritten": ""}},
-    {{"source_indices": [2], "rewritten": ""}},
-    {{"source_indices": [1], "rewritten": ""}}
-  ]
-}}
-
-Explanation:
-- Keep core meanings
-- Keep major entity commonly referred to by the term
-- Drop sub-brands
-
----
-
-Now perform the task.
-
-Tasks:
-
-1. DROP candidates that do not define the term itself.
-
-   DROP:
-   - things merely named after the term (songs, films, minor works)
-   - sub-brands or extended names (e.g., "Apple Music", "Amazon Prime")
-   - entities that require additional words to identify (cannot be referred to by the term alone)
-   - given names or family names (e.g., "unisex given name", "surname")
-
-2. KEEP a proper noun ONLY if the term can be used ALONE to refer to it in natural language.
-
-   Examples:
-   - "Apple" → Apple Inc. (KEEP)
-   - "Apple Music" → NOT KEEP
-   - "Apple Records" → NOT KEEP
-
-3. MERGE meanings when they share the same core concept.
-
-   IMPORTANT:
-   - If meanings differ only by domain (film, theatre, music, etc.), MERGE them
-   - Prefer broader, more general definitions over narrow ones
-
-   DO NOT merge:
-   - different conceptual roles (e.g., artistic role vs business role)
-   - unrelated meanings
-
-4. REORDER by importance in everyday usage:
-
-   - core dictionary meaning first
-   - then widely known entities directly referred to by the term
-   - then less common meanings
-
----
-
-CRITICAL FINAL CHECK:
-
-- Remove anything that cannot be referred to by the term alone
-- Remove all name-related meanings (given name, surname)
-- Ensure no major, widely known meaning is missing
-- Ensure no unrelated meanings are merged
-- Prefer general definitions over domain-specific ones
-
----
-
-Respond with JSON only:
-
-{{
-  "definitions": [
-    {{
-      "source_indices": [<int>, ...],
-      "rewritten": "<one-sentence definition or empty>"
-    }}
-  ]
-}}
-"""
+Candidate data:
+{candidate_payload}"""
 
 
 @dataclass
@@ -209,6 +75,8 @@ class CandidateSense:
     label: str
     description: str
     detailed_description: str
+    definition: str = ""
+    hypothesis: str = ""
 
 
 @dataclass
@@ -218,6 +86,9 @@ class FilteredDefinition:
     source_labels: list[str]
     is_merged: bool
     is_rewritten: bool
+    canonical_label: str = ""
+    source_candidate_ids: list[int] = field(default_factory=list)
+    merge_rationale: str = ""
 
 
 @dataclass
@@ -241,35 +112,54 @@ def fetch_wikidata_candidates(
     num_candidates: int = DEFAULT_NUM_CANDIDATES,
     language: str = "en",
 ) -> list[CandidateSense]:
-    """Fetch raw Wikidata candidates with no client-side filtering or reordering."""
+    """Fetch Wikidata candidates using the shared candidate-bank path.
+
+    This intentionally mirrors ``wikidata_llm_candidate_merge_experiment.ipynb``:
+    first call ``utils.load_wikidata_definition_candidates`` without LLM
+    filtering, then convert the returned rows with
+    ``utils.build_wikidata_candidate_bank`` so the LLM sees the same
+    hypotheses as the experiment notebook.
+    """
     if not isinstance(term, str) or not term.strip():
         return []
 
-    df = search_wikidata(
-        term.strip(),
-        language=language,
-        limit=int(num_candidates),
-        exact_match_text=False,
-        exact_match_first=False,
-        include_detailed_description=True,
-        drop_missing_detailed_description=False,
-        detailed_description_sentences=3,
-        filter_name=False,
-        label_contains_text=False,
-    )
+    normalized_term = term.strip()
+    if language != "en":
+        raise ValueError(
+            "WikidataDefinitionFilter currently mirrors the English shared "
+            "candidate-bank path used by wikidata_llm_candidate_merge_experiment.ipynb."
+        )
 
     candidates: list[CandidateSense] = []
-    if df is None or df.empty:
+    try:
+        candidates_df, definition_column = load_wikidata_definition_candidates(
+            normalized_term,
+            use_detailed_description=False,
+            exact_match_text=False,
+            exact_match_first=False,
+            limit=int(num_candidates),
+            filter_name=True,
+            require_detailed_description=False,
+            target_candidate_count=int(num_candidates),
+            use_llm_filter=False,
+        )
+    except ValueError:
         return candidates
 
-    for idx, row in enumerate(df.itertuples(index=False)):
+    candidate_bank = build_wikidata_candidate_bank(candidates_df, definition_column)
+    if not candidate_bank:
+        return candidates
+
+    for idx, candidate in enumerate(candidate_bank):
         candidates.append(
             CandidateSense(
                 index=idx,
-                entity_id=str(getattr(row, "id", "") or ""),
-                label=str(getattr(row, "label", "") or ""),
-                description=str(getattr(row, "description", "") or ""),
-                detailed_description=str(getattr(row, "detailed_description", "") or ""),
+                entity_id=str(candidate.get("entity_id", "") or ""),
+                label=str(candidate.get("label", "") or ""),
+                description=str(candidate.get("description", "") or ""),
+                detailed_description="",
+                definition=str(candidate.get("definition", "") or ""),
+                hypothesis=str(candidate.get("hypothesis", "") or ""),
             )
         )
     return candidates
@@ -292,7 +182,7 @@ def build_llm_client(
 
     ``use_api=True`` uses the OpenAI API with the key loaded from
     ``api_key_file`` (defaults to ``API_KEY`` in the project root) and the
-    model defaults to ``gpt-4o-mini``.
+    model defaults to ``gpt-5.4-mini``.
     """
     if use_api:
         config = LocalLLMConfig.from_env(
@@ -371,15 +261,42 @@ def _cache_write(cache_path: Path, *, term: str, payload: dict[str, Any]) -> Non
 # LLM prompting and parsing
 # ---------------------------------------------------------------------------
 
-def _format_candidate_block(candidates: list[CandidateSense]) -> str:
-    lines: list[str] = []
+def _definition_to_hypothesis(definition: str) -> str:
+    cleaned = str(definition or "").strip()
+    if cleaned.endswith((".", "!", "?")):
+        cleaned = cleaned[:-1]
+    if not cleaned:
+        cleaned = "a candidate sense"
+    return f"It refers to {cleaned}."
+
+
+def _compact_candidates_for_prompt(candidates: list[CandidateSense]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
     for cand in candidates:
-        text_for_judgment = cand.detailed_description.strip() or cand.description.strip()
-        if not text_for_judgment:
-            text_for_judgment = "(no description available)"
-        lines.append(f"[{cand.index}] label: {cand.label}")
-        lines.append(f"     description: {text_for_judgment}")
-    return "\n".join(lines)
+        hypothesis = cand.hypothesis.strip()
+        if not hypothesis:
+            text_for_judgment = cand.definition.strip() or cand.description.strip()
+            if not text_for_judgment:
+                text_for_judgment = "(no description available)"
+            hypothesis = _definition_to_hypothesis(text_for_judgment)
+        compact.append(
+            {
+                "candidate_id": int(cand.index) + 1,
+                "label": cand.label,
+                "hypothesis": hypothesis,
+            }
+        )
+    return compact
+
+
+def _build_merge_prompt(term: str, candidates: list[CandidateSense]) -> str:
+    payload = {
+        "word": term,
+        "candidate_senses": _compact_candidates_for_prompt(candidates),
+    }
+    return USER_PROMPT_TEMPLATE.format(
+        candidate_payload=json.dumps(payload, ensure_ascii=False, indent=2)
+    )
 
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -407,15 +324,80 @@ def _build_definitions(
     candidates: list[CandidateSense],
 ) -> list[FilteredDefinition]:
     by_index = {cand.index: cand for cand in candidates}
+    by_candidate_id = {cand.index + 1: cand for cand in candidates}
+
+    raw_merged_senses = parsed.get("merged_senses")
+    if isinstance(raw_merged_senses, list):
+        definitions: list[FilteredDefinition] = []
+        used_candidate_ids: set[int] = set()
+        for item in raw_merged_senses:
+            if not isinstance(item, dict):
+                continue
+            definition_text = str(item.get("merged_description", "") or "").strip()
+            if not definition_text:
+                definition_text = str(item.get("definition", "") or "").strip()
+            if not definition_text:
+                continue
+
+            raw_ids = item.get("source_candidate_ids") or []
+            if not isinstance(raw_ids, list):
+                raw_ids = [raw_ids]
+            source_candidate_ids: list[int] = []
+            sources: list[CandidateSense] = []
+            for value in raw_ids:
+                try:
+                    candidate_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                source = by_candidate_id.get(candidate_id)
+                if source is None or candidate_id in used_candidate_ids:
+                    continue
+                source_candidate_ids.append(candidate_id)
+                sources.append(source)
+                used_candidate_ids.add(candidate_id)
+
+            canonical_label = str(item.get("canonical_label", "") or "").strip()
+            merge_rationale = str(item.get("merge_rationale", "") or "").strip()
+            definitions.append(
+                FilteredDefinition(
+                    definition=definition_text,
+                    source_entity_ids=[src.entity_id for src in sources],
+                    source_labels=[src.label for src in sources],
+                    is_merged=len(sources) > 1,
+                    is_rewritten=True,
+                    canonical_label=canonical_label,
+                    source_candidate_ids=source_candidate_ids,
+                    merge_rationale=merge_rationale,
+                )
+            )
+        return definitions
+
     raw_items = parsed.get("definitions")
     if not isinstance(raw_items, list):
-        raise ValueError(f"LLM response missing 'definitions' list: {parsed!r}")
+        raise ValueError(
+            f"LLM response missing 'merged_senses' or 'definitions' list: {parsed!r}"
+        )
 
     definitions: list[FilteredDefinition] = []
     seen_indices: set[int] = set()
     for item in raw_items:
         if not isinstance(item, dict):
             continue
+        direct_definition = str(item.get("definition", "") or "").strip()
+        if direct_definition:
+            definitions.append(
+                FilteredDefinition(
+                    definition=direct_definition,
+                    source_entity_ids=[],
+                    source_labels=[],
+                    is_merged=False,
+                    is_rewritten=True,
+                    canonical_label=str(item.get("canonical_label", "") or "").strip(),
+                )
+            )
+            continue
+
+        # Backward-compatible parser for older cached or experimental outputs.
         raw_indices = item.get("source_indices") or []
         if not isinstance(raw_indices, list):
             continue
@@ -453,6 +435,9 @@ def _build_definitions(
                 source_labels=[src.label for src in sources],
                 is_merged=is_merged,
                 is_rewritten=is_rewritten,
+                canonical_label=str(item.get("canonical_label", "") or "").strip(),
+                source_candidate_ids=[i + 1 for i in indices],
+                merge_rationale=str(item.get("merge_rationale", "") or "").strip(),
             )
         )
     return definitions
@@ -505,6 +490,7 @@ class WikidataDefinitionFilter:
         num_candidates: int = DEFAULT_NUM_CANDIDATES,
         language: str = "en",
         use_cache: bool = True,
+        write_cache: bool = True,
     ) -> FilterResult:
         """Return filtered, merged, frequency-ranked senses for ``term``.
 
@@ -512,7 +498,7 @@ class WikidataDefinitionFilter:
         ``True`` and any cached entry exists for the term, it is returned as-is
         regardless of the current model/language/num_candidates. When
         ``use_cache`` is ``False``, the LLM is re-run and the cached entry for
-        this term is overwritten.
+        this term is overwritten unless ``write_cache`` is also ``False``.
         """
         if not isinstance(term, str) or not term.strip():
             raise ValueError("term must be a non-empty string.")
@@ -522,7 +508,12 @@ class WikidataDefinitionFilter:
         if use_cache:
             cached = _cache_lookup(self.cache_path, term=normalized)
             if cached is not None:
-                return _result_from_cache_payload(cached, from_cache=True)
+                cached_result = _result_from_cache_payload(cached, from_cache=True)
+                if (
+                    cached_result.metadata.get("wikidata_candidate_filter")
+                    == WIKIDATA_CANDIDATE_FILTER_VERSION
+                ):
+                    return cached_result
 
         candidates = fetch_wikidata_candidates(
             normalized,
@@ -539,19 +530,20 @@ class WikidataDefinitionFilter:
                 definitions=[],
                 from_cache=False,
                 raw_llm_response="",
-                metadata={"note": "no_wikidata_candidates"},
+                metadata={
+                    "note": "no_wikidata_candidates",
+                    "wikidata_candidate_filter": WIKIDATA_CANDIDATE_FILTER_VERSION,
+                },
             )
-            _cache_write(
-                self.cache_path,
-                term=normalized,
-                payload=_result_to_cache_payload(result),
-            )
+            if write_cache:
+                _cache_write(
+                    self.cache_path,
+                    term=normalized,
+                    payload=_result_to_cache_payload(result),
+                )
             return result
 
-        prompt = USER_PROMPT_TEMPLATE.format(
-            term=normalized,
-            candidate_block=_format_candidate_block(candidates),
-        )
+        prompt = _build_merge_prompt(normalized, candidates)
 
         chat_kwargs: dict[str, Any] = {
             "max_tokens": self.max_tokens,
@@ -561,22 +553,39 @@ class WikidataDefinitionFilter:
         if not model_lower.startswith(("gpt-5", "o1", "o3", "o4")):
             chat_kwargs["temperature"] = self.temperature
 
+        total_tokens_before = self.llm_client.total_tokens
         raw_response = self.llm_client.complete(
             prompt,
             system_prompt=SYSTEM_PROMPT,
             **chat_kwargs,
         )
+        usage = self.llm_client.last_usage
+        api_wait_wall_time = self.llm_client.last_api_wait_wall_time
+        total_tokens_after = self.llm_client.total_tokens
 
         try:
             parsed = _extract_json_object(raw_response)
             definitions = _build_definitions(parsed, candidates)
-            metadata: dict[str, Any] = {}
+            metadata: dict[str, Any] = {
+                "discarded_candidates": parsed.get("discarded_candidates", []),
+                "notes": parsed.get("notes", ""),
+                "prompt_style": "wikidata_llm_candidate_merge_experiment",
+            }
         except (ValueError, json.JSONDecodeError) as exc:
             definitions = []
             metadata = {"parse_error": str(exc)}
 
         metadata["provider"] = self.provider
         metadata["model"] = self.model
+        metadata["wikidata_candidate_filter"] = WIKIDATA_CANDIDATE_FILTER_VERSION
+        metadata["candidate_count_after_rule_filter"] = len(candidates)
+        metadata["token_usage"] = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "total_tokens_delta": total_tokens_after - total_tokens_before,
+        }
+        metadata["api_wait_wall_time"] = api_wait_wall_time
 
         result = FilterResult(
             term=normalized,
@@ -589,11 +598,12 @@ class WikidataDefinitionFilter:
             metadata=metadata,
         )
 
-        _cache_write(
-            self.cache_path,
-            term=normalized,
-            payload=_result_to_cache_payload(result),
-        )
+        if write_cache:
+            _cache_write(
+                self.cache_path,
+                term=normalized,
+                payload=_result_to_cache_payload(result),
+            )
         return result
 
 

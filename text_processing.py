@@ -129,6 +129,10 @@ PROTECTED_ENTITY_LABELS = {
     "NORP",
 }
 
+DISCARDED_PHRASE_ENTITY_LABELS = {
+    "DATE",
+}
+
 ROMAN_NUMERAL_RE = re.compile(r"(?i)M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})")
 
 
@@ -139,6 +143,16 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_
     char_intervals = []
 
     for ent in doc.ents:
+        if ent.label_.upper() in DISCARDED_PHRASE_ENTITY_LABELS:
+            if debug_mode:
+                _debug_skip(
+                    "entity",
+                    ent,
+                    f"{ent.label_} entities are discarded as phrase candidates",
+                    stage=debug_stage,
+                )
+            continue
+
         if all_words_are_digits(ent.text):
             if debug_mode:
                 _debug_skip("entity", ent, "every word in the entity is numeric", stage=debug_stage)

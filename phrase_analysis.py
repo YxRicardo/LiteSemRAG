@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from text_processing import normalize_text
+from text_processing import _is_title_like_noun_chunk, normalize_text
 
 
 PHRASE_TYPE_ATOMIC = "atomic"
@@ -121,7 +121,15 @@ class PhraseAnalyzer:
         span = self._resolve_spacy_span(doc, raw_text, span_start, span_end)
         ent = self._find_matching_entity(doc, raw_text, span_start, span_end)
 
-        atomic_reason = self._atomic_reason(phrase_text_norm, ent)
+        atomic_reason = self._atomic_reason(
+            phrase_text_norm,
+            ent,
+            doc=doc,
+            span=span,
+            raw_text=raw_text,
+            span_start=span_start,
+            span_end=span_end,
+        )
         if self._token_count(phrase_text_norm) <= 1 and atomic_reason is None:
             return PhraseAnalysis(
                 phrase_text=raw_text,
@@ -192,14 +200,44 @@ class PhraseAnalyzer:
                 return ent
         return None
 
-    def _atomic_reason(self, phrase_text_norm, ent):
+    def _atomic_reason(
+        self,
+        phrase_text_norm,
+        ent,
+        doc=None,
+        span=None,
+        raw_text=None,
+        span_start=None,
+        span_end=None,
+    ):
         if ent is not None and ent.label_.upper() not in self.ignored_atomic_ner_labels:
             return f"ner:{ent.label_}"
+        if self._matches_title_like_span(doc, span, raw_text, span_start, span_end):
+            return "protected:TITLE_LIKE_NOUN_CHUNK"
         if phrase_text_norm in self.title_aliases:
             return "title_alias"
         if phrase_text_norm in self.fixed_collocations:
             return "fixed_collocation"
         return None
+
+    def _matches_title_like_span(self, doc, span, raw_text, span_start, span_end):
+        if doc is None:
+            return False
+
+        target = normalize_text(raw_text or "")
+        for noun_chunk in doc.noun_chunks:
+            if span_start is not None and span_end is not None:
+                if noun_chunk.start_char != span_start or noun_chunk.end_char != span_end:
+                    continue
+            elif normalize_text(noun_chunk.text) != target:
+                continue
+
+            return _is_title_like_noun_chunk(noun_chunk)
+
+        if span is not None:
+            return _is_title_like_noun_chunk(span)
+
+        return False
 
     def _head_and_modifiers(self, span, doc):
         root = span.root

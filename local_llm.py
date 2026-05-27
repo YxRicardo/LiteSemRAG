@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -199,6 +200,21 @@ def _record_usage(response: Any, current_total: int) -> int:
     return current_total
 
 
+def _usage_dict(response: Any) -> dict[str, int | None]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+    return {
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
+    }
+
+
 def _response_text(response: Any) -> str:
     choices = getattr(response, "choices", None) or []
     if not choices:
@@ -224,14 +240,25 @@ class LocalLLMSyncClient:
             client_kwargs["base_url"] = self.config.base_url
         self.client = OpenAI(**client_kwargs)
         self.total_tokens = 0
+        self.last_usage = {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+        self.last_api_wait_wall_time = 0.0
 
     def chat(self, messages: list[Message], **kwargs: Any) -> str:
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=messages,
-            **_chat_kwargs_for_model(self.config.model, kwargs),
-        )
+        request_start = time.perf_counter()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                **_chat_kwargs_for_model(self.config.model, kwargs),
+            )
+        finally:
+            self.last_api_wait_wall_time = time.perf_counter() - request_start
         self.total_tokens = _record_usage(response, self.total_tokens)
+        self.last_usage = _usage_dict(response)
         return _response_text(response)
 
     def complete(
@@ -261,6 +288,20 @@ class LocalLLMClient:
     @property
     def total_tokens(self) -> int:
         return self._sync_client.total_tokens if self._sync_client else 0
+
+    @property
+    def last_usage(self) -> dict[str, int | None]:
+        if not self._sync_client:
+            return {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+            }
+        return dict(self._sync_client.last_usage)
+
+    @property
+    def last_api_wait_wall_time(self) -> float:
+        return self._sync_client.last_api_wait_wall_time if self._sync_client else 0.0
 
     def complete(
         self,

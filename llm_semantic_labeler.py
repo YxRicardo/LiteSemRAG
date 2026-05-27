@@ -1,12 +1,13 @@
 """LLM-based semantic label selection with SQLite caching.
 
 This module is designed as a notebook-friendly helper for validating span
-semantics against Wikidata candidates. The cache key intentionally focuses on
-the target span and its nearby context words so the same semantic choice can be
-reused across notebooks without repeating LLM calls.
+semantics against Wikidata candidates. Cache entries are scoped to the target
+span, nearby context words, model identity, and the exact candidate bank, so
+changing candidate semantics automatically invalidates old judgments.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -49,6 +50,7 @@ class SemanticCacheKey:
     context_signature: str
     provider: str
     model: str
+    candidate_bank_hash: str
 
 
 def _normalize_space(text: str) -> str:
@@ -134,6 +136,28 @@ def _candidate_block(candidate_bank: Iterable[Mapping[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def candidate_bank_hash(candidate_bank: Iterable[Mapping[str, Any]]) -> str:
+    """Return a stable hash for the ordered candidate semantics shown to LLM."""
+    canonical_candidates = []
+    for candidate in candidate_bank:
+        canonical_candidates.append(
+            {
+                "entity_id": str(candidate.get("entity_id") or ""),
+                "label": str(candidate.get("label") or ""),
+                "description": _normalize_space(candidate.get("description") or ""),
+                "definition": _normalize_space(candidate.get("definition") or ""),
+                "hypothesis": _normalize_space(candidate.get("hypothesis") or ""),
+            }
+        )
+    payload = json.dumps(
+        canonical_candidates,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     text = str(text).strip()
     if not text:
@@ -176,12 +200,13 @@ def _parse_selected_index(payload: Mapping[str, Any], candidate_bank: list[Mappi
 def _ensure_cache_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
-        CREATE TABLE IF NOT EXISTS llm_semantic_label_cache (
+        CREATE TABLE IF NOT EXISTS llm_semantic_label_cache_v2 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             normalized_span TEXT NOT NULL,
             context_signature TEXT NOT NULL,
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
+            candidate_bank_hash TEXT NOT NULL,
             span_text TEXT NOT NULL,
             context_text TEXT NOT NULL,
             matched_text TEXT,
@@ -192,7 +217,7 @@ def _ensure_cache_schema(connection: sqlite3.Connection) -> None:
             raw_response TEXT NOT NULL,
             reason TEXT,
             created_at_utc TEXT NOT NULL,
-            UNIQUE(normalized_span, context_signature, provider, model)
+            UNIQUE(normalized_span, context_signature, provider, model, candidate_bank_hash)
         )
         """
     )
@@ -215,17 +240,19 @@ def _lookup_cache_row(
     row = connection.execute(
         """
         SELECT *
-        FROM llm_semantic_label_cache
+        FROM llm_semantic_label_cache_v2
         WHERE normalized_span = ?
           AND context_signature = ?
           AND provider = ?
           AND model = ?
+          AND candidate_bank_hash = ?
         """,
         (
             cache_key.normalized_span,
             cache_key.context_signature,
             cache_key.provider,
             cache_key.model,
+            cache_key.candidate_bank_hash,
         ),
     ).fetchone()
     return row
@@ -247,11 +274,12 @@ def _save_cache_row(
 ) -> None:
     connection.execute(
         """
-        INSERT INTO llm_semantic_label_cache (
+        INSERT INTO llm_semantic_label_cache_v2 (
             normalized_span,
             context_signature,
             provider,
             model,
+            candidate_bank_hash,
             span_text,
             context_text,
             matched_text,
@@ -263,8 +291,8 @@ def _save_cache_row(
             reason,
             created_at_utc
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(normalized_span, context_signature, provider, model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(normalized_span, context_signature, provider, model, candidate_bank_hash)
         DO UPDATE SET
             span_text = excluded.span_text,
             context_text = excluded.context_text,
@@ -282,6 +310,7 @@ def _save_cache_row(
             cache_key.context_signature,
             cache_key.provider,
             cache_key.model,
+            cache_key.candidate_bank_hash,
             span_text,
             context_text,
             matched_text,
@@ -336,6 +365,7 @@ def choose_wikidata_candidate_with_llm(
 
     llm_client = client or LocalLLMClient(config)
     active_config = llm_client.config
+    bank_hash = candidate_bank_hash(candidate_bank_list)
     normalized_span = _normalize_text(span_text)
     context_signature = build_context_signature(
         span_text,
@@ -348,6 +378,7 @@ def choose_wikidata_candidate_with_llm(
         context_signature=context_signature,
         provider=active_config.provider,
         model=active_config.model,
+        candidate_bank_hash=bank_hash,
     )
 
     with _open_cache(cache_path) as connection:
@@ -366,6 +397,7 @@ def choose_wikidata_candidate_with_llm(
                     "raw_response": cache_row["raw_response"],
                     "cache_hit": True,
                     "context_signature": context_signature,
+                    "candidate_bank_hash": bank_hash,
                     "provider": active_config.provider,
                     "model": active_config.model,
                 }
@@ -413,6 +445,7 @@ def choose_wikidata_candidate_with_llm(
         "raw_response": raw_response,
         "cache_hit": False,
         "context_signature": context_signature,
+        "candidate_bank_hash": bank_hash,
         "provider": active_config.provider,
         "model": active_config.model,
     }
