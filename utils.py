@@ -352,6 +352,46 @@ def filter_entity_ids_with_wikipedia_sitelinks(entity_ids, language="en", header
     return valid_entity_ids
 
 
+# Deduplicate and normalize a list of Wikidata entity IDs.
+def _clean_entity_ids(entity_ids):
+    cleaned_ids = []
+    for entity_id in entity_ids:
+        if not isinstance(entity_id, str):
+            continue
+        normalized = entity_id.strip()
+        if normalized and normalized not in cleaned_ids:
+            cleaned_ids.append(normalized)
+    return cleaned_ids
+
+
+# Fetch a batch of Wikidata entities keyed by entity ID.
+def fetch_entities(entity_ids, language="en", props="sitelinks", headers=None, timeout=30):
+    cleaned_ids = _clean_entity_ids(entity_ids)
+    if not cleaned_ids:
+        return {}
+
+    params = {
+        "action": "wbgetentities",
+        "format": "json",
+        "ids": "|".join(cleaned_ids),
+        "languages": language,
+        "props": props,
+    }
+    data = _safe_get_json(WIKIDATA_API_URL, params=params, headers=headers, timeout=timeout)
+    entities = data.get("entities", {}) if isinstance(data, dict) else {}
+    if not isinstance(entities, dict):
+        return {}
+
+    results = {}
+    for entity_id, entity in entities.items():
+        if not isinstance(entity, dict):
+            continue
+        if entity.get("missing") == "":
+            continue
+        results[entity_id] = entity
+    return results
+
+
 # Search Wikidata and return normalized candidate rows with descriptions.
 def search_wikidata(
     term,

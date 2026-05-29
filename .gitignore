@@ -20,11 +20,12 @@
 !/Latex_paper/
 !/Latex_paper/main.tex
 
-# 归档目录：保留废弃的历史脚本与 notebook（README 仅本地保留）
+# 归档目录：保留废弃的历史脚本、notebook 与 README
 !/archive/
 !/archive/**/
 !/archive/**/*.py
 !/archive/**/*.ipynb
+!/archive/**/*.md
 
 # 始终跟踪 .gitignore 本身
 !/.gitignore

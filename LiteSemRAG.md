@@ -449,9 +449,9 @@ rag.shutdown()
 - `text_processing.py`：cleaning, chunking, span extraction, Transformer
   encoding, span embedding alignment, BM25 helpers.
 - `phrase_analysis.py`：phrase classification and head/modifier extraction.
-- `utils.py`：HDBSCAN, embedding math, Wikidata candidate loading,
-  cross-encoder score extraction, dataset/eval utilities.
-- `wikidata_utils.py`：Wikidata/Wikipedia fetch helpers.
+- `utils.py`：HDBSCAN, embedding math, Wikidata/Wikipedia fetch helpers,
+  Wikidata candidate loading, cross-encoder score extraction, dataset/eval
+  utilities.
 - `wikidata_definition_filter.py`：LLM-based offline candidate-sense filtering
   with SQLite cache.
 - `llm_semantic_labeler.py`：LLM candidate selection/cache experiments.
