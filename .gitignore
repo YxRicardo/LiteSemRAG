@@ -1,14 +1,27 @@
-# 忽略所有文件
+# 默认忽略仓库内所有文件
 *
 
-# 允许目录
+# 允许 Git 遍历子目录
 !*/
 
-# 允许根目录 Python 文件
+# 根目录：仅跟踪 .py 与 .ipynb
 !/*.py
-!jupyter_notebooks/
-!jupyter_notebooks/*.ipynb
+!/*.ipynb
 
-# 忽略 Wikipedia redirect 生成数据
-data/
-tmp_redirect_index/
+# jupyter_notebooks：仅跟踪 .py 与 .ipynb（含子目录）
+!/jupyter_notebooks/
+!/jupyter_notebooks/**/
+!/jupyter_notebooks/*.py
+!/jupyter_notebooks/*.ipynb
+!/jupyter_notebooks/**/*.py
+!/jupyter_notebooks/**/*.ipynb
+
+# 例外：论文主文件
+!/Latex_paper/
+!/Latex_paper/main.tex
+
+# 始终跟踪 .gitignore 本身
+!/.gitignore
+
+# notebook 自动保存目录
+**/.ipynb_checkpoints/

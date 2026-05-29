@@ -551,6 +551,9 @@ class LiteSemRAG:
                  llm_semantic_labeler_cache_path="cache/llm_semantic_label_cache.sqlite3",
                  llm_semantic_labeler_context_word_window=20,
                  llm_semantic_labeler_max_tokens=256,
+                 llm_semantic_labeler_batch_size=10,
+                 fft_max_samples=10,
+                 fft_d1_d2_ratio_threshold=0.8,
                  fft_knn_check_k=5,
                  fft_danger_neighbor_m=10,
                  phrase_audit_enabled=False,
@@ -616,11 +619,14 @@ class LiteSemRAG:
         self.llm_semantic_labeler_cache_path = llm_semantic_labeler_cache_path
         self.llm_semantic_labeler_context_word_window = int(llm_semantic_labeler_context_word_window)
         self.llm_semantic_labeler_max_tokens = int(llm_semantic_labeler_max_tokens)
+        self.llm_semantic_labeler_batch_size = max(1, int(llm_semantic_labeler_batch_size))
         self.llm_semantic_label_client = None
         self.llm_semantic_label_total_tokens = 0
         self.llm_semantic_label_cache_hits = 0
         self.llm_semantic_label_cache_misses = 0
         self.fft_propagation_wall_time = 0.0
+        self.fft_max_samples = max(1, int(fft_max_samples))
+        self.fft_d1_d2_ratio_threshold = float(fft_d1_d2_ratio_threshold)
         self.fft_knn_check_k = max(0, int(fft_knn_check_k))
         self.fft_danger_neighbor_m = max(0, int(fft_danger_neighbor_m))
         self.sem_description_batch_size = 32
@@ -1400,7 +1406,7 @@ class LiteSemRAG:
             last_update_time[0] = now
             remaining_text = f" | remaining: {max(total - processed, 0)}" if show_remaining else ""
             print(
-                f"\r{label}: {processed}/{total}{remaining_text}",
+                f"\r\033[K{label}: {processed}/{total}{remaining_text}",
                 end="",
                 flush=True,
             )
@@ -1464,6 +1470,8 @@ class LiteSemRAG:
             del self.index_session_record_count
         if hasattr(self, "index_session_sample_count"):
             del self.index_session_sample_count
+        if not hasattr(self, "llm_semantic_labeler_batch_size"):
+            self.llm_semantic_labeler_batch_size = 10
         if getattr(self, "schema_version", None) == CURRENT_SCHEMA_VERSION:
             return
         if not hasattr(self, "phrase_analyzer"):
@@ -1558,6 +1566,8 @@ class LiteSemRAG:
             self.llm_semantic_labeler_context_word_window = 20
         if not hasattr(self, "llm_semantic_labeler_max_tokens"):
             self.llm_semantic_labeler_max_tokens = 256
+        if not hasattr(self, "llm_semantic_labeler_batch_size"):
+            self.llm_semantic_labeler_batch_size = 10
         if not hasattr(self, "llm_semantic_label_client"):
             self.llm_semantic_label_client = None
         if not hasattr(self, "llm_semantic_label_total_tokens"):
@@ -1568,6 +1578,10 @@ class LiteSemRAG:
             self.llm_semantic_label_cache_misses = 0
         if not hasattr(self, "fft_propagation_wall_time"):
             self.fft_propagation_wall_time = 0.0
+        if not hasattr(self, "fft_max_samples"):
+            self.fft_max_samples = 10
+        if not hasattr(self, "fft_d1_d2_ratio_threshold"):
+            self.fft_d1_d2_ratio_threshold = 0.8
         if not hasattr(self, "fft_knn_check_k"):
             self.fft_knn_check_k = 5
         if not hasattr(self, "fft_danger_neighbor_m"):
@@ -2906,6 +2920,7 @@ class LiteSemRAG:
         description_vote_map = {}
         sample_prediction_records = []
         sample_span_occurrences = self._sample_sem_span_occurrences(sem_node, max_samples=max_samples)
+        prepared_samples = []
         for sample_index, span_occurrence in enumerate(sample_span_occurrences, start=1):
             chunk_node = span_occurrence.chunk_node
             prompt_info = self._build_sem_node_description_prompt(
@@ -2920,14 +2935,17 @@ class LiteSemRAG:
                 )
             if prompt_info is None:
                 continue
+            prepared_samples.append((sample_index, span_occurrence, chunk_node, prompt_info))
 
-            if getattr(self, "use_llm_semantic_labeler", False):
-                top_candidate = self._predict_description_from_prompt_with_llm(
-                    token_text,
-                    prompt_info,
-                    candidate_bank,
-                )
-            else:
+        if getattr(self, "use_llm_semantic_labeler", False):
+            top_candidates = self._predict_descriptions_from_prompt_infos_with_llm(
+                token_text,
+                [prompt_info for _sample_index, _span_occurrence, _chunk_node, prompt_info in prepared_samples],
+                candidate_bank,
+            )
+        else:
+            top_candidates = []
+            for _sample_index, _span_occurrence, _chunk_node, prompt_info in prepared_samples:
                 pairs = [(prompt_info["prompt_text"], candidate["hypothesis"]) for candidate in candidate_bank]
                 raw_scores = model.predict(
                     pairs,
@@ -2946,7 +2964,12 @@ class LiteSemRAG:
                     key=lambda item: item["score"],
                     reverse=True,
                 )
-                top_candidate = ranked_candidates[0] if ranked_candidates else None
+                top_candidates.append(ranked_candidates[0] if ranked_candidates else None)
+
+        for (sample_index, span_occurrence, chunk_node, prompt_info), top_candidate in zip(
+            prepared_samples,
+            top_candidates,
+        ):
             if top_candidate is not None:
                 description = top_candidate["description"]
                 state = description_vote_map.setdefault(
@@ -3026,37 +3049,64 @@ class LiteSemRAG:
             ),
         }
 
-    # Run one LLM semantic judgment for one prompt/context. This is intentionally
-    # single-record, so FFT samples are not combined into a shared prompt.
-    def _predict_description_from_prompt_with_llm(self, token_text, prompt_info, candidate_bank):
-        from llm_semantic_labeler import choose_wikidata_candidate_with_llm
+    # Run LLM semantic judgments for prepared prompt/context records in shared prompts.
+    def _predict_descriptions_from_prompt_infos_with_llm(
+        self,
+        token_text,
+        prompt_infos,
+        candidate_bank,
+    ):
+        from llm_semantic_labeler import choose_wikidata_candidates_with_llm_batch
+
+        if not prompt_infos:
+            return []
 
         client = self._get_llm_semantic_label_client()
         total_before = getattr(client, "total_tokens", 0)
-        result = choose_wikidata_candidate_with_llm(
-            span_text=token_text,
-            context_text=prompt_info["context_text"],
-            matched_text=prompt_info.get("matched_text") or token_text,
-            local_span=prompt_info.get("local_span"),
+        records = [
+            {
+                "span_text": token_text,
+                "context_text": prompt_info["context_text"],
+                "matched_text": prompt_info.get("matched_text") or token_text,
+                "local_span": prompt_info.get("local_span"),
+            }
+            for prompt_info in prompt_infos
+        ]
+        results = choose_wikidata_candidates_with_llm_batch(
+            records=records,
             candidate_bank=candidate_bank,
             cache_path=self.llm_semantic_labeler_cache_path,
             context_word_window=self.llm_semantic_labeler_context_word_window,
             client=client,
             max_tokens=self.llm_semantic_labeler_max_tokens,
+            max_batch_size=self.llm_semantic_labeler_batch_size,
         )
         total_after = getattr(client, "total_tokens", total_before)
         self.llm_semantic_label_total_tokens += max(0, int(total_after - total_before))
-        if result.get("cache_hit"):
-            self.llm_semantic_label_cache_hits += 1
-        else:
-            self.llm_semantic_label_cache_misses += 1
+        for result in results:
+            if result.get("cache_hit"):
+                self.llm_semantic_label_cache_hits += 1
+            else:
+                self.llm_semantic_label_cache_misses += 1
 
-        candidate = dict(result["selected_candidate"])
-        candidate["score"] = None
-        candidate["prediction_method"] = "llm_semantic_label"
-        candidate["llm_reason"] = result.get("reason")
-        candidate["llm_cache_hit"] = bool(result.get("cache_hit"))
-        return candidate
+        candidates = []
+        for result in results:
+            candidate = dict(result["selected_candidate"])
+            candidate["score"] = None
+            candidate["prediction_method"] = "llm_semantic_label"
+            candidate["llm_reason"] = result.get("reason")
+            candidate["llm_cache_hit"] = bool(result.get("cache_hit"))
+            candidates.append(candidate)
+        return candidates
+
+    # Run one LLM semantic judgment for one prompt/context.
+    def _predict_description_from_prompt_with_llm(self, token_text, prompt_info, candidate_bank):
+        candidates = self._predict_descriptions_from_prompt_infos_with_llm(
+            token_text,
+            [prompt_info],
+            candidate_bank,
+        )
+        return candidates[0] if candidates else None
 
     # Run cross-encoder prediction for a single span occurrence; return the top candidate or None.
     def _predict_description_for_span_occurrence(
@@ -3209,8 +3259,8 @@ class LiteSemRAG:
             embeds_for_fft.append(embed_np)
 
         sampled_indices = []
-        if embeds_for_fft and len(embeds_for_fft) > 10:
-            sampled_indices = list(self._run_farthest_first_traversal(embeds_for_fft, 10))
+        if embeds_for_fft and len(embeds_for_fft) > self.fft_max_samples:
+            sampled_indices = list(self._run_farthest_first_traversal(embeds_for_fft, self.fft_max_samples))
         elif embeds_for_fft:
             sampled_indices = list(range(len(embeds_for_fft)))
 
@@ -3235,7 +3285,9 @@ class LiteSemRAG:
             "token_text": token_text,
             "token_node_id": getattr(token_node, "token_node_id", None),
             "sem_node_id": sem_node.sem_node_id,
+            "fft_max_samples": self.fft_max_samples,
             "consensus_ratio_threshold": self.consensus_ratio_threshold,
+            "fft_d1_d2_ratio_threshold": self.fft_d1_d2_ratio_threshold,
             "fft_knn_check_k": self.fft_knn_check_k,
             "fft_danger_neighbor_m": self.fft_danger_neighbor_m,
             "all_text_embeddings": all_text_embeddings,
@@ -3338,7 +3390,7 @@ class LiteSemRAG:
             sem_node,
             model=self.sem_description_model,
             candidate_bank_cache=self._sem_description_candidate_bank_cache,
-            max_samples=10,
+            max_samples=self.fft_max_samples,
         )
         if prediction_result is None:
             _emit("no_prediction")
@@ -3483,30 +3535,66 @@ class LiteSemRAG:
                 "llm_cache_hit": top_candidate.get("llm_cache_hit"),
             }
 
+        def _predict_missing_records_for_tes(text_embeddings):
+            pending = []
+            pending_keys = set()
+            for te in text_embeddings:
+                key = self._get_span_occurrence_key(te.to_span_occurrence())
+                if key in prediction_cache or key in pending_keys:
+                    continue
+                pending.append((key, te))
+                pending_keys.add(key)
+            if not pending:
+                return
+
+            if getattr(self, "use_llm_semantic_labeler", False):
+                prompt_infos = []
+                llm_pending = []
+                for key, te in pending:
+                    span_occurrence = te.to_span_occurrence()
+                    chunk_node = span_occurrence.chunk_node
+                    prompt_info = self._build_sem_node_description_prompt(
+                        chunk_node.chunk_text,
+                        token_node.token_text,
+                        match_span=span_occurrence.get_span_tuple(),
+                    )
+                    if prompt_info is None:
+                        prompt_info = self._build_fallback_sem_description_prompt(
+                            chunk_node.chunk_text,
+                            token_node.token_text,
+                        )
+                    if prompt_info is None:
+                        continue
+                    prompt_infos.append(prompt_info)
+                    llm_pending.append((key, te))
+                top_candidates = self._predict_descriptions_from_prompt_infos_with_llm(
+                    token_node.token_text,
+                    prompt_infos,
+                    candidate_bank,
+                )
+                for (key, te), top_candidate in zip(llm_pending, top_candidates):
+                    if top_candidate is None:
+                        continue
+                    prediction_cache[key] = _prediction_record_from_candidate(te, top_candidate)
+                return
+
+            for key, te in pending:
+                top_candidate = self._predict_description_for_span_occurrence(
+                    token_node.token_text,
+                    te.to_span_occurrence(),
+                    candidate_bank,
+                    self.sem_description_model,
+                )
+                if top_candidate is not None:
+                    prediction_cache[key] = _prediction_record_from_candidate(te, top_candidate)
+
         def _get_or_predict_record(te):
             key = self._get_span_occurrence_key(te.to_span_occurrence())
             cached = prediction_cache.get(key)
             if cached is not None:
                 return cached
-            span_occurrence = te.to_span_occurrence()
-            if getattr(self, "use_llm_semantic_labeler", False):
-                top_candidate = self._predict_description_for_span_occurrence_with_llm(
-                    token_node.token_text,
-                    span_occurrence,
-                    candidate_bank,
-                )
-            else:
-                top_candidate = self._predict_description_for_span_occurrence(
-                    token_node.token_text,
-                    span_occurrence,
-                    candidate_bank,
-                    self.sem_description_model,
-                )
-            if top_candidate is None:
-                return None
-            record = _prediction_record_from_candidate(te, top_candidate)
-            prediction_cache[key] = record
-            return record
+            _predict_missing_records_for_tes([te])
+            return prediction_cache.get(key)
 
         final_groups = defaultdict(list)
         class_medoid_embeds = {}
@@ -3514,6 +3602,25 @@ class LiteSemRAG:
         danger_indices = set()
         safety_checks = []
         safe_class_tes = defaultdict(list)
+
+        if getattr(self, "use_llm_semantic_labeler", False):
+            neighbor_tes_to_judge = []
+            for records in valid_classes.values():
+                for record in records:
+                    key = self._get_span_occurrence_key(record["span_occurrence"])
+                    te = embedding_lookup.get(key)
+                    if te is None:
+                        continue
+                    seed_idx = te_to_index.get(id(te))
+                    if seed_idx is None:
+                        continue
+                    for neighbor_idx in self._nearest_cluster_text_embedding_indices(
+                        cluster_text_embeddings,
+                        seed_idx,
+                        self.fft_knn_check_k,
+                    ):
+                        neighbor_tes_to_judge.append(cluster_text_embeddings[neighbor_idx])
+            _predict_missing_records_for_tes(neighbor_tes_to_judge)
 
         for description, records in valid_classes.items():
             for record in records:
@@ -3641,7 +3748,7 @@ class LiteSemRAG:
                 d1 = float(sorted_dists[0].item())
                 d2 = float(sorted_dists[1].item())
                 ratio = (d1 / d2) if d2 > 0 else float("inf")
-                if d2 > 0 and ratio <= 0.8:
+                if d2 > 0 and ratio <= self.fft_d1_d2_ratio_threshold:
                     chosen_desc = medoid_descriptions[int(sorted_idx[0].item())]
                     final_groups[chosen_desc].append(te)
                     sample_assignments.append({
@@ -3658,6 +3765,11 @@ class LiteSemRAG:
         else:
             for te, singleton_description, _is_danger_zone in unclassified_records:
                 model_judgment_records.append((te, singleton_description, None, None, None))
+
+        if getattr(self, "use_llm_semantic_labeler", False):
+            _predict_missing_records_for_tes(
+                [te for te, _singleton_description, _d1, _d2, _ratio in model_judgment_records]
+            )
 
         for te, singleton_description, d1, d2, ratio in model_judgment_records:
             prediction_record = _get_or_predict_record(te)
@@ -3720,6 +3832,8 @@ class LiteSemRAG:
             "description_counts": {d: len(tes) for d, tes in final_groups.items()},
             "initial_class_sizes": {d: len(r) for d, r in description_groups.items()},
             "safe_class_sizes": {d: len(tes) for d, tes in safe_class_tes.items()},
+            "fft_max_samples": self.fft_max_samples,
+            "fft_d1_d2_ratio_threshold": self.fft_d1_d2_ratio_threshold,
             "fft_knn_check_k": self.fft_knn_check_k,
             "fft_danger_neighbor_m": self.fft_danger_neighbor_m,
             "safety_checks": safety_checks,

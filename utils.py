@@ -521,6 +521,7 @@ def load_wikidata_definition_candidates(
     require_detailed_description: bool = False,
     label_contains_text: bool = True,
     target_candidate_count: int | None = None,
+    use_span_rules: bool = True,
     use_llm_filter: bool = False,
     llm_filter=None,
     llm_filter_use_api: bool = False,
@@ -608,12 +609,16 @@ def load_wikidata_definition_candidates(
         )
 
     definition_column = "detailed_description" if use_detailed_description else "description"
-    candidates_df = _select_wikidata_candidates_by_span_rules(
-        candidates_df,
-        query_text=query_text,
-        definition_column=definition_column,
-        max_candidate_count=max_candidate_count,
-    )
+    if use_span_rules:
+        candidates_df = _select_wikidata_candidates_by_span_rules(
+            candidates_df,
+            query_text=query_text,
+            definition_column=definition_column,
+            max_candidate_count=max_candidate_count,
+        )
+    else:
+        definition_mask = _series_non_empty_mask(candidates_df[definition_column])
+        candidates_df = candidates_df[definition_mask].head(max_candidate_count).reset_index(drop=True)
     if candidates_df.empty:
         raise ValueError(
             f"No usable {definition_column} candidates remained for span={query_text!r}."

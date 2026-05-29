@@ -35,30 +35,82 @@ DEFAULT_MAX_TOKENS = 1024
 
 DEFAULT_API_MODEL = "gpt-5.4-mini"
 DEFAULT_API_KEY_FILE = "API_KEY"
-WIKIDATA_CANDIDATE_FILTER_VERSION = "merge_prompt_v4_label_window_plus2"
+WIKIDATA_CANDIDATE_FILTER_VERSION = "merge_prompt_v5_coarse_examples"
 
 
-SYSTEM_PROMPT = """You are a careful lexical semantics annotator.
-Your task is to clean candidate word senses from Wikidata for a semantic retrieval system.
-Merge candidates when they refer to the same or nearly the same meaning, even if their labels or wording differ.
-Keep candidates separate when they would lead to different retrieval behavior in context.
-Prefer concise, concrete sense descriptions.
+SYSTEM_PROMPT = """You are a conservative lexical-sense merger for a semantic retrieval system.
+Your job is to reduce noisy Wikidata candidate senses to a small set of coarse retrieval meanings.
+Prefer merging over splitting when candidates describe the same broad concept, role, entity type, or function.
+Do not preserve fine-grained domain, institution, jurisdiction, title, or wording differences unless they change what evidence should be retrieved.
+When uncertain, merge the candidates and write a broader description.
 Return only valid JSON."""
 
-USER_PROMPT_TEMPLATE = """Merge near-duplicate candidate senses for the target word.
+USER_PROMPT_TEMPLATE = """Merge candidate senses for the target word into coarse retrieval-oriented meanings.
 
-Rules:
-1. Merge candidates only when their hypotheses mean the same or nearly the same thing for retrieval.
-2. Keep candidates separate when they describe meaningfully different contextual senses.
-3. Discard candidates that are too vague, redundant, or not a plausible sense of the target word.
-4. Output only valid JSON with keys: word, merged_senses, discarded_candidates, notes.
+Goal:
+Create the smallest useful sense inventory for retrieval. These merged descriptions will later be used by a cross-encoder, so avoid distinctions that are too subtle for short context snippets.
+
+Default bias:
+- Merge by broad semantic function, not by Wikidata entity granularity.
+- Merge title/domain variants when they are instances of the same role or concept.
+- Merge specific subtypes into their broader parent sense unless the subtype changes the entity type or expected evidence.
+- If two candidates could both match the same ordinary sentence about the target word, merge them.
+- When uncertain, merge.
+
+Split only when:
+1. The meanings are genuinely different entity types or concepts, such as fruit vs company or financial bank vs river bank.
+2. Keeping them together would make clearly wrong documents look relevant.
+3. The distinction is likely obvious from short local context, not just from specialist wording.
+
+Discard only when:
+1. The candidate is not a plausible sense of the target word.
+2. The candidate is too vague to add value and cannot be merged into a broader valid sense.
+
+Examples:
+[
+  {{
+    "word": "president",
+    "candidate_senses": [
+      {{"candidate_id": 1, "label": "president", "hypothesis": "It refers to leader of a country or part of a country."}},
+      {{"candidate_id": 2, "label": "president", "hypothesis": "It refers to leader of an organization."}},
+      {{"candidate_id": 3, "label": "speaker", "hypothesis": "It refers to presiding officer of a legislative body."}},
+      {{"candidate_id": 4, "label": "chancellor", "hypothesis": "It refers to leader of a university or college."}}
+    ],
+    "expected_merge": {{
+      "canonical_label": "leader or presiding officer",
+      "merged_description": "A person who leads or presides over a country, organization, legislative body, university, or similar institution.",
+      "source_candidate_ids": [1, 2, 3, 4]
+    }},
+    "rationale": "These are institutional leadership or presiding roles. The differences are title/domain variants, not separate retrieval meanings for a generic word-sense index."
+  }},
+  {{
+    "word": "bank",
+    "candidate_senses": [
+      {{"candidate_id": 1, "label": "bank", "hypothesis": "It refers to a financial institution."}},
+      {{"candidate_id": 2, "label": "river bank", "hypothesis": "It refers to land alongside a river."}}
+    ],
+    "expected_split": [1, 2],
+    "rationale": "These meanings retrieve different kinds of evidence and should stay separate."
+  }},
+  {{
+    "word": "apple",
+    "candidate_senses": [
+      {{"candidate_id": 1, "label": "apple", "hypothesis": "It refers to an edible fruit."}},
+      {{"candidate_id": 2, "label": "Apple Inc.", "hypothesis": "It refers to a technology company."}}
+    ],
+    "expected_split": [1, 2],
+    "rationale": "A fruit and a company are different entity types and should stay separate."
+  }}
+]
+
+Output only valid JSON with keys: word, merged_senses, discarded_candidates, notes.
 
 Each merged_senses item must contain:
 - sense_id: a short stable id such as s1, s2, s3
 - canonical_label: short label for the merged sense
-- merged_description: one sentence describing the merged meaning
+- merged_description: one sentence describing the broad merged meaning
 - source_candidate_ids: list of integer candidate_id values that were merged
-- merge_rationale: one short sentence
+- merge_rationale: one short sentence explaining why these candidates belong together or why the sense stayed separate
 
 Each discarded_candidates item must contain:
 - candidate_id

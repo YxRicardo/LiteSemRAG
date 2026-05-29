@@ -554,12 +554,12 @@ def _is_valid_token(token, debug_mode=False, debug_stage=None):
         return False
 
     is_model = any(c.isdigit() for c in token.text)
-    if token.pos_ not in ["NOUN", "PROPN", "ADJ"] and not is_model:
+    if token.pos_ not in ["NOUN", "PROPN"] and not is_model:
         if debug_mode:
             _debug_skip(
                 "token",
                 token,
-                f"POS={token.pos_} is not in {{NOUN, PROPN, ADJ}} and the token does not look like a model/code token",
+                f"POS={token.pos_} is not in {{NOUN, PROPN}} and the token does not look like a model/code token",
                 stage=debug_stage,
             )
         return False
