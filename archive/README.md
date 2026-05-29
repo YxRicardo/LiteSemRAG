@@ -37,3 +37,6 @@ cross-encoder/LLM 标注）已脱钩的历史脚本与 notebook。归档而非�
 - `hotpotqa_embeds_explore.ipynb`、`hotpotqa_embeds_qwen.ipynb`
 - `hotpotqa_cross_encoder.ipynb`、`hotpotqa_llm_model_compare.ipynb`
 - `hotpotqa_scan_cache_explore.ipynb`
+
+> `hotpotqa_cross_encoder.ipynb` 依赖已删除的 `wikidata_utils`（其功能已并入
+> `utils.py`），原样运行会 import 失败。
