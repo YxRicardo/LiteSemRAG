@@ -30,5 +30,8 @@
 # 始终跟踪 .gitignore 本身
 !/.gitignore
 
+# 仅跟踪这一份文档（CLAUDE.md / AGENTS.md 等其它 .md 仍只保留在本地）
+!/LiteSemRAG.md
+
 # notebook 自动保存目录
 **/.ipynb_checkpoints/
