@@ -592,6 +592,7 @@ class LiteSemRAG:
                  llm_candidate_filter_api_model=None,
                  llm_candidate_filter_cache_path="cache/wikidata_definition_filter_cache.sqlite3",
                  use_llm_semantic_labeler=False,
+                 disambiguate_query_sense=True,
                  llm_semantic_labeler_provider="openai",
                  llm_semantic_labeler_model="gpt-5.4-mini",
                  llm_semantic_labeler_api_key_file="API_KEY",
@@ -666,6 +667,10 @@ class LiteSemRAG:
         self.llm_candidate_filter_total_wall_time = 0.0
         self.llm_candidate_filter_api_wait_wall_time = 0.0
         self.use_llm_semantic_labeler = bool(use_llm_semantic_labeler)
+        # 查询期多义消歧:当一个 span 命中的 token 在索引期生成了多个带描述的 sem
+        # node(多义)时,复用索引期的语义判断(cross-encoder / LLM)来选择对应的
+        # sem node,而不是单纯比 embedding 相似度。只有一个 sem node 时直接取用。
+        self.disambiguate_query_sense = bool(disambiguate_query_sense)
         self.llm_semantic_labeler_provider = llm_semantic_labeler_provider
         self.llm_semantic_labeler_model = llm_semantic_labeler_model
         self.llm_semantic_labeler_api_key_file = llm_semantic_labeler_api_key_file
@@ -1733,6 +1738,8 @@ class LiteSemRAG:
             self.sem_description_model_name = "cross-encoder/nli-deberta-v3-large"
         if not hasattr(self, "sem_description_model"):
             self.sem_description_model = None
+        if not hasattr(self, "disambiguate_query_sense"):
+            self.disambiguate_query_sense = True
         if not hasattr(self, "consensus_ratio_threshold"):
             self.consensus_ratio_threshold = 0.8
         if not hasattr(self, "min_occurrences_for_description"):
@@ -2205,6 +2212,86 @@ class LiteSemRAG:
 
         return query_text, token_embeddings, offsets, tokens_for_processing
 
+    # Disambiguate a multi-sense query span by reusing the index-time semantic
+    # judgment instead of embedding similarity.
+    #
+    # If the matched token built several described sem nodes during indexing (i.e.
+    # it is genuinely multi-sense), score the query context against those senses'
+    # candidate definitions with the same cross-encoder / LLM judge used at index
+    # time, and return the sem node whose description wins. Returns None to signal
+    # the caller should fall back to embedding-similarity matching (single sense,
+    # missing descriptions, no model, or an inconclusive judgment).
+    def _disambiguate_query_sem_node_by_description(self, token_node, query_text, token_text, match_span):
+        if not getattr(self, "disambiguate_query_sense", False):
+            return None
+        sem_nodes = getattr(token_node, "sem_node_list", []) or []
+        if len(sem_nodes) < 2:
+            return None
+
+        # Map each described sense to its sem node. Duplicate descriptions are
+        # merged at finalize, so collisions should not occur; keep the first.
+        description_to_sem_node = {}
+        for sem_node in sem_nodes:
+            description = (getattr(sem_node, "description", None) or "").strip()
+            if description:
+                description_to_sem_node.setdefault(description, sem_node)
+        if len(description_to_sem_node) < 2:
+            return None
+
+        use_llm = bool(getattr(self, "use_llm_semantic_labeler", False))
+        if not use_llm and self.sem_description_model is None:
+            return None
+
+        candidate_bank = self._load_sem_description_candidate_bank(
+            sem_nodes[0], self._sem_description_candidate_bank_cache
+        )
+        if not candidate_bank:
+            return None
+        # Restrict the judgment to the senses that actually became sem nodes so the
+        # winning description always maps back to a node.
+        filtered_bank = [
+            candidate
+            for candidate in candidate_bank
+            if (candidate.get("description") or "").strip() in description_to_sem_node
+        ]
+        if len({(candidate.get("description") or "").strip() for candidate in filtered_bank}) < 2:
+            return None
+
+        prompt_info = self._build_sem_node_description_prompt(
+            query_text, token_text, match_span=match_span
+        )
+        if prompt_info is None:
+            prompt_info = self._build_fallback_sem_description_prompt(query_text, token_text)
+        if prompt_info is None:
+            return None
+
+        if use_llm:
+            top_candidate = self._predict_description_from_prompt_with_llm(
+                token_text, prompt_info, filtered_bank
+            )
+        else:
+            pairs = [
+                (prompt_info["prompt_text"], candidate["hypothesis"])
+                for candidate in filtered_bank
+            ]
+            raw_scores = self.sem_description_model.predict(
+                pairs,
+                batch_size=min(self.sem_description_batch_size, len(pairs)),
+                show_progress_bar=False,
+            )
+            scores = extract_cross_encoder_scores(raw_scores, self.sem_description_model)
+            ranked = sorted(
+                zip(filtered_bank, scores),
+                key=lambda item: float(item[1]),
+                reverse=True,
+            )
+            top_candidate = ranked[0][0] if ranked else None
+
+        if not top_candidate:
+            return None
+        description = (top_candidate.get("description") or "").strip()
+        return description_to_sem_node.get(description)
+
     # Resolve exact, fuzzy, and embedding-based semantic node matches for a query.
     def _resolve_query_matches(
         self,
@@ -2248,9 +2335,23 @@ class LiteSemRAG:
             semantic_weight = None
 
             if token_node is not None:
-                max_sem_index = self.get_max_sim_sem(token_node, token_embed)
-                if max_sem_index is not None:
-                    exact_sem_node = token_node.sem_node_list[max_sem_index]
+                surface_start = query_unit.get("surface_start")
+                surface_end = query_unit.get("surface_end")
+                match_span = (
+                    (surface_start, surface_end)
+                    if surface_start is not None and surface_end is not None
+                    else None
+                )
+                exact_sem_node = self._disambiguate_query_sem_node_by_description(
+                    token_node,
+                    query_text,
+                    token,
+                    match_span,
+                )
+                if exact_sem_node is None:
+                    max_sem_index = self.get_max_sim_sem(token_node, token_embed)
+                    if max_sem_index is not None:
+                        exact_sem_node = token_node.sem_node_list[max_sem_index]
                 if token_type in {"phrase", "ent"} and search_mode != "broad":
                     tokens_in_phrase.extend(token.split(" "))
 

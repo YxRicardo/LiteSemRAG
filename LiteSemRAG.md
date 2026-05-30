@@ -59,6 +59,7 @@ LiteSemRAG(
     consensus_ratio_threshold=0.8,
     min_description_candidates=3,
     use_llm_semantic_labeler=False,
+    disambiguate_query_sense=True,
 )
 ```
 
@@ -91,6 +92,13 @@ Important parameters:
 - `use_llm_semantic_labeler` switches semantic-description sample judgments
   from the cross-encoder to per-sample LLM calls. FFT samples and fallback
   samples are judged one prompt at a time, using `llm_semantic_labeler.py`.
+- `disambiguate_query_sense` enables query-time sense disambiguation. When a
+  query span resolves to a token that built multiple *described* semantic nodes
+  during indexing (a genuinely multi-sense token), the exact match is chosen by
+  re-running the index-time semantic judgment (cross-encoder, or LLM when
+  `use_llm_semantic_labeler` is on) over the query context against those senses'
+  candidate definitions, instead of by embedding similarity. Tokens with a
+  single semantic node skip the judgment and resolve directly.
 
 The constructor initializes graph lists, ID counters, phrase/modifier indexes,
 runtime model handles, a `ThreadPoolExecutor`, and a schema version marker. It
@@ -306,8 +314,11 @@ expand_compositional=False)`:
 
 `_resolve_query_matches()` then produces, for each query unit:
 
-- `exact_sem_node` from the existing token node and highest centroid
-  similarity;
+- `exact_sem_node` from the existing token node. For a token that built
+  multiple described semantic nodes, `_disambiguate_query_sem_node_by_description()`
+  picks the sense by re-running the index-time cross-encoder / LLM judgment over
+  the query context (controlled by `disambiguate_query_sense`); otherwise, or on
+  an inconclusive judgment, it falls back to the highest centroid similarity;
 - `fuzzy_sem_nodes` from `phrase_word_intersection_query()` and
   `max_cosine_sem_nodes()`;
 - `retrieved_sem` plus `semantic_weight` from `query_by_sim()` when exact and
