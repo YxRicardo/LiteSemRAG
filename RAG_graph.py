@@ -4,6 +4,7 @@ import os
 import pickle
 import random
 import re
+import sys
 import time
 import traceback
 from html import escape
@@ -79,6 +80,51 @@ COMPOSITIONAL_QUERY_ROLE_WEIGHT = {
     "head": 0.7,
     "modifier": 0.2,
 }
+
+# Recursion limit used while pickling the deeply linked node graph.
+DEEP_PICKLE_RECURSION_LIMIT = 1_000_000
+# Worker-thread stack size (bytes) so a high recursion limit cannot crash the
+# native C stack while pickle does its depth-first traversal.
+DEEP_PICKLE_STACK_SIZE = 512 * 1024 * 1024
+
+# Pickle a deeply linked object graph without hitting RecursionError.
+#
+# pickle traverses object references depth-first, so a long reference chain
+# (DocumentNode -> ChunkNode -> SemNode -> TokenNode -> ...) can exceed the
+# default recursion limit. We raise the limit and run the dump on a worker
+# thread with a large stack, which keeps the native stack from overflowing.
+def deep_pickle_dump(obj, fileobj, protocol=pickle.HIGHEST_PROTOCOL):
+    error = {}
+
+    def _dump():
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(DEEP_PICKLE_RECURSION_LIMIT)
+        try:
+            pickle.dump(obj, fileobj, protocol=protocol)
+        except BaseException as exc:  # propagate to the calling thread
+            error["exc"] = exc
+        finally:
+            sys.setrecursionlimit(old_limit)
+
+    old_stack_size = None
+    try:
+        old_stack_size = threading.stack_size(DEEP_PICKLE_STACK_SIZE)
+    except (ValueError, RuntimeError):
+        # Platform refused the requested stack size; fall back to default.
+        old_stack_size = None
+
+    worker = threading.Thread(target=_dump)
+    worker.start()
+    worker.join()
+
+    if old_stack_size is not None:
+        try:
+            threading.stack_size(old_stack_size)
+        except (ValueError, RuntimeError):
+            pass
+
+    if "exc" in error:
+        raise error["exc"]
 
 # Compute the co-occurrence edge weight between two semantic nodes.
 def get_COG_edge_weight(node_a, node_b):
@@ -533,7 +579,8 @@ def _find_description_match_span(chunk_text, token_text):
 
 class LiteSemRAG:
     # Initialize graph storage, model handles, retrieval settings, and runtime state.
-    def __init__(self, df_ratio, buffer_size=100, anomaly_threshold_percentile=0.9,
+    def __init__(self, buffer_size=100, anomaly_threshold_percentile=0.9,
+                 min_occurrences_for_description=20,
                  anomaly_section_size=50,
                  retrieve_top_k=5, chunk_size=300, device="cuda",
                  discard_no_word=False,
@@ -558,7 +605,6 @@ class LiteSemRAG:
                  fft_danger_neighbor_m=10,
                  phrase_audit_enabled=False,
                  phrase_audit_cache_path="cache/phrase_protection_audit.jsonl"):
-        self.df_ratio = df_ratio
         self.doc_nodes = []
         self.chunk_nodes = []
         self.token_nodes = []
@@ -569,6 +615,13 @@ class LiteSemRAG:
         self.next_token_node_id = 0
         self.next_sem_node_id = 0
         self.buffer_size = buffer_size
+        # 一个 token/phrase 至少出现这么多次,finalize 时才会跑描述预测 / 多义切分;
+        # 低于该阈值的走 create_basic_sem_node(单节点、无描述)。与 buffer_size(内存
+        # flush 阈值)解耦:不再用"索引期是否撑爆 buffer"来决定能否享受语义描述。
+        # 取值应 <= buffer_size(出现次数达到 buffer_size 的 token 在索引期已必然走
+        # 完整路径)。设为 None 则关闭该特性,退回旧行为(仅索引期撑爆 buffer 的
+        # token 才有描述);设为 1 则所有 token 都做描述。
+        self.min_occurrences_for_description = min_occurrences_for_description
         self.token_node_query = {}
         self.tau_conc = 0.90
         self.tau_disp = 0.78
@@ -657,6 +710,7 @@ class LiteSemRAG:
         self._sem_description_candidate_bank_cache = {}
         self.llm_candidate_filter_result_cache = {}
         self.sem_build_count = 0
+        self._reset_sem_build_stats()
         self.phrase_audit_enabled = bool(phrase_audit_enabled)
         self.phrase_audit_cache_path = phrase_audit_cache_path
         self._phrase_audit_session_id = None
@@ -868,9 +922,11 @@ class LiteSemRAG:
         return new_doc_node
 
     # Create and register a chunk node under a document node.
-    def create_chunk_node(self, chunk_text, doc_node):
+    def create_chunk_node(self, chunk_text, doc_node, num_tokens=None):
         new_chunk_node = ChunkNode(chunk_text, self._new_node_id("chunk"), doc_node)
-        new_chunk_node.num_tokens = get_num_tokens(chunk_text, self.nlp)
+        if num_tokens is None:
+            num_tokens = get_num_tokens(chunk_text, self.nlp)
+        new_chunk_node.num_tokens = num_tokens
         self.chunk_nodes.append(new_chunk_node)
         doc_node.chunk_node_list.append(new_chunk_node)
         return new_chunk_node
@@ -1068,12 +1124,13 @@ class LiteSemRAG:
         return len(removed_nodes)
 
     # Route compositional phrase spans to both the full phrase and semantic head for indexing.
-    def _prepare_index_phrase_spans(self, chunk_text, phrases):
+    def _prepare_index_phrase_spans(self, chunk_text, phrases, doc=None):
         if not phrases:
             return phrases
 
         analyzer = self._get_phrase_analyzer()
-        doc = self.nlp(chunk_text)
+        if doc is None:
+            doc = self.nlp(chunk_text)
         routed_phrases = []
 
         for phrase, start_char, end_char in phrases:
@@ -1299,15 +1356,65 @@ class LiteSemRAG:
         )
         token_node.sem_node_list.extend(final_sem_nodes)
 
+    # Reset the per-session counters that track who reaches the full sem-build path.
+    def _reset_sem_build_stats(self):
+        # 进入 build_sem_node 的 token/span 数(= 通过 min_occurrences_for_description
+        # 或索引期已撑爆 buffer 的高频词,二者都意味着出现次数足够走完整建节点路径)。
+        self.sem_stats_passed_occurrence = 0
+        # 其中被判为 entity / 原子短语(force_single_semantic)而直接单义的,不计入 S_mean 统计。
+        self.sem_stats_entity_single = 0
+        # 通过出现次数闸门、且非 entity 的 token 中,因 s_mean 过高(语义集中)被判单义而筛掉的数量。
+        self.sem_stats_smean_filtered = 0
+        # 通过 s_mean 检测、进入聚类/描述消歧路径的数量(多义切分的候选)。
+        self.sem_stats_smean_passed = 0
+        # 上述候选里最终真正切出多个语义节点的数量。
+        self.sem_stats_multi_sense = 0
+
     # Build semantic nodes from buffered token embeddings.
     def build_sem_node(self, token_node):
+        self.sem_stats_passed_occurrence += 1
         if getattr(token_node, "force_single_semantic", False):
+            # 被判为 entity / 原子短语:默认单义,不参与 S_mean / 多义统计。
+            self.sem_stats_entity_single += 1
             self.create_basic_sem_node(token_node)
         elif token_node.node_type == "token" and not self.semantic_type_cls(token_node):
+            # s_mean 过高 → 各次出现语义一致 → 被筛成单义。
+            self.sem_stats_smean_filtered += 1
             self.create_basic_sem_node(token_node)
         else:
+            # 通过 s_mean(或非 token 的短语),进入描述驱动的多义切分路径。
+            self.sem_stats_smean_passed += 1
+            sem_count_before = len(token_node.sem_node_list)
             self._build_sem_node_from_cluster(token_node, list(token_node.embeds_buffer))
+            if len(token_node.sem_node_list) - sem_count_before > 1:
+                self.sem_stats_multi_sense += 1
         token_node.embeds_buffer.clear()
+
+    # Print how many token/span reached / passed each stage of the sem-build funnel.
+    def _print_sem_build_stats(self):
+        passed = getattr(self, "sem_stats_passed_occurrence", 0)
+        entity = getattr(self, "sem_stats_entity_single", 0)
+        smean_filtered = getattr(self, "sem_stats_smean_filtered", 0)
+        smean_passed = getattr(self, "sem_stats_smean_passed", 0)
+        multi_sense = getattr(self, "sem_stats_multi_sense", 0)
+        # 参与 S_mean 判定的总数(已剔除 entity / 原子短语)。
+        smean_candidates = smean_filtered + smean_passed
+        min_occ = getattr(self, "min_occurrences_for_description", None)
+        print("=" * 60)
+        print(f"sem-build funnel (min_occurrences_for_description={min_occ}):")
+        print(
+            f"  1. 通过出现次数闸门进入完整建节点路径: {passed} "
+            f"(其中 entity/原子短语默认单义: {entity})"
+        )
+        print(
+            f"  2. 参与 S_mean 判定(非 entity): {smean_candidates} "
+            f"-> 因 S_mean 过高被筛为单义: {smean_filtered}"
+        )
+        print(
+            f"  3. 通过 S_mean 进入消歧路径: {smean_passed} "
+            f"-> 最终切出多个语义: {multi_sense}"
+        )
+        print("=" * 60)
 
     # Build semantic nodes for all token nodes waiting in the build queue.
     def solve_sem_nodes(self):
@@ -1353,6 +1460,7 @@ class LiteSemRAG:
         self.start_time = start_time
         self.index_session_start_time = start_time
         self.index_session_document_count = indexed_document_count
+        self._reset_sem_build_stats()
         self.llm_candidate_filter_total_tokens = 0
         self.llm_candidate_filter_prompt_tokens = 0
         self.llm_candidate_filter_completion_tokens = 0
@@ -1438,13 +1546,14 @@ class LiteSemRAG:
 
     # Decide whether a token node should be split into multiple semantic clusters.
     def semantic_type_cls(self, token_node):
-        if token_node.df > len(self.chunk_nodes) * self.df_ratio:
-            return False
+        # 是否对该 token 做多义切分,仅由 embedding 的集中度决定:
+        # s_mean 高 → 各次出现语义一致 → 单义节点(返回 False);
+        # s_mean 低 → 语义分散 → 走切分路径(返回 True)。
+        # 注:此前还有一个基于 df 的"太常见就不切分"闸门,但 df 在索引期
+        # 恒为 0(只在 finalize 的 assign_idf 里赋值),该分支从未生效;且即便
+        # 生效,它会把"高频多义词"(如 bank)误判为单义,与目标相悖,故已移除。
         s_mean = get_s_mean([i.embed for i in token_node.embeds_buffer])
-        if s_mean > self.tau_conc:
-            return False
-        else:
-            return True
+        return not (s_mean > self.tau_conc)
 
     # Look up a token node by its surface text.
     def query_token_node(self, text):
@@ -1626,6 +1735,8 @@ class LiteSemRAG:
             self.sem_description_model = None
         if not hasattr(self, "consensus_ratio_threshold"):
             self.consensus_ratio_threshold = 0.8
+        if not hasattr(self, "min_occurrences_for_description"):
+            self.min_occurrences_for_description = 20
         if not hasattr(self, "min_description_candidates"):
             legacy_min_candidates = getattr(self, "single_cluster_min_description_candidates", 3)
             self.min_description_candidates = max(1, int(legacy_min_candidates))
@@ -2539,6 +2650,7 @@ class LiteSemRAG:
             self.log_time(f"Removed {removed_placeholder_count} empty placeholder token nodes.")
         self.finalize_token_nodes()
         self.log_time("Finished token node finalization.")
+        self._print_sem_build_stats()
 
         self.merge_duplicate_description_sem_nodes()
         self.log_time("Finished merging sem nodes by description.")
@@ -2584,9 +2696,17 @@ class LiteSemRAG:
             show_remaining=True,
         )
         progress_update(0, force=True)
+        min_occ = getattr(self, "min_occurrences_for_description", None)
         for index, token_node in enumerate(self.token_nodes, start=1):
             if not token_node.has_semantic:
-                self.create_basic_sem_node(token_node)
+                # 对索引期未撑爆 buffer 的 token,buffer 里积累的就是它的全部出现次数。
+                # 出现次数 >= 阈值的才跑完整 build_sem_node(描述预测 / 多义切分),
+                # 其余仍走廉价的 create_basic_sem_node(单节点、无描述)。
+                occurrence_count = len(token_node.embeds_buffer)
+                if min_occ is not None and occurrence_count >= min_occ:
+                    self.build_sem_node(token_node)
+                else:
+                    self.create_basic_sem_node(token_node)
             elif len(token_node.anomaly_section) > 0:
                 if (
                     getattr(token_node, "force_single_semantic", False)
@@ -4992,11 +5112,15 @@ class LiteSemRAG:
 
     # Rebuild reverse edges from chunks to connected semantic nodes.
     def build_chunk2sem_edge(self):
+        seen_sem_ids = {}
         for chunk_node in self.chunk_nodes:
             chunk_node.sem_node_list = []
+            seen_sem_ids[id(chunk_node)] = set()
         for sem_node in self.sem_nodes:
             for chunk_node in sem_node.chunk_node_list:
-                if not id(sem_node) in (id(x) for x in chunk_node.sem_node_list):
+                chunk_seen = seen_sem_ids.setdefault(id(chunk_node), set())
+                if id(sem_node) not in chunk_seen:
+                    chunk_seen.add(id(sem_node))
                     chunk_node.sem_node_list.append(sem_node)
 
     # Rebuild graph metadata after document or chunk deletion.
@@ -5229,8 +5353,11 @@ class LiteSemRAG:
                     if new_doc_node is None:
                         new_doc_node = self.create_doc_node(doc_name)
                         doc_node_map[doc_name] = new_doc_node
+                    # Parse the chunk with spaCy once and reuse the doc across
+                    # chunk-node sizing, span extraction, and phrase routing.
+                    spacy_doc = self.nlp(chunk_text)
                     new_chunk_node = self.create_chunk_node(
-                        chunk_text, new_doc_node
+                        chunk_text, new_doc_node, num_tokens=len(spacy_doc)
                     )
 
                     if getattr(self, "phrase_audit_enabled", False):
@@ -5240,6 +5367,7 @@ class LiteSemRAG:
                             min_tokens=2,
                             discard_no_word=self.discard_no_word,
                             return_phrase_audit=True,
+                            doc=spacy_doc,
                         )
                         self._append_phrase_audit_records(
                             phrase_audit_records,
@@ -5253,8 +5381,11 @@ class LiteSemRAG:
                             self.nlp,
                             min_tokens=2,
                             discard_no_word=self.discard_no_word,
+                            doc=spacy_doc,
                         )
-                    phrases = self._prepare_index_phrase_spans(chunk_text, phrases)
+                    phrases = self._prepare_index_phrase_spans(
+                        chunk_text, phrases, doc=spacy_doc
+                    )
 
                     if not safe_queue_put(
                         preprocess_queue,
@@ -5395,7 +5526,8 @@ class LiteSemRAG:
 
         self.solve_sem_nodes()
         self.solve_anomaly()
-        self.build_modifier_postings()
+        # Modifier postings are rebuilt from scratch in finalize(); building
+        # them per document here would be overwritten and is pure waste.
 
         if completion_message is not None:
             self.log_time(completion_message())
@@ -5980,7 +6112,7 @@ class LiteSemRAG:
     # Save the full graph object to a pickle file.
     def save_data(self, path):
         with open(path, "wb") as f:
-            pickle.dump(self, f)
+            deep_pickle_dump(self, f)
 
     # Save indexed document names to the configured JSON file.
     def save_doc_to_json(self):
@@ -6155,7 +6287,7 @@ class LiteSemRAG:
                 "tensors_path": pt_path,
             }
             with open(pkl_path, "wb") as f:
-                pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+                deep_pickle_dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
         finally:
             if tensor_fields_cleared:
                 self.query_database = qbak

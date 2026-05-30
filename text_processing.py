@@ -606,8 +606,10 @@ def extract_important_spans(
     discard_no_word=False,
     debug_mode=False,
     return_phrase_audit=False,
+    doc=None,
 ):
-    doc = nlp(chunk)
+    if doc is None:
+        doc = nlp(chunk)
     protected_entity_records = _collect_protected_entity_records(
         doc,
         discard_no_word=discard_no_word,

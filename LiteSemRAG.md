@@ -47,9 +47,9 @@ Current constructor:
 
 ```python
 LiteSemRAG(
-    df_ratio,
     buffer_size=100,
     anomaly_threshold_percentile=0.9,
+    min_occurrences_for_description=20,
     anomaly_section_size=50,
     retrieve_top_k=5,
     chunk_size=300,
@@ -64,10 +64,18 @@ LiteSemRAG(
 
 Important parameters:
 
-- `df_ratio` controls when a token is considered too common to split into
-  multiple semantic nodes.
-- `buffer_size` controls when a token's collected embeddings are scheduled for
-  semantic-node construction.
+- `buffer_size` is purely a memory-management flush threshold: when a token
+  accumulates this many buffered embeddings during indexing its semantic node is
+  built early so the buffer can be released.
+- `min_occurrences_for_description` decouples "does this token get a description /
+  sense split" from `buffer_size`. At `finalize()`, any token/phrase that has not
+  yet built a semantic node and whose occurrence count is `>=` this value runs the
+  full description-prediction / sense-split path; rarer tokens fall back to a
+  single description-less basic node. Should be `<= buffer_size`. Set to `None` to
+  disable (legacy behavior: only tokens that overflowed `buffer_size` during
+  indexing ever got descriptions); set to `1` to describe every token. Larger
+  values trade recall of sense-aware nodes for fewer cross-encoder / Wikidata /
+  LLM calls at finalize.
 - `anomaly_threshold_percentile` and `anomaly_section_size` control outlier
   routing and re-clustering.
 - `retrieve_top_k` is the default cap for `get_top_k_chunks_for_sem_node`.
@@ -411,7 +419,6 @@ Useful methods:
 from RAG_graph import LiteSemRAG
 
 rag = LiteSemRAG(
-    df_ratio=0.05,
     chunk_size=300,
     device="cuda",
 )
