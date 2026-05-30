@@ -917,11 +917,6 @@ def hdbscan_cluster(
 
     return n_clusters, clusters, cluster_centers
 
-# Compute a similarity threshold from edge weights using a percentile.
-def get_anomaly_threshold(values, percentile):
-    q = 1 - percentile
-    return float(np.percentile(values, q * 100))
-
                                                              
                                        
  

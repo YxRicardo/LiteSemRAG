@@ -52,16 +52,14 @@ from utils import (
     build_wikidata_candidate_bank,
     extract_cross_encoder_scores,
     farthest_first_traversal,
-    get_anomaly_threshold,
     get_s_mean,
-    inspect_sem_nodes,
     load_wikidata_definition_candidates,
     plot_embeddings,
     print_size_mb,
     sem_embed_sim,
 )
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 RUNTIME_FIELD_NAMES = (
     "text_encoder",
     "tokenizer",
@@ -383,7 +381,6 @@ class TokenNode:
     span_occurrences: list = field(default_factory=list)
     idf: float = 0
     df: int = 0
-    anomaly_section: list = field(default_factory=list)
     is_placeholder: bool = False
     force_single_semantic: bool = False
     compositional_head: object | None = None
@@ -465,12 +462,6 @@ class SpanOccurrence:
         return self.span_start, self.span_end
 
 @dataclass
-class AnomalyTextEmbedding:
-    text_embedding: TextEmbedding
-    max_val: float
-    max_idx: int
-
-@dataclass
 class SemNode:
     sem_node_id: int
     token_node: TokenNode
@@ -483,7 +474,6 @@ class SemNode:
     pending_embed_rebuild: bool = False
     chunk_edge_weight: list = field(default_factory=list)
     embed: object = None
-    anomaly_threshold: float | None = None
     tf_dict_by_chunk_id: dict | None = None
     idf: float = 0
     df: int = 0
@@ -579,9 +569,8 @@ def _find_description_match_span(chunk_text, token_text):
 
 class LiteSemRAG:
     # Initialize graph storage, model handles, retrieval settings, and runtime state.
-    def __init__(self, buffer_size=100, anomaly_threshold_percentile=0.9,
+    def __init__(self,
                  min_occurrences_for_description=20,
-                 anomaly_section_size=50,
                  retrieve_top_k=5, chunk_size=300, device="cuda",
                  discard_no_word=False,
                  sem_description_prompt_context_mode="sentence_neighbors",
@@ -615,22 +604,16 @@ class LiteSemRAG:
         self.next_chunk_node_id = 0
         self.next_token_node_id = 0
         self.next_sem_node_id = 0
-        self.buffer_size = buffer_size
-        # 一个 token/phrase 至少出现这么多次,finalize 时才会跑描述预测 / 多义切分;
-        # 低于该阈值的走 create_basic_sem_node(单节点、无描述)。与 buffer_size(内存
-        # flush 阈值)解耦:不再用"索引期是否撑爆 buffer"来决定能否享受语义描述。
-        # 取值应 <= buffer_size(出现次数达到 buffer_size 的 token 在索引期已必然走
-        # 完整路径)。设为 None 则关闭该特性,退回旧行为(仅索引期撑爆 buffer 的
-        # token 才有描述);设为 1 则所有 token 都做描述。
+        # 索引期不再增量建语义节点:每个 token/phrase 的所有出现都先累积在
+        # token_node.embeds_buffer 里,直到所有文档扫描完毕,finalize 时才统一跑
+        # 多义判定(build_sem_node)。一个 token/phrase 至少出现这么多次才会跑描述
+        # 预测 / 多义切分,低于该阈值的走 create_basic_sem_node(单节点、无描述)。
+        # 设为 None 则所有 token 都只建单节点、无描述;设为 1 则所有 token 都做描述。
         self.min_occurrences_for_description = min_occurrences_for_description
         self.token_node_query = {}
         self.tau_conc = 0.90
         self.tau_disp = 0.78
-        self.build_sem_node_waitlist = []
         self.device = device
-        self.anomaly_threshold_percentile = anomaly_threshold_percentile
-        self.anomaly_section_size = anomaly_section_size
-        self.anomaly_waitlist = []
         self.query_database = None
         self.retrieve_top_k = retrieve_top_k
         self.chunk_size = chunk_size
@@ -1075,7 +1058,6 @@ class LiteSemRAG:
             and not getattr(token_node, "sem_node_list", [])
             and not getattr(token_node, "embeds_buffer", [])
             and not getattr(token_node, "span_occurrences", [])
-            and not getattr(token_node, "anomaly_section", [])
         )
 
     # Remove modifier-only placeholder token nodes from global token indexes.
@@ -1102,14 +1084,6 @@ class LiteSemRAG:
             for token_text, token_node in self.token_node_query.items()
             if id(token_node) not in removed_ids
         }
-        self.build_sem_node_waitlist = [
-            token_node for token_node in self.build_sem_node_waitlist
-            if id(token_node) not in removed_ids
-        ]
-        self.anomaly_waitlist = [
-            token_node for token_node in self.anomaly_waitlist
-            if id(token_node) not in removed_ids
-        ]
 
         for token_node in self.token_nodes:
             if id(getattr(token_node, "compositional_head", None)) in removed_ids:
@@ -1292,21 +1266,6 @@ class LiteSemRAG:
         sem_node.append_text_embedding_occurrence(text_embedding, edge_weight=edge_weight)
         self._retain_text_embedding_for_sem(sem_node, text_embedding)
 
-    # Store one anomaly and queue the token for reclustering once the anomaly set is large enough.
-    def _append_anomaly_embedding(self, token_node, text_embedding, max_val, max_idx):
-        token_node.anomaly_section.append(
-            AnomalyTextEmbedding(
-                text_embedding=text_embedding,
-                max_val=max_val,
-                max_idx=max_idx,
-            )
-        )
-        if (
-            len(token_node.anomaly_section) >= self.anomaly_section_size
-            and token_node not in self.anomaly_waitlist
-        ):
-            self.anomaly_waitlist.append(token_node)
-
     # Attach a span occurrence to a semantic node and retain its embedding when available.
     def _append_span_occurrence_to_sem(
         self,
@@ -1334,8 +1293,6 @@ class LiteSemRAG:
         new_sem_node.span_occurrences = [k.to_span_occurrence() for k in token_node.embeds_buffer]
         self._initialize_sem_retained_text_embeddings(new_sem_node, token_node.embeds_buffer)
         new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
-        new_sem_node.anomaly_threshold = get_anomaly_threshold(new_sem_node.chunk_edge_weight,
-                                                                 self.anomaly_threshold_percentile)
         new_sem_node.chunk_node_embed.clear()
 
         token_node.sem_node_list.append(new_sem_node)
@@ -1352,9 +1309,6 @@ class LiteSemRAG:
             new_sem_node.chunk_node_embed.append(te.embed)
         self._initialize_sem_retained_text_embeddings(new_sem_node, text_embeddings)
         new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
-        new_sem_node.anomaly_threshold = get_anomaly_threshold(
-            new_sem_node.chunk_edge_weight, self.anomaly_threshold_percentile
-        )
         final_sem_nodes = self._assign_sem_description_on_build(
             new_sem_node,
             list(text_embeddings),
@@ -1363,8 +1317,8 @@ class LiteSemRAG:
 
     # Reset the per-session counters that track who reaches the full sem-build path.
     def _reset_sem_build_stats(self):
-        # 进入 build_sem_node 的 token/span 数(= 通过 min_occurrences_for_description
-        # 或索引期已撑爆 buffer 的高频词,二者都意味着出现次数足够走完整建节点路径)。
+        # 进入 build_sem_node 的 token/span 数(= finalize 时出现次数达到
+        # min_occurrences_for_description、足够走完整建节点路径的 token/phrase)。
         self.sem_stats_passed_occurrence = 0
         # 其中被判为 entity / 原子短语(force_single_semantic)而直接单义的,不计入 S_mean 统计。
         self.sem_stats_entity_single = 0
@@ -1420,36 +1374,6 @@ class LiteSemRAG:
             f"-> 最终切出多个语义: {multi_sense}"
         )
         print("=" * 60)
-
-    # Build semantic nodes for all token nodes waiting in the build queue.
-    def solve_sem_nodes(self):
-        total_token_nodes = len(self.build_sem_node_waitlist)
-        if total_token_nodes == 0:
-            print("semantic_node_build: total=0 | remaining=0")
-            return
-
-        progress_update = self._make_progress_updater(
-            "semantic_node_build",
-            total_token_nodes,
-            show_remaining=True,
-        )
-        progress_update(0, force=True)
-        for index, token_node in enumerate(self.build_sem_node_waitlist, start=1):
-            self.build_sem_node(token_node)
-            progress_update(index)
-        progress_update(total_token_nodes, force=True)
-        print()
-        self.build_sem_node_waitlist = []
-
-    # Cluster or reassign anomaly embeddings collected during semantic node creation.
-    def solve_anomaly(self):
-        for token_node in self.anomaly_waitlist:
-            if len(token_node.anomaly_section) < self.anomaly_section_size:
-                continue
-            text_embeddings = [item.text_embedding for item in token_node.anomaly_section]
-            self._build_sem_node_from_cluster(token_node, text_embeddings)
-            token_node.anomaly_section = []
-        self.anomaly_waitlist = []
 
     # Print an elapsed-time progress message for the current operation.
     def log_time(self, msg):
@@ -1604,8 +1528,6 @@ class LiteSemRAG:
             self.sem_nodes = self.proto_nodes
         if not hasattr(self, "next_sem_node_id") and hasattr(self, "next_proto_node_id"):
             self.next_sem_node_id = self.next_proto_node_id
-        if not hasattr(self, "build_sem_node_waitlist") and hasattr(self, "build_proto_waitlist"):
-            self.build_sem_node_waitlist = self.build_proto_waitlist
         if not hasattr(self, "sem_retained_embed_limit") and hasattr(self, "proto_retained_embed_limit"):
             self.sem_retained_embed_limit = self.proto_retained_embed_limit
         if not hasattr(self, "sem_description_prompt_context_mode") and hasattr(self, "proto_description_prompt_context_mode"):
@@ -1755,24 +1677,6 @@ class LiteSemRAG:
                 self._ensure_occurrence_metadata_attrs(text_embedding)
             for span_occurrence in getattr(token_node, "span_occurrences", []):
                 self._ensure_occurrence_metadata_attrs(span_occurrence)
-            upgraded_anomaly_section = []
-            for item in getattr(token_node, "anomaly_section", []):
-                if isinstance(item, AnomalyTextEmbedding):
-                    self._ensure_occurrence_metadata_attrs(item.text_embedding)
-                    upgraded_anomaly_section.append(item)
-                    continue
-                if isinstance(item, tuple) and len(item) == 4:
-                    embed, chunk_node, max_val, max_idx = item
-                    upgraded_anomaly_section.append(
-                        AnomalyTextEmbedding(
-                            text_embedding=TextEmbedding(embed=embed, chunk_node=chunk_node),
-                            max_val=max_val,
-                            max_idx=max_idx,
-                        )
-                    )
-                    continue
-                upgraded_anomaly_section.append(item)
-            token_node.anomaly_section = upgraded_anomaly_section
         for chunk_node in getattr(self, "chunk_nodes", []):
             if not hasattr(chunk_node, "sem_node_list") and hasattr(chunk_node, "proto_node_list"):
                 chunk_node.sem_node_list = chunk_node.proto_node_list
@@ -1843,11 +1747,17 @@ class LiteSemRAG:
             token_node.compositional_modifier_texts_norm = []
         if not hasattr(token_node, "headed_phrase_records"):
             token_node.headed_phrase_records = {}
+        # 索引期 anomaly 机制已移除:丢弃旧 pickle 残留的 anomaly_section 属性。
+        if hasattr(token_node, "anomaly_section"):
+            del token_node.anomaly_section
 
     # Populate missing semantic-node fields introduced after older saved graph versions.
     def _ensure_sem_node_backward_compatible_attrs(self, sem_node):
         if not hasattr(sem_node, "sem_node_id") and hasattr(sem_node, "proto_node_id"):
             sem_node.sem_node_id = sem_node.proto_node_id
+        # anomaly 阈值路由已移除:丢弃旧 pickle 残留的 anomaly_threshold 属性。
+        if hasattr(sem_node, "anomaly_threshold"):
+            del sem_node.anomaly_threshold
         if not hasattr(sem_node, "span_occurrences"):
             sem_node.span_occurrences = []
         if not hasattr(sem_node, "retained_text_embeddings") or sem_node.retained_text_embeddings is None:
@@ -2785,55 +2695,71 @@ class LiteSemRAG:
         output_path = os.path.join(logs_dir, f"sem_description_{timestamp}.log")
         return self.save_sem_description_logs(output_path=output_path, as_html=False)
 
-    # Ensure every token node has semantic nodes and absorb pending anomalies.
+    # Build semantic nodes for every token node from its fully accumulated embeddings.
+    #
+    # 索引期只累积 embedding,从不建语义节点;此处每个 token 的 buffer 里就是它的
+    # 全部出现次数。分两趟处理:先建潜在多义节点(出现次数 >= 阈值,走完整的
+    # build_sem_node:描述预测 / 多义切分,通常是最耗时的一段),再建剩余的廉价
+    # 基础节点(create_basic_sem_node:单节点、无描述)。
     def finalize_token_nodes(self):
-        total_token_nodes = len(self.token_nodes)
-        if total_token_nodes == 0:
+        if not self.token_nodes:
             return
 
-        progress_update = self._make_progress_updater(
-            "finalize_token_nodes",
-            total_token_nodes,
-            show_remaining=True,
-        )
-        progress_update(0, force=True)
         min_occ = getattr(self, "min_occurrences_for_description", None)
-        for index, token_node in enumerate(self.token_nodes, start=1):
-            if not token_node.has_semantic:
-                # 对索引期未撑爆 buffer 的 token,buffer 里积累的就是它的全部出现次数。
-                # 出现次数 >= 阈值的才跑完整 build_sem_node(描述预测 / 多义切分),
-                # 其余仍走廉价的 create_basic_sem_node(单节点、无描述)。
-                occurrence_count = len(token_node.embeds_buffer)
-                if min_occ is not None and occurrence_count >= min_occ:
-                    self.build_sem_node(token_node)
-                else:
-                    self.create_basic_sem_node(token_node)
-            elif len(token_node.anomaly_section) > 0:
-                if (
-                    getattr(token_node, "force_single_semantic", False)
-                    and token_node.sem_node_list
-                ):
-                    for item in token_node.anomaly_section:
-                        self._append_sem_occurrence(
-                            token_node.sem_node_list[0],
-                            item.text_embedding,
-                            edge_weight=1.0,
-                        )
-                    token_node.anomaly_section.clear()
-                    token_node.embeds_buffer.clear()
-                    progress_update(index)
-                    continue
-                for item in token_node.anomaly_section:
-                    self._append_sem_occurrence(
-                        token_node.sem_node_list[item.max_idx],
-                        item.text_embedding,
-                        edge_weight=item.max_val,
-                    )
-                token_node.anomaly_section.clear()
-            token_node.embeds_buffer.clear()
-            progress_update(index)
-        progress_update(total_token_nodes, force=True)
-        print()
+
+        # Pass 0: split nodes into the expensive multi-sense candidates and the
+        # cheap description-less remainder. A node is a multi-sense candidate when
+        # its accumulated occurrence count reaches min_occurrences_for_description.
+        multi_sense_candidates = []
+        basic_only = []
+        for token_node in self.token_nodes:
+            if token_node.has_semantic:
+                continue
+            occurrence_count = len(token_node.embeds_buffer)
+            if min_occ is not None and occurrence_count >= min_occ:
+                multi_sense_candidates.append(token_node)
+            else:
+                basic_only.append(token_node)
+
+        print(
+            f"finalize_token_nodes: {len(multi_sense_candidates)} potential "
+            f"multi-sense node(s) (occurrences >= min_occurrences_for_description="
+            f"{min_occ}), {len(basic_only)} basic node(s)."
+        )
+
+        # Pass 1: build the potential multi-sense nodes first. This is the
+        # expensive stage (s_mean gate -> FFT sampling -> per-sample description
+        # prediction) and usually dominates finalize time.
+        total_candidates = len(multi_sense_candidates)
+        if total_candidates:
+            print("  Building potential multi-sense nodes (most time-consuming stage)...")
+            progress_update = self._make_progress_updater(
+                "multi_sense_node_build",
+                total_candidates,
+                show_remaining=True,
+            )
+            progress_update(0, force=True)
+            for index, token_node in enumerate(multi_sense_candidates, start=1):
+                self.build_sem_node(token_node)  # clears its own embeds_buffer
+                progress_update(index)
+            progress_update(total_candidates, force=True)
+            print()
+
+        # Pass 2: build the remaining cheap, description-less basic nodes.
+        total_basic = len(basic_only)
+        if total_basic:
+            progress_update = self._make_progress_updater(
+                "basic_node_build",
+                total_basic,
+                show_remaining=True,
+            )
+            progress_update(0, force=True)
+            for index, token_node in enumerate(basic_only, start=1):
+                self.create_basic_sem_node(token_node)
+                token_node.embeds_buffer.clear()
+                progress_update(index)
+            progress_update(total_basic, force=True)
+            print()
 
     # Sample unique chunks connected to a semantic node.
     def _sample_sem_chunk_nodes(self, sem_node, max_samples=10):
@@ -3434,10 +3360,6 @@ class LiteSemRAG:
         new_sem_node.embed = self._store_sem_embed(average_embeds(new_sem_node.chunk_node_embed))
         self._initialize_sem_retained_text_embeddings(new_sem_node, text_embeddings)
         new_sem_node.chunk_edge_weight = sem_embed_sim(new_sem_node).cpu().tolist()
-        new_sem_node.anomaly_threshold = get_anomaly_threshold(
-            new_sem_node.chunk_edge_weight,
-            self.anomaly_threshold_percentile,
-        )
         new_sem_node.chunk_node_embed.clear()
         return new_sem_node
 
@@ -4285,13 +4207,6 @@ class LiteSemRAG:
                 f"({sem_node.token_node.token_text!r}, description={sem_node.description!r})."
             )
 
-        if sem_node.chunk_edge_weight:
-            sem_node.anomaly_threshold = get_anomaly_threshold(
-                sem_node.chunk_edge_weight,
-                self.anomaly_threshold_percentile,
-            )
-        else:
-            sem_node.anomaly_threshold = None
         sem_node.chunk_node_embed.clear()
         sem_node.pending_embed_rebuild = False
 
@@ -4307,7 +4222,6 @@ class LiteSemRAG:
         new_sem_node.pending_embed_rebuild = True
         new_sem_node.chunk_edge_weight = []
         new_sem_node.embed = None
-        new_sem_node.anomaly_threshold = None
         new_sem_node.tf_dict_by_chunk_id = None
         new_sem_node.chunk_len_dict_by_id = None
         new_sem_node.BM25 = None
@@ -4360,13 +4274,6 @@ class LiteSemRAG:
             primary_sem.embed = self._store_sem_embed(average_embeds(retained_embeds))
         elif merged_embeds:
             primary_sem.embed = self._store_sem_embed(torch.stack(merged_embeds).mean(dim=0))
-        if primary_sem.chunk_edge_weight:
-            primary_sem.anomaly_threshold = get_anomaly_threshold(
-                primary_sem.chunk_edge_weight,
-                self.anomaly_threshold_percentile,
-            )
-        else:
-            primary_sem.anomaly_threshold = None
         primary_sem.tf_dict_by_chunk_id = None
         primary_sem.chunk_len_dict_by_id = None
         primary_sem.BM25 = None
@@ -4973,7 +4880,6 @@ class LiteSemRAG:
         # Skip runtime handles, large graph containers, queues, indexes, and log buffers.
         skip_field_names = set(RUNTIME_FIELD_NAMES) | {
             "doc_nodes", "chunk_nodes", "token_nodes", "phrase_token_nodes", "sem_nodes",
-            "build_sem_node_waitlist", "anomaly_waitlist",
             "token_node_query", "phrase_index", "modifier_postings", "query_database",
             "predicted_sem_description_logs", "deleted_merged_sem_logs",
             "sem_description_operation_logs", "wikidata_no_result_logs",
@@ -5050,7 +4956,8 @@ class LiteSemRAG:
         for sem_node in self.sem_nodes:
             sem_node.get_BM25(self.chunk_avg_len)
 
-    # Route extracted token embeddings into buffers, semantic nodes, or anomaly queues.
+    # Accumulate every extracted token/phrase embedding on its token node.
+    # Semantic nodes are not built here: all embeddings buffer until finalize.
     def process_embeds(self, new_chunk_node, phrase_embs, token_embs):
         for embed_record in phrase_embs + token_embs:
             text, embed, span_start, span_end, *metadata = embed_record
@@ -5075,43 +4982,8 @@ class LiteSemRAG:
                 occurrence_metadata,
                 new_chunk_node,
             )
-            if not token_node.embeds_buffer and not token_node.has_semantic:
-                token_node.embeds_buffer.append(text_embedding)
-            else:
-                if token_node.has_semantic:
-                    if (
-                        getattr(token_node, "force_single_semantic", False)
-                        and token_node.sem_node_list
-                    ):
-                        self._append_sem_occurrence(
-                            token_node.sem_node_list[0],
-                            text_embedding,
-                            edge_weight=1.0,
-                        )
-                        self._append_token_occurrence(token_node, text_embedding)
-                        continue
-                    max_val, max_idx = inspect_sem_nodes(embed, token_node.sem_node_list)
-                    if max_val >= token_node.sem_node_list[max_idx].anomaly_threshold:
-                        self._append_sem_occurrence(
-                            token_node.sem_node_list[max_idx],
-                            text_embedding,
-                            edge_weight=max_val,
-                        )
-                    else:
-                        self._append_anomaly_embedding(
-                            token_node,
-                            text_embedding,
-                            max_val,
-                            max_idx,
-                        )
-                else:
-                    token_node.embeds_buffer.append(text_embedding)
+            token_node.embeds_buffer.append(text_embedding)
             self._append_token_occurrence(token_node, text_embedding)
-            if (
-                len(token_node.embeds_buffer) >= self.buffer_size
-                and token_node not in self.build_sem_node_waitlist
-            ):
-                self.build_sem_node_waitlist.append(token_node)
 
     # Index one document through the shared staged indexing pipeline.
     def index_document(self, doc_name, multiprocessing=True):
@@ -5266,10 +5138,6 @@ class LiteSemRAG:
                 if id(sem_node) in valid_sem_ids
             ]
             token_node.has_semantic = len(token_node.sem_node_list) > 0
-            token_node.anomaly_section = [
-                item for item in token_node.anomaly_section
-                if id(item.text_embedding.chunk_node) in valid_chunk_ids
-            ]
             token_node.span_occurrences = [
                 item for item in token_node.span_occurrences
                 if id(item.chunk_node) in valid_chunk_ids
@@ -5285,7 +5153,7 @@ class LiteSemRAG:
                     continue
                 record["occurrences"] = occurrences
                 record["count"] = len(occurrences)
-            if token_node.has_semantic or token_node.embeds_buffer or token_node.anomaly_section:
+            if token_node.has_semantic or token_node.embeds_buffer:
                 valid_token_nodes.append(token_node)
                 token_node_query[token_node.token_text] = token_node
                 if token_node.node_type == "phrase":
@@ -5298,15 +5166,6 @@ class LiteSemRAG:
         self.token_node_query = token_node_query
         self.phrase_token_nodes = phrase_token_nodes
         self._cleanup_empty_placeholder_token_nodes()
-
-        self.build_sem_node_waitlist = [
-            token_node for token_node in self.build_sem_node_waitlist
-            if token_node in self.token_nodes
-        ]
-        self.anomaly_waitlist = [
-            token_node for token_node in self.anomaly_waitlist
-            if token_node in self.token_nodes
-        ]
 
         self.reset_chunk_node_id()
         self.reset_doc_node_id()
@@ -5355,7 +5214,6 @@ class LiteSemRAG:
         queue_size=4,
         *,
         completion_message=None,
-        print_sem_build_summary=False,
         reset_sem_build_stats=True,
     ):
         """Index records shaped as {"doc_name": str, "text": str}."""
@@ -5625,19 +5483,12 @@ class LiteSemRAG:
                 f"Error in {stage_name}:\n{error_text}"
             )
 
-        self.solve_sem_nodes()
-        self.solve_anomaly()
-        # Modifier postings are rebuilt from scratch in finalize(); building
-        # them per document here would be overwritten and is pure waste.
+        # Indexing only accumulates embeddings on token nodes now; semantic
+        # nodes (and modifier postings, IDF, BM25, ...) are all built later in
+        # finalize() from each token's fully accumulated embedding set.
 
         if completion_message is not None:
             self.log_time(completion_message())
-
-        if print_sem_build_summary:
-            print(
-                "single-cluster semantic build: "
-                f"built {self.sem_build_count} sem nodes"
-            )
 
     # Index one document with staged CPU preprocessing, GPU encoding, and CPU consumption.
     def index_document_parallel(self, doc_name, batch_size=8, queue_size=4):
@@ -6584,7 +6435,6 @@ class LiteSemRAG:
                 f"Index {indexed_document_count} documents. "
                 f"Index pipeline time: {time.perf_counter() - index_start_time:.4f}s"
             ),
-            print_sem_build_summary=True,
         )
 
 class ListBatchExtractor:

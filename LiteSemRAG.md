@@ -31,8 +31,6 @@ Supporting records:
   phrase/head/modifier metadata.
 - `SpanOccurrence` stores the persisted chunk/span location for a token or
   phrase occurrence.
-- `AnomalyTextEmbedding` stores embeddings that did not match an existing
-  semantic node strongly enough.
 - `CoOccurrenceGraph` and `CoOccurrenceNode` are query-time structures used to
   rank chunks by matched semantic nodes and their shared chunk evidence.
 
@@ -47,10 +45,7 @@ Current constructor:
 
 ```python
 LiteSemRAG(
-    buffer_size=100,
-    anomaly_threshold_percentile=0.9,
     min_occurrences_for_description=20,
-    anomaly_section_size=50,
     retrieve_top_k=5,
     chunk_size=300,
     device="cuda",
@@ -65,20 +60,14 @@ LiteSemRAG(
 
 Important parameters:
 
-- `buffer_size` is purely a memory-management flush threshold: when a token
-  accumulates this many buffered embeddings during indexing its semantic node is
-  built early so the buffer can be released.
-- `min_occurrences_for_description` decouples "does this token get a description /
-  sense split" from `buffer_size`. At `finalize()`, any token/phrase that has not
-  yet built a semantic node and whose occurrence count is `>=` this value runs the
-  full description-prediction / sense-split path; rarer tokens fall back to a
-  single description-less basic node. Should be `<= buffer_size`. Set to `None` to
-  disable (legacy behavior: only tokens that overflowed `buffer_size` during
-  indexing ever got descriptions); set to `1` to describe every token. Larger
-  values trade recall of sense-aware nodes for fewer cross-encoder / Wikidata /
-  LLM calls at finalize.
-- `anomaly_threshold_percentile` and `anomaly_section_size` control outlier
-  routing and re-clustering.
+- `min_occurrences_for_description` gates "does this token get a description /
+  sense split". Indexing builds no semantic nodes — every embedding is retained on
+  its `TokenNode` until the corpus is fully scanned. At `finalize()`, any
+  token/phrase whose accumulated occurrence count is `>=` this value runs the full
+  description-prediction / sense-split path; rarer tokens fall back to a single
+  description-less basic node. Set to `None` to give every token a basic node with
+  no description; set to `1` to describe every token. Larger values trade recall of
+  sense-aware nodes for fewer cross-encoder / Wikidata / LLM calls at finalize.
 - `retrieve_top_k` is the default cap for `get_top_k_chunks_for_sem_node`.
 - `chunk_size` is passed to `split_doc()` as the maximum chunk token count.
 - `device` is used by the Transformer encoder and query database.
@@ -147,8 +136,9 @@ records from `split_doc()`, then calls `_index_chunk_records_pipeline()`.
 3. GPU batching calls `encode_chunk_batch()`, then CPU consumption calls
    `get_token_embeds()` and `process_embeds()`.
 
-After chunks are consumed, the pipeline drains semantic-node and anomaly queues
-with `solve_sem_nodes()` and `solve_anomaly()`, then rebuilds modifier postings.
+Indexing builds no semantic nodes and runs no clustering: after chunks are
+consumed the pipeline only logs timing. All semantic-node construction is
+deferred to `finalize()`.
 
 ### 3.3 Embedding Ingestion
 
@@ -160,12 +150,10 @@ extracted phrase/token embedding:
 3. Atomic phrases set `force_single_semantic=True`.
 4. `_register_compositional_phrase_relation()` records full phrase, head, and
    modifier relationships on token nodes.
-5. If the token has semantic nodes, the embedding is attached to the closest
-   matching `SemNode` when it clears that node's anomaly threshold; otherwise it
-   enters the token's anomaly section.
-6. If the token has no semantic nodes yet, the embedding is buffered until
-   `buffer_size` schedules the token for `build_sem_node()`.
-7. `_append_token_occurrence()` records the occurrence on the token itself.
+5. The embedding is appended to `TokenNode.embeds_buffer`. Every occurrence is
+   retained — the buffer is never flushed or capped during indexing, so by the
+   end of the run each token holds all of its embeddings.
+6. `_append_token_occurrence()` records the occurrence on the token itself.
 
 ---
 
@@ -215,21 +203,28 @@ lists or co-occurrence scores.
 
 ## 5. Semantic Node Construction
 
-`build_sem_node(token_node)` decides whether to create one basic semantic node
-or cluster the token's buffered embeddings:
+All semantic nodes are built in `finalize()`. `finalize_token_nodes()` walks
+every `TokenNode` and, using the token's fully accumulated `embeds_buffer`,
+routes it by occurrence count: tokens reaching `min_occurrences_for_description`
+go to `build_sem_node()`, the rest to `create_basic_sem_node()` (one
+description-less node). After a node is built the buffer is cleared.
 
-- `semantic_type_cls(token_node)` returns false for common or highly
-  concentrated tokens, based on document frequency and `get_s_mean()`.
-- `force_single_semantic` also routes a token to `create_basic_sem_node()`.
-- Otherwise, `hdbscan_cluster()` clusters buffered embeddings.
+`build_sem_node(token_node)` decides whether the token collapses to a single
+basic node or runs the description-driven sense split:
 
-For each cluster, `_build_sem_node_from_cluster()` creates a `SemNode`,
-initializes retained sample embeddings, computes a centroid, assigns an anomaly
-threshold, and calls `_assign_sem_description_on_build()`.
+- `force_single_semantic` (entities / atomic phrases) routes straight to
+  `create_basic_sem_node()`.
+- `semantic_type_cls(token_node)` returns false for highly concentrated tokens
+  (high `get_s_mean()`), which also collapse to a single basic node.
+- Otherwise the token enters the sense-split path via
+  `_build_sem_node_from_cluster()` (despite the legacy name, **no HDBSCAN runs**).
 
-Embeddings labelled as HDBSCAN noise are routed to the closest semantic node or
-stored as anomalies. `solve_anomaly()` periodically clusters accumulated
-anomalies and may create new semantic nodes.
+`_build_sem_node_from_cluster()` creates a `SemNode`, initializes retained sample
+embeddings, computes a centroid, and calls `_assign_sem_description_on_build()`,
+which does the actual sense splitting: it FFT-samples the occurrences down to
+`fft_max_samples`, predicts a description per sample, and may split one token into
+multiple described `SemNode` objects when samples disagree coherently. Every
+operation over the buffer is linear in the number of occurrences.
 
 `SemNode.retained_text_embeddings` keeps a reservoir-sampled subset of source
 embeddings (`sem_retained_embed_limit`, default 10). These samples are used for
@@ -251,9 +246,9 @@ Main steps:
    `build_wikidata_candidate_bank()`.
 2. `_predict_sem_description_from_samples()` builds cross-encoder prompts from
    retained span samples and candidate definitions.
-3. `_assign_sem_description_on_build()` applies consensus rules. If one HDBSCAN
-   cluster has multiple coherent predicted descriptions, it can split that
-   cluster into multiple `SemNode` objects.
+3. `_assign_sem_description_on_build()` applies consensus rules. If a token's
+   FFT samples yield multiple coherent predicted descriptions, it can split the
+   token's occurrences into multiple `SemNode` objects.
 4. `merge_duplicate_description_sem_nodes()` later merges same-token semantic
    nodes with matching descriptions during `finalize()`.
 
@@ -277,8 +272,9 @@ Current finalize order:
 2. Validate the graph is non-empty.
 3. Recompute average chunk length for BM25.
 4. Remove empty placeholder token nodes.
-5. `finalize_token_nodes()` creates basic semantic nodes for still-buffered
-   tokens and absorbs pending anomalies.
+5. `finalize_token_nodes()` builds every token's semantic node(s) from its fully
+   accumulated `embeds_buffer` (sense split or basic node, per
+   `min_occurrences_for_description`), then clears the buffer.
 6. `merge_duplicate_description_sem_nodes()` merges same-description semantic
    nodes.
 7. Validate semantic nodes exist.
@@ -377,9 +373,10 @@ Other query helpers:
   inspection or storage.
 
 Backward compatibility is handled by `_ensure_backward_compatible_attrs()` and
-node-specific helpers. `CURRENT_SCHEMA_VERSION = 4`; older pickles are upgraded
+node-specific helpers. `CURRENT_SCHEMA_VERSION = 5`; older pickles are upgraded
 for renamed `proto_*` fields, missing occurrence metadata, retained embeddings,
-compositional phrase metadata, and modifier postings.
+compositional phrase metadata, and modifier postings, and have the removed
+`anomaly_section` / `anomaly_threshold` attributes stripped (schema 5).
 
 `save_doc_to_json()` writes only indexed document names to
 `index_documents.json`.
@@ -467,9 +464,10 @@ rag.shutdown()
 - `text_processing.py`：cleaning, chunking, span extraction, Transformer
   encoding, span embedding alignment, BM25 helpers.
 - `phrase_analysis.py`：phrase classification and head/modifier extraction.
-- `utils.py`：HDBSCAN, embedding math, Wikidata/Wikipedia fetch helpers,
-  Wikidata candidate loading, cross-encoder score extraction, dataset/eval
-  utilities.
+- `utils.py`：embedding math (`get_s_mean` / `average_embeds` / `sem_embed_sim`),
+  farthest-first-traversal sampling, Wikidata/Wikipedia fetch helpers, Wikidata
+  candidate loading, cross-encoder score extraction, dataset/eval utilities.
+  (`hdbscan_cluster` remains but is legacy — unused by the engine.)
 - `wikidata_definition_filter.py`：LLM-based offline candidate-sense filtering
   with SQLite cache.
 - `llm_semantic_labeler.py`：LLM candidate selection/cache experiments.
