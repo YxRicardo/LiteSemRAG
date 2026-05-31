@@ -53,6 +53,7 @@ LiteSemRAG(
     sem_description_prompt_context_mode="sentence_neighbors",
     consensus_ratio_threshold=0.8,
     min_description_candidates=3,
+    use_llm_candidate_filter=False,
     use_llm_semantic_labeler=False,
     disambiguate_query_sense=True,
 )
@@ -78,9 +79,23 @@ Important parameters:
   predictions have enough sample agreement to be accepted.
 - `min_description_candidates` controls candidate-bank padding/fallback
   behavior.
+- `use_llm_candidate_filter` merges/filters the raw Wikidata candidates with an
+  LLM **and** classifies the FFT samples in a single call, following the combined
+  prompt in `wikidata_llm_candidate_merge_experiment.ipynb`. When enabled, the
+  merged senses become the candidate bank and the per-sample `sample_judgments`
+  directly supply each FFT sample's sense — no separate cross-encoder or
+  per-sample LLM judgment runs for the sampled occurrences. FFT samples the LLM
+  marks `unsupported`/`ambiguous` get no sense here and are treated like ordinary
+  non-sampled occurrences downstream (no KNN safety check). Non-sampled and
+  danger-zone occurrences are still judged the usual way (cross-encoder, or the
+  labeler when `use_llm_semantic_labeler` is on). The standalone, samples-free
+  `WikidataDefinitionFilter.filter_definitions()` is retained as an extra utility.
 - `use_llm_semantic_labeler` switches semantic-description sample judgments
   from the cross-encoder to per-sample LLM calls. FFT samples and fallback
   samples are judged one prompt at a time, using `llm_semantic_labeler.py`.
+  (When `use_llm_candidate_filter` is on, the sampled FFT occurrences are already
+  judged by the combined merge call; the labeler then only applies to the
+  remaining non-sampled / danger-zone occurrences.)
 - `disambiguate_query_sense` enables query-time sense disambiguation. When a
   query span resolves to a token that built multiple *described* semantic nodes
   during indexing (a genuinely multi-sense token), the exact match is chosen by
@@ -244,11 +259,21 @@ Main steps:
 1. `_load_sem_description_candidate_bank()` loads and caches candidates using
    `load_wikidata_definition_candidates()` and
    `build_wikidata_candidate_bank()`.
-2. `_predict_sem_description_from_samples()` builds cross-encoder prompts from
-   retained span samples and candidate definitions.
+2. `_predict_sem_description_from_samples()` FFT-samples the occurrences, builds a
+   prompt per sample, and judges each one. In the default path this scores the
+   sample against candidate definitions with the cross-encoder (or, when
+   `use_llm_semantic_labeler` is on, with a per-sample LLM call). When
+   `use_llm_candidate_filter` is on, this step instead issues **one combined LLM
+   call** (`_run_combined_merge_for_samples()` →
+   `WikidataDefinitionFilter.filter_definitions_with_samples()`) that both merges
+   the Wikidata candidates and returns `sample_judgments`; the matched-sense
+   judgments become the sample senses and `unsupported`/`ambiguous` samples drop
+   out of the vote.
 3. `_assign_sem_description_on_build()` applies consensus rules. If a token's
    FFT samples yield multiple coherent predicted descriptions, it can split the
-   token's occurrences into multiple `SemNode` objects.
+   token's occurrences into multiple `SemNode` objects; non-sampled and
+   danger-zone occurrences are then assigned by medoid / d1-d2 distance (falling
+   back to the cross-encoder or labeler as configured).
 4. `merge_duplicate_description_sem_nodes()` later merges same-token semantic
    nodes with matching descriptions during `finalize()`.
 
@@ -468,8 +493,11 @@ rag.shutdown()
   farthest-first-traversal sampling, Wikidata/Wikipedia fetch helpers, Wikidata
   candidate loading, cross-encoder score extraction, dataset/eval utilities.
   (`hdbscan_cluster` remains but is legacy — unused by the engine.)
-- `wikidata_definition_filter.py`：LLM-based offline candidate-sense filtering
-  with SQLite cache.
+- `wikidata_definition_filter.py`：LLM-based candidate-sense merging/filtering.
+  `filter_definitions()` is the samples-free, SQLite-cached path;
+  `filter_definitions_with_samples()` adds the FFT samples to the prompt and
+  returns per-sample `sample_judgments` (no cache), powering
+  `use_llm_candidate_filter`.
 - `llm_semantic_labeler.py`：LLM candidate selection/cache experiments.
 - `local_llm.py`：OpenAI-compatible chat client wrapper.
 - `simple_rag.py`：standalone baseline RAG used for HotpotQA comparison; not

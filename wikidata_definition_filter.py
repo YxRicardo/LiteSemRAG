@@ -36,6 +36,10 @@ DEFAULT_MAX_TOKENS = 1024
 DEFAULT_API_MODEL = "gpt-5.4-mini"
 DEFAULT_API_KEY_FILE = "API_KEY"
 WIKIDATA_CANDIDATE_FILTER_VERSION = "merge_prompt_v5_coarse_examples"
+# Combined merge + per-sample judgment prompt, ported verbatim from
+# jupyter_notebooks/wikidata_llm_candidate_merge_experiment.ipynb. Only the JSON
+# payload shape is adapted to the engine; the instruction text is unchanged.
+WIKIDATA_CANDIDATE_MERGE_WITH_SAMPLES_VERSION = "merge_with_samples_prompt_v1"
 
 
 SYSTEM_PROMPT = """You are a conservative lexical-sense merger for a semantic retrieval system.
@@ -120,6 +124,74 @@ Candidate data:
 {candidate_payload}"""
 
 
+# Combined system prompt (candidate merge + FFT-sample judgment), verbatim from
+# wikidata_llm_candidate_merge_experiment.ipynb.
+MERGE_WITH_SAMPLES_SYSTEM_PROMPT = """You are a conservative lexical-sense merger for a semantic retrieval system.
+Your job is to reduce noisy Wikidata candidate senses to a small set of coarse retrieval meanings.
+Prefer merging over splitting when candidates describe the same broad concept, role, entity type, or function.
+Do not preserve fine-grained domain, institution, jurisdiction, title, or wording differences unless they change what evidence should be retrieved.
+Every merged sense description must be a general reusable meaning, not a description of one specific named object.
+When uncertain, merge the candidates and write a broader description.
+Return only valid JSON."""
+
+# Combined user prompt template. The instruction text matches the notebook's
+# build_merge_prompt; only the trailing JSON payload is injected by the engine.
+MERGE_WITH_SAMPLES_USER_PROMPT_TEMPLATE = """Merge candidate senses for the target word into coarse retrieval-oriented meanings.
+
+Goal:
+Create the smallest useful sense inventory for retrieval, using the provided FFT-selected dataset samples as the evidence base. These merged descriptions will later be used by a cross-encoder, so avoid distinctions that are too subtle for short context snippets.
+
+Dataset evidence:
+- The fft_dataset_samples are real dataset contexts selected by farthest-first traversal over span embeddings.
+- Use all provided samples as the reference for deciding which candidate senses are useful.
+- A candidate sense may be included in merged_senses only if at least one provided FFT sample plausibly expresses that sense.
+- If a candidate sense does not appear in, or is not supported by, any provided FFT sample, discard it.
+- Do not keep a candidate sense merely because it is a valid dictionary or Wikidata sense of the word.
+
+Default bias:
+- Merge by broad semantic function, not by Wikidata entity granularity.
+- Merge title/domain variants when they are instances of the same role or concept.
+- Merge specific subtypes into their broader parent sense unless the subtype changes the entity type or expected evidence.
+- If two candidates could both match the same ordinary sentence about the target word, merge them.
+- When uncertain, merge.
+- A merged sense must describe a general meaning, category, role, function, or concept. Do not write a merged sense as a description of one specific named object, work, organization, place, person, or identifier.
+- If the evidence only supports one specific named item and cannot be generalized into a reusable lexical meaning, discard that candidate instead of creating a specific named-object sense.
+
+Split only when:
+1. The meanings are genuinely different entity types or concepts, such as fruit vs company or financial bank vs river bank.
+2. Keeping them together would make clearly wrong documents look relevant.
+3. The distinction is likely obvious from short local context, not just from specialist wording.
+
+Discard only when:
+1. The candidate is not a plausible sense of the target word.
+2. The candidate is too vague to add value and cannot be merged into a broader valid sense.
+3. The candidate is not supported by any of the provided FFT dataset samples.
+
+Output only valid JSON with keys: word, merged_senses, sample_judgments, discarded_candidates, notes.
+
+Each merged_senses item must contain:
+- sense_id: a short stable id such as s1, s2, s3
+- canonical_label: short label for the merged sense
+- merged_description: one sentence describing the broad merged meaning; it must be a general reusable meaning, not a description of one specific named object
+- source_candidate_ids: list of integer candidate_id values that were merged
+- merge_rationale: one short sentence explaining why these candidates belong together or why the sense stayed separate
+
+Each sample_judgments item must contain:
+- sample_order: the integer sample_order from fft_dataset_samples
+- matched_text: the matched_text from that sample
+- judgment: one of matched_sense, unsupported, ambiguous
+- sense_id: the selected merged sense_id when judgment is matched_sense, otherwise null
+- confidence: a number from 0.0 to 1.0 indicating confidence in this semantic judgment
+- reason: one short sentence explaining the judgment
+
+Each discarded_candidates item must contain:
+- candidate_id
+- reason
+
+Candidate data:
+{candidate_payload}"""
+
+
 @dataclass
 class CandidateSense:
     index: int
@@ -141,6 +213,7 @@ class FilteredDefinition:
     canonical_label: str = ""
     source_candidate_ids: list[int] = field(default_factory=list)
     merge_rationale: str = ""
+    sense_id: str = ""
 
 
 @dataclass
@@ -351,6 +424,75 @@ def _build_merge_prompt(term: str, candidates: list[CandidateSense]) -> str:
     )
 
 
+def _compact_fft_samples_for_prompt(
+    fft_samples: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for sample in fft_samples or []:
+        context_text = " ".join(str(sample.get("context_text", "") or "").split())
+        row: dict[str, Any] = {
+            "sample_order": int(sample.get("sample_order")),
+            "matched_text": str(sample.get("matched_text", "") or ""),
+            "context_text": context_text,
+        }
+        title = sample.get("title")
+        if title:
+            row["title"] = str(title)
+        rows.append(row)
+    return rows
+
+
+def _build_merge_with_samples_prompt(
+    term: str,
+    candidates: list[CandidateSense],
+    fft_samples: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "word": term,
+        "candidate_senses": _compact_candidates_for_prompt(candidates),
+        "fft_dataset_samples": _compact_fft_samples_for_prompt(fft_samples),
+    }
+    return MERGE_WITH_SAMPLES_USER_PROMPT_TEMPLATE.format(
+        candidate_payload=json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+
+
+def _resolve_sample_sense_descriptions(
+    parsed: dict[str, Any],
+    definitions: list[FilteredDefinition],
+) -> dict[int, str]:
+    """Map sample_order -> merged_description for matched_sense judgments only.
+
+    Samples judged ``unsupported`` or ``ambiguous`` (or pointing at an unknown
+    sense_id) are intentionally omitted so the caller treats them as
+    unclassified samples.
+    """
+    description_by_sense_id = {
+        defn.sense_id: defn.definition
+        for defn in definitions
+        if defn.sense_id
+    }
+    raw_judgments = parsed.get("sample_judgments")
+    if not isinstance(raw_judgments, list):
+        return {}
+    sample_sense_descriptions: dict[int, str] = {}
+    for item in raw_judgments:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("judgment", "") or "").strip() != "matched_sense":
+            continue
+        sense_id = str(item.get("sense_id", "") or "").strip()
+        description = description_by_sense_id.get(sense_id)
+        if not description:
+            continue
+        try:
+            sample_order = int(item.get("sample_order"))
+        except (TypeError, ValueError):
+            continue
+        sample_sense_descriptions[sample_order] = description
+    return sample_sense_descriptions
+
+
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
@@ -410,6 +552,7 @@ def _build_definitions(
 
             canonical_label = str(item.get("canonical_label", "") or "").strip()
             merge_rationale = str(item.get("merge_rationale", "") or "").strip()
+            sense_id = str(item.get("sense_id", "") or "").strip()
             definitions.append(
                 FilteredDefinition(
                     definition=definition_text,
@@ -420,6 +563,7 @@ def _build_definitions(
                     canonical_label=canonical_label,
                     source_candidate_ids=source_candidate_ids,
                     merge_rationale=merge_rationale,
+                    sense_id=sense_id,
                 )
             )
         return definitions
@@ -657,6 +801,118 @@ class WikidataDefinitionFilter:
                 payload=_result_to_cache_payload(result),
             )
         return result
+
+    def filter_definitions_with_samples(
+        self,
+        term: str,
+        fft_samples: list[dict[str, Any]],
+        num_candidates: int = DEFAULT_NUM_CANDIDATES,
+        language: str = "en",
+    ) -> FilterResult:
+        """Merge candidate senses and judge FFT samples in a single LLM call.
+
+        This mirrors ``wikidata_llm_candidate_merge_experiment.ipynb``: the
+        prompt receives both the raw Wikidata candidates and the FFT-selected
+        dataset samples, and the LLM returns ``merged_senses`` together with
+        ``sample_judgments`` that assign each FFT sample to a merged sense.
+
+        The result is never cached: ``sample_judgments`` depend on the supplied
+        FFT samples, so caching by term alone would be incorrect.
+        ``result.metadata["sample_sense_descriptions"]`` maps each matched
+        sample_order to its merged-sense description.
+        """
+        if not isinstance(term, str) or not term.strip():
+            raise ValueError("term must be a non-empty string.")
+
+        normalized = term.strip()
+
+        candidates = fetch_wikidata_candidates(
+            normalized,
+            num_candidates=num_candidates,
+            language=language,
+        )
+
+        if not candidates:
+            return FilterResult(
+                term=normalized,
+                language=language,
+                num_candidates=int(num_candidates),
+                candidates=[],
+                definitions=[],
+                from_cache=False,
+                raw_llm_response="",
+                metadata={
+                    "note": "no_wikidata_candidates",
+                    "wikidata_candidate_filter": WIKIDATA_CANDIDATE_MERGE_WITH_SAMPLES_VERSION,
+                    "sample_sense_descriptions": {},
+                    "sample_judgments": [],
+                },
+            )
+
+        prompt = _build_merge_with_samples_prompt(normalized, candidates, fft_samples)
+
+        chat_kwargs: dict[str, Any] = {
+            "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        model_lower = self.model.lower()
+        if not model_lower.startswith(("gpt-5", "o1", "o3", "o4")):
+            chat_kwargs["temperature"] = self.temperature
+
+        total_tokens_before = self.llm_client.total_tokens
+        raw_response = self.llm_client.complete(
+            prompt,
+            system_prompt=MERGE_WITH_SAMPLES_SYSTEM_PROMPT,
+            **chat_kwargs,
+        )
+        usage = self.llm_client.last_usage
+        api_wait_wall_time = self.llm_client.last_api_wait_wall_time
+        total_tokens_after = self.llm_client.total_tokens
+
+        try:
+            parsed = _extract_json_object(raw_response)
+            definitions = _build_definitions(parsed, candidates)
+            sample_sense_descriptions = _resolve_sample_sense_descriptions(
+                parsed, definitions
+            )
+            metadata: dict[str, Any] = {
+                "discarded_candidates": parsed.get("discarded_candidates", []),
+                "sample_judgments": parsed.get("sample_judgments", []),
+                "sample_sense_descriptions": sample_sense_descriptions,
+                "notes": parsed.get("notes", ""),
+                "prompt_style": "wikidata_llm_candidate_merge_experiment_with_samples",
+            }
+        except (ValueError, json.JSONDecodeError) as exc:
+            definitions = []
+            metadata = {
+                "parse_error": str(exc),
+                "sample_sense_descriptions": {},
+                "sample_judgments": [],
+            }
+
+        metadata["provider"] = self.provider
+        metadata["model"] = self.model
+        metadata["wikidata_candidate_filter"] = WIKIDATA_CANDIDATE_MERGE_WITH_SAMPLES_VERSION
+        metadata["candidate_count_after_rule_filter"] = len(candidates)
+        metadata["fft_sample_count"] = len(fft_samples or [])
+        metadata["token_usage"] = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "total_tokens_delta": total_tokens_after - total_tokens_before,
+        }
+        metadata["api_wait_wall_time"] = api_wait_wall_time
+
+        return FilterResult(
+            term=normalized,
+            language=language,
+            num_candidates=int(num_candidates),
+            candidates=candidates,
+            definitions=definitions,
+            from_cache=False,
+            raw_llm_response=raw_response,
+            metadata=metadata,
+        )
 
 
 def _result_to_cache_payload(result: FilterResult) -> dict[str, Any]:

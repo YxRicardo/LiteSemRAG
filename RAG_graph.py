@@ -696,6 +696,9 @@ class LiteSemRAG:
         self.llm_semantic_label_cache_hits = 0
         self.llm_semantic_label_cache_misses = 0
         self._sem_description_candidate_bank_cache = {}
+        # token_text -> {sample_order: merged_description} produced by the combined
+        # candidate-merge + FFT-sample-judgment LLM call (use_llm_candidate_filter).
+        self._combined_merge_sample_sense_descriptions = {}
         self.llm_candidate_filter_result_cache = {}
         self.sem_build_count = 0
         self._reset_sem_build_stats()
@@ -1648,6 +1651,8 @@ class LiteSemRAG:
             self._wikidata_no_result_keys = set()
         if not hasattr(self, "_sem_description_candidate_bank_cache"):
             self._sem_description_candidate_bank_cache = {}
+        if not hasattr(self, "_combined_merge_sample_sense_descriptions"):
+            self._combined_merge_sample_sense_descriptions = {}
         if not hasattr(self, "llm_candidate_filter_result_cache"):
             self.llm_candidate_filter_result_cache = {}
         if not hasattr(self, "phrase_audit_enabled"):
@@ -2705,6 +2710,10 @@ class LiteSemRAG:
         if not self.token_nodes:
             return
 
+        # The combined merge stores sample_order -> description per token; clear it
+        # so a fresh finalize re-runs the combined LLM call against current samples.
+        self._combined_merge_sample_sense_descriptions = {}
+
         min_occ = getattr(self, "min_occurrences_for_description", None)
 
         # Pass 0: split nodes into the expensive multi-sense candidates and the
@@ -3045,6 +3054,110 @@ class LiteSemRAG:
         )
         return []
 
+    # Build the fft_dataset_samples payload sent to the combined merge LLM call.
+    def _build_fft_samples_payload(self, prepared_samples):
+        fft_samples = []
+        for sample_index, _span_occurrence, chunk_node, prompt_info in prepared_samples:
+            doc_node = getattr(chunk_node, "doc_node", None)
+            title = getattr(doc_node, "doc_name", None) if doc_node is not None else None
+            fft_samples.append(
+                {
+                    "sample_order": sample_index,
+                    "title": title,
+                    "matched_text": prompt_info.get("matched_text") or "",
+                    "context_text": prompt_info.get("context_text") or "",
+                }
+            )
+        return fft_samples
+
+    # Merge candidate senses and judge FFT samples in a single LLM call.
+    # Used when use_llm_candidate_filter is enabled. Caches the merged candidate
+    # bank (by token) and the sample_order -> merged-description map so the split
+    # path reuses both without issuing a second LLM call. Mirrors the combined
+    # prompt of wikidata_llm_candidate_merge_experiment.ipynb.
+    def _run_combined_merge_for_samples(self, sem_node, fft_samples):
+        token_text = sem_node.token_node.token_text
+        cached_map = self._combined_merge_sample_sense_descriptions.get(token_text)
+        if cached_map is not None:
+            return (
+                self._sem_description_candidate_bank_cache.get(token_text, []),
+                cached_map,
+            )
+
+        max_candidate_count = self.llm_candidate_filter_candidate_limit
+        filter_start = time.perf_counter()
+        try:
+            candidates_df, definition_column = load_wikidata_definition_candidates(
+                token_text,
+                use_detailed_description=self.sem_description_use_detailed_description,
+                limit=self.llm_candidate_filter_candidate_limit,
+                target_candidate_count=max_candidate_count,
+                use_llm_filter=True,
+                llm_filter=self._get_llm_candidate_filter(),
+                llm_filter_use_api=self.llm_candidate_filter_use_api,
+                fft_samples=fft_samples,
+            )
+        except ValueError:
+            self._sem_description_candidate_bank_cache[token_text] = []
+            self._combined_merge_sample_sense_descriptions[token_text] = {}
+            self._log_wikidata_no_result(
+                token_text,
+                "sem_description",
+                "no_candidate_definitions",
+            )
+            return [], {}
+        finally:
+            self.llm_candidate_filter_total_wall_time += time.perf_counter() - filter_start
+
+        candidate_bank = build_wikidata_candidate_bank(
+            candidates_df, definition_column=definition_column
+        )
+        self._sem_description_candidate_bank_cache[token_text] = candidate_bank
+
+        llm_metadata = None
+        sample_sense_descriptions = {}
+        if not candidates_df.empty and "llm_filter_metadata" in candidates_df:
+            llm_metadata = candidates_df["llm_filter_metadata"].iloc[0]
+            self._record_llm_candidate_filter_usage(llm_metadata)
+            raw_map = (llm_metadata or {}).get("sample_sense_descriptions") or {}
+            for order, description in raw_map.items():
+                try:
+                    sample_sense_descriptions[int(order)] = description
+                except (TypeError, ValueError):
+                    continue
+            self.llm_candidate_filter_result_cache[token_text] = {
+                "candidate_bank": candidate_bank,
+                "definitions": [
+                    {
+                        "entity_id": candidate.get("entity_id"),
+                        "label": candidate.get("label"),
+                        "description": candidate.get("description"),
+                        "definition": candidate.get("definition"),
+                    }
+                    for candidate in candidate_bank
+                ],
+                "metadata": llm_metadata,
+            }
+        self._combined_merge_sample_sense_descriptions[token_text] = sample_sense_descriptions
+
+        if candidate_bank:
+            self._log_sem_description_operation(
+                "combined_candidate_merge_with_samples",
+                token_text=token_text,
+                candidate_limit=self.llm_candidate_filter_candidate_limit,
+                candidate_count=len(candidate_bank),
+                fft_sample_count=len(fft_samples or []),
+                matched_sample_count=len(sample_sense_descriptions),
+                llm_token_usage=(llm_metadata or {}).get("token_usage") if llm_metadata else None,
+            )
+        else:
+            self._log_wikidata_no_result(
+                token_text,
+                "sem_description",
+                "empty_candidate_bank",
+            )
+        return candidate_bank, sample_sense_descriptions
+
     # Predict a semantic node description by scoring sampled contexts against candidates.
     def _predict_sem_description_from_samples(
         self,
@@ -3054,15 +3167,7 @@ class LiteSemRAG:
         max_samples=10,
     ):
         token_text = sem_node.token_node.token_text
-        candidate_bank = self._load_sem_description_candidate_bank(sem_node, candidate_bank_cache)
-
-        if not candidate_bank:
-            self._log_wikidata_no_result(
-                token_text,
-                "sem_description",
-                "empty_candidate_bank",
-            )
-            return None
+        combined = bool(getattr(self, "use_llm_candidate_filter", False))
 
         description_vote_map = {}
         sample_prediction_records = []
@@ -3084,34 +3189,73 @@ class LiteSemRAG:
                 continue
             prepared_samples.append((sample_index, span_occurrence, chunk_node, prompt_info))
 
-        if getattr(self, "use_llm_semantic_labeler", False):
-            top_candidates = self._predict_descriptions_from_prompt_infos_with_llm(
-                token_text,
-                [prompt_info for _sample_index, _span_occurrence, _chunk_node, prompt_info in prepared_samples],
-                candidate_bank,
+        if combined:
+            # A single LLM call merges the candidate senses and judges each FFT
+            # sample. Samples the LLM marks unsupported/ambiguous get no candidate
+            # here, so they drop out of the consensus vote and are later handled by
+            # the same embedding-based path as ordinary non-sampled occurrences.
+            fft_samples = self._build_fft_samples_payload(prepared_samples)
+            candidate_bank, sample_sense_descriptions = self._run_combined_merge_for_samples(
+                sem_node, fft_samples
             )
-        else:
+            if not candidate_bank:
+                self._log_wikidata_no_result(
+                    token_text,
+                    "sem_description",
+                    "empty_candidate_bank",
+                )
+                return None
+            description_to_candidate = {
+                candidate["description"]: candidate for candidate in candidate_bank
+            }
             top_candidates = []
-            for _sample_index, _span_occurrence, _chunk_node, prompt_info in prepared_samples:
-                pairs = [(prompt_info["prompt_text"], candidate["hypothesis"]) for candidate in candidate_bank]
-                raw_scores = model.predict(
-                    pairs,
-                    batch_size=min(self.sem_description_batch_size, len(pairs)),
-                    show_progress_bar=False,
+            for sample_index, _span_occurrence, _chunk_node, _prompt_info in prepared_samples:
+                description = sample_sense_descriptions.get(sample_index)
+                candidate = description_to_candidate.get(description) if description else None
+                if candidate is not None:
+                    candidate = {
+                        **candidate,
+                        "score": None,
+                        "prediction_method": "llm_candidate_merge",
+                    }
+                top_candidates.append(candidate)
+        else:
+            candidate_bank = self._load_sem_description_candidate_bank(sem_node, candidate_bank_cache)
+            if not candidate_bank:
+                self._log_wikidata_no_result(
+                    token_text,
+                    "sem_description",
+                    "empty_candidate_bank",
                 )
-                scores = extract_cross_encoder_scores(raw_scores, model)
-                ranked_candidates = sorted(
-                    [
-                        {
-                            **candidate,
-                            "score": float(score),
-                        }
-                        for candidate, score in zip(candidate_bank, scores)
-                    ],
-                    key=lambda item: item["score"],
-                    reverse=True,
+                return None
+            if getattr(self, "use_llm_semantic_labeler", False):
+                top_candidates = self._predict_descriptions_from_prompt_infos_with_llm(
+                    token_text,
+                    [prompt_info for _sample_index, _span_occurrence, _chunk_node, prompt_info in prepared_samples],
+                    candidate_bank,
                 )
-                top_candidates.append(ranked_candidates[0] if ranked_candidates else None)
+            else:
+                top_candidates = []
+                for _sample_index, _span_occurrence, _chunk_node, prompt_info in prepared_samples:
+                    pairs = [(prompt_info["prompt_text"], candidate["hypothesis"]) for candidate in candidate_bank]
+                    raw_scores = model.predict(
+                        pairs,
+                        batch_size=min(self.sem_description_batch_size, len(pairs)),
+                        show_progress_bar=False,
+                    )
+                    scores = extract_cross_encoder_scores(raw_scores, model)
+                    ranked_candidates = sorted(
+                        [
+                            {
+                                **candidate,
+                                "score": float(score),
+                            }
+                            for candidate, score in zip(candidate_bank, scores)
+                        ],
+                        key=lambda item: item["score"],
+                        reverse=True,
+                    )
+                    top_candidates.append(ranked_candidates[0] if ranked_candidates else None)
 
         for (sample_index, span_occurrence, chunk_node, prompt_info), top_candidate in zip(
             prepared_samples,
@@ -3473,57 +3617,16 @@ class LiteSemRAG:
             except Exception as exc:
                 print(f"[fft_recorder] hook raised {exc!r}; skipping record")
 
-        if getattr(self, "use_llm_candidate_filter", False):
-            candidate_bank = self._load_sem_description_candidate_bank(
-                sem_node,
-                self._sem_description_candidate_bank_cache,
-            )
-            if len(candidate_bank) == 1:
-                only_candidate = candidate_bank[0]
-                sem_node.description = only_candidate["description"]
-                self.predicted_sem_description_logs.append(
-                    {
-                        "sem_node_id": sem_node.sem_node_id,
-                        "token_text": token_node.token_text,
-                        "description": sem_node.description,
-                        "predicted_entity_id": only_candidate.get("entity_id"),
-                        "predicted_label": only_candidate.get("label"),
-                        "predicted_definition": only_candidate.get("definition"),
-                        "prediction_score_mean": None,
-                        "chunk_count": len(sem_node.chunk_node_list),
-                        "sample_count": 0,
-                        "top_description_count": 0,
-                        "top_description_ratio": 1.0,
-                        "sample_predictions": [],
-                    }
-                )
-                self._log_sem_description_operation(
-                    "assign_single_llm_candidate_description",
-                    token_text=token_node.token_text,
-                    sem_node_id=sem_node.sem_node_id,
-                    description=sem_node.description,
-                    candidate_count=1,
-                    predicted_entity_id=only_candidate.get("entity_id"),
-                    predicted_label=only_candidate.get("label"),
-                )
-                _emit(
-                    "single_llm_candidate",
-                    final_assignments=[
-                        {
-                            "te_index": idx,
-                            "assigned_description": sem_node.description,
-                            "provenance": "single_llm_candidate",
-                        }
-                        for idx in range(len(cluster_text_embeddings))
-                    ],
-                    extra={"candidate_count": 1},
-                )
-                sem_node.chunk_node_embed.clear()
-                return [sem_node]
+        # In combined-merge mode (use_llm_candidate_filter) the candidate bank and
+        # the per-FFT-sample sense judgments come from one LLM call issued inside
+        # _predict_sem_description_from_samples, so there is no separate sample-less
+        # candidate-bank load here. A single merged sense collapses naturally via
+        # the consensus path below.
 
         if (
             self.sem_description_model is None
             and not getattr(self, "use_llm_semantic_labeler", False)
+            and not getattr(self, "use_llm_candidate_filter", False)
         ):
             _emit("no_model")
             sem_node.chunk_node_embed.clear()

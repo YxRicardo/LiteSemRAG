@@ -567,21 +567,32 @@ def load_wikidata_definition_candidates(
     llm_filter_use_api: bool = False,
     llm_filter_use_cache: bool = True,
     llm_filter_write_cache: bool = True,
+    fft_samples=None,
 ):
     # When use_llm_filter is enabled, WikidataDefinitionFilter first applies
     # the same span-aware candidate rules, then lets the LLM merge/rerank the
-    # remaining definitions.
+    # remaining definitions. When fft_samples are supplied, the merge and the
+    # per-sample sense judgment happen in a single LLM call (mirroring
+    # wikidata_llm_candidate_merge_experiment.ipynb); sample_order ->
+    # merged-description assignments are surfaced via the row metadata.
     if use_llm_filter:
         from wikidata_definition_filter import WikidataDefinitionFilter
 
         _, pd = _import_wikidata_deps()
         filter_instance = llm_filter or WikidataDefinitionFilter(use_api=llm_filter_use_api)
-        result = filter_instance.filter_definitions(
-            query_text,
-            num_candidates=int(target_candidate_count or limit),
-            use_cache=llm_filter_use_cache,
-            write_cache=llm_filter_write_cache,
-        )
+        if fft_samples is not None:
+            result = filter_instance.filter_definitions_with_samples(
+                query_text,
+                fft_samples=fft_samples,
+                num_candidates=int(target_candidate_count or limit),
+            )
+        else:
+            result = filter_instance.filter_definitions(
+                query_text,
+                num_candidates=int(target_candidate_count or limit),
+                use_cache=llm_filter_use_cache,
+                write_cache=llm_filter_write_cache,
+            )
         if not result.definitions:
             raise ValueError(
                 f"WikidataDefinitionFilter returned no definitions for span={query_text!r}."
