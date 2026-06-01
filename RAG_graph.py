@@ -60,6 +60,85 @@ from utils import (
 )
 
 CURRENT_SCHEMA_VERSION = 5
+
+# Anchor 传播分配法的默认数值超参(对齐
+# jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb)。只有少数核心项
+# 通过 __init__ 暴露;其余写死成这里的 notebook 默认值,需要时可在实例上覆盖。
+ANCHOR_PROP_DEFAULTS = {
+    "anchor_fraction": 0.15,        # anchor 占全部 occurrence 的比例
+    "anchor_fft_ratio": 0.70,       # anchor 中由 FFT 选出的比例(其余 random)
+    "anchor_min_count": 2,          # anchor 最少个数
+    "anchor_random_state": 42,      # anchor 随机采样种子
+    "prop_knn_k": 8,                # 构图近邻数 k
+    "prop_vote_ratio": 0.60,        # 普通类采纳所需近邻多数比例
+    "prop_weak_vote_ratio": 0.50,   # 弱投票(需 anchor center)比例
+    "prop_rare_vote_ratio": 0.80,   # 稀有类采纳所需更高比例
+    "prop_high_margin": 1.5,        # CE margin 高于此视为"自信"(用于反对票)
+    "prop_ce_oppose_gap": 0.5,      # CE 对多数类分数比 top1 低多少算强烈反对
+    "prop_rare_anchor_threshold": 2,  # anchor 中样本数 <= 此值的类视为稀有类
+    "prop_max_rounds": 50,          # 标签传播最大轮数
+}
+
+# 各版本消融开关。kNN 类型对 C/D 固定(C=plain、D=mutual),E/F 由方法名带出。
+ANCHOR_PROP_VERSION_FLAGS = {
+    "C": {"use_margin": False, "use_center": False, "rare_conservative": False},
+    "D": {"use_margin": False, "use_center": False, "rare_conservative": False},
+    "E": {"use_margin": True, "use_center": False, "rare_conservative": False},
+    "F": {"use_margin": True, "use_center": True, "rare_conservative": True},
+}
+ANCHOR_PROP_DEFAULT_KNN_TYPE = {"C": "plain", "D": "mutual"}
+ANCHOR_PROP_UNCERTAIN_MODES = ("ce_fallback", "re_llm")
+DEFAULT_SEM_ASSIGNMENT_METHOD = "Anchor-F-mutual [ce_fallback]"
+
+
+def _anchor_method_name(version, knn_type, uncertain_mode):
+    """与 notebook 的 anchor_method_name() 一致的规范方法名。"""
+    if version in {"E", "F"}:
+        return f"Anchor-{version}-{knn_type} [{uncertain_mode}]"
+    return f"Anchor-{version} [{uncertain_mode}]"
+
+
+def _parse_anchor_method(method_name):
+    """解析 Anchor 方法名 -> spec dict;非 Anchor 名(FFT-CE/FFT-LLM/None)返回 None。
+
+    支持:
+      Anchor-C [ce_fallback] / Anchor-D [re_llm]
+      Anchor-E-plain [ce_fallback] / Anchor-F-mutual [re_llm] 等全部变体。
+    """
+    if not method_name or not isinstance(method_name, str):
+        return None
+    text = method_name.strip()
+    if not text.startswith("Anchor-"):
+        return None
+    match = re.match(
+        r"^Anchor-([CDEF])(?:-(plain|mutual))?\s*\[(ce_fallback|re_llm)\]$",
+        text,
+    )
+    if match is None:
+        raise ValueError(f"无法解析的 Anchor 分配方法名: {method_name!r}")
+    version, knn_type, uncertain_mode = match.group(1), match.group(2), match.group(3)
+    if version in {"E", "F"}:
+        if knn_type is None:
+            raise ValueError(f"方法 {version} 必须在名字里指定 plain/mutual: {method_name!r}")
+    else:
+        if knn_type is not None:
+            raise ValueError(f"方法 {version} 不接受 plain/mutual 后缀: {method_name!r}")
+        knn_type = ANCHOR_PROP_DEFAULT_KNN_TYPE[version]
+    flags = dict(ANCHOR_PROP_VERSION_FLAGS[version])
+    return {
+        "method_name": _anchor_method_name(version, knn_type, uncertain_mode),
+        "version": version,
+        "knn_type": knn_type,
+        "uncertain_mode": uncertain_mode,
+        **flags,
+    }
+
+
+def _l2_normalize_rows(matrix):
+    norms = np.clip(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12, None)
+    return matrix / norms
+
+
 RUNTIME_FIELD_NAMES = (
     "text_encoder",
     "tokenizer",
@@ -593,6 +672,11 @@ class LiteSemRAG:
                  fft_d1_d2_ratio_threshold=0.8,
                  fft_knn_check_k=5,
                  fft_danger_neighbor_m=10,
+                 sem_assignment_method=DEFAULT_SEM_ASSIGNMENT_METHOD,
+                 anchor_fraction=ANCHOR_PROP_DEFAULTS["anchor_fraction"],
+                 anchor_fft_ratio=ANCHOR_PROP_DEFAULTS["anchor_fft_ratio"],
+                 anchor_min_count=ANCHOR_PROP_DEFAULTS["anchor_min_count"],
+                 prop_knn_k=ANCHOR_PROP_DEFAULTS["prop_knn_k"],
                  phrase_audit_enabled=False,
                  phrase_audit_cache_path="cache/phrase_protection_audit.jsonl"):
         self.doc_nodes = []
@@ -670,6 +754,16 @@ class LiteSemRAG:
         self.fft_d1_d2_ratio_threshold = float(fft_d1_d2_ratio_threshold)
         self.fft_knn_check_k = max(0, int(fft_knn_check_k))
         self.fft_danger_neighbor_m = max(0, int(fft_danger_neighbor_m))
+        # 语义分配方法选择:Anchor-{C,D,E,F}[-plain/mutual] [ce_fallback|re_llm]
+        # 走 anchor 传播路径;其它(FFT-CE / FFT-LLM / None)沿用既有
+        # _assign_sem_description_on_build。其余 anchor 数值超参取 notebook 默认值,
+        # 存为实例属性、可按需覆盖。
+        self.anchor_prop_params = dict(ANCHOR_PROP_DEFAULTS)
+        self.anchor_prop_params["anchor_fraction"] = float(anchor_fraction)
+        self.anchor_prop_params["anchor_fft_ratio"] = float(anchor_fft_ratio)
+        self.anchor_prop_params["anchor_min_count"] = max(1, int(anchor_min_count))
+        self.anchor_prop_params["prop_knn_k"] = max(1, int(prop_knn_k))
+        self._set_sem_assignment_method(sem_assignment_method)
         self.sem_description_batch_size = 32
         self.sem_description_use_detailed_description = False
         self.sem_description_require_detailed_description = True
@@ -706,6 +800,18 @@ class LiteSemRAG:
         self.phrase_audit_cache_path = phrase_audit_cache_path
         self._phrase_audit_session_id = None
         self.schema_version = CURRENT_SCHEMA_VERSION
+
+    # Select the semantic-assignment method and cache the parsed anchor spec.
+    # Anchor 方法名 -> 走传播路径(spec 非 None);其它名(FFT-CE/FFT-LLM/None)
+    # 沿用既有 cross-encoder/LLM 的 consensus+d1/d2 路径。
+    def _set_sem_assignment_method(self, method_name):
+        self.sem_assignment_method = method_name
+        self._anchor_method_spec = _parse_anchor_method(method_name)
+
+    # Convenience accessor for the active anchor hyper-parameters.
+    def _anchor_param(self, key):
+        params = getattr(self, "anchor_prop_params", None) or {}
+        return params.get(key, ANCHOR_PROP_DEFAULTS[key])
 
     # Recompute the average chunk length used by BM25 scoring.
     def _recompute_chunk_avg_len(self):
@@ -1625,6 +1731,16 @@ class LiteSemRAG:
             self.fft_knn_check_k = 5
         if not hasattr(self, "fft_danger_neighbor_m"):
             self.fft_danger_neighbor_m = 10
+        if not hasattr(self, "anchor_prop_params"):
+            self.anchor_prop_params = dict(ANCHOR_PROP_DEFAULTS)
+        else:
+            for key, value in ANCHOR_PROP_DEFAULTS.items():
+                self.anchor_prop_params.setdefault(key, value)
+        if not hasattr(self, "sem_assignment_method"):
+            # 旧 pickle 没有该字段:保持其历史行为(FFT 路径),不强行切到 anchor。
+            self._set_sem_assignment_method("FFT-CE")
+        elif not hasattr(self, "_anchor_method_spec"):
+            self._set_sem_assignment_method(self.sem_assignment_method)
         if not hasattr(self, "sem_description_batch_size"):
             self.sem_description_batch_size = 32
         if not hasattr(self, "sem_description_use_detailed_description"):
@@ -3589,6 +3705,10 @@ class LiteSemRAG:
     # Returns the list of sem nodes that should be attached to `token_node.sem_node_list`.
     # Each returned sem node has its `chunk_node_embed` cleared.
     def _assign_sem_description_on_build(self, sem_node, cluster_text_embeddings):
+        if getattr(self, "_anchor_method_spec", None) is not None:
+            return self._assign_sem_description_anchor_propagation(
+                sem_node, cluster_text_embeddings
+            )
         token_node = sem_node.token_node
         recorder = getattr(self, "_fft_call_recorder", None)
         record_snapshot = (
@@ -4195,6 +4315,475 @@ class LiteSemRAG:
                 extra={"split_event": split_event_payload},
             )
 
+        return new_sem_nodes
+
+    # ------------------------------------------------------------------
+    # Anchor-传播 语义分配(C/D/E/F 及其 plain/mutual + ce_fallback/re_llm 变体)
+    # 移植自 jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb 的
+    # run_anchor_propagation:少量 anchor 经 LLM 候选合并标注,在 (mutual-)kNN 图上
+    # 传播,CE 作"反对票"。anchor 标签复用现有 use_llm_candidate_filter 的合并路径;
+    # 无 LLM 时退化为 cross-encoder top-1。
+    # ------------------------------------------------------------------
+
+    # 把一个 text-embedding 的向量转成 1-D float32 numpy。
+    def _te_embed_to_numpy(self, text_embedding):
+        embed = text_embedding.embed
+        if isinstance(embed, torch.Tensor):
+            return embed.detach().to(torch.float32).cpu().numpy()
+        return np.asarray(embed, dtype=np.float32)
+
+    # 采样 anchor 位置:fft_ratio 用 FFT 覆盖边界/稀有点,其余 random。
+    def _sample_anchor_positions(self, embeddings):
+        n_records = len(embeddings)
+        if n_records == 0:
+            return []
+        fraction = float(self._anchor_param("anchor_fraction"))
+        fft_ratio = float(self._anchor_param("anchor_fft_ratio"))
+        min_count = int(self._anchor_param("anchor_min_count"))
+        random_state = int(self._anchor_param("anchor_random_state"))
+
+        n_anchor = max(min_count, int(round(fraction * n_records)))
+        n_anchor = min(n_anchor, n_records)
+        n_fft = min(n_anchor, int(round(fft_ratio * n_anchor)))
+        n_rand = n_anchor - n_fft
+
+        fft_positions = []
+        if n_fft > 0:
+            fft_positions = [
+                int(p)
+                for p in self._run_farthest_first_traversal(
+                    embeddings, n_fft, start="random", random_state=random_state
+                )
+            ]
+        fft_set = set(fft_positions)
+        remaining = [p for p in range(n_records) if p not in fft_set]
+        rand_positions = []
+        if n_rand > 0 and remaining:
+            rng = np.random.default_rng(random_state)
+            take = min(n_rand, len(remaining))
+            rand_positions = [
+                int(p) for p in rng.choice(remaining, size=take, replace=False)
+            ]
+        return sorted(fft_set | set(rand_positions))
+
+    # 为给定 occurrence 构造描述 prompt(主 prompt 失败时退化 fallback)。
+    def _build_occurrence_prompt_info(self, token_text, span_occurrence):
+        chunk_node = span_occurrence.chunk_node
+        prompt_info = self._build_sem_node_description_prompt(
+            chunk_node.chunk_text,
+            token_text,
+            match_span=span_occurrence.get_span_tuple(),
+        )
+        if prompt_info is None:
+            prompt_info = self._build_fallback_sem_description_prompt(
+                chunk_node.chunk_text,
+                token_text,
+            )
+        return prompt_info
+
+    # 标注 anchor 子集 + 取候选库。返回 (candidate_bank, {pos: description})。
+    def _label_anchor_positions(self, sem_node, records, anchor_positions):
+        token_text = sem_node.token_node.token_text
+        prepared = []
+        for sample_index, pos in enumerate(anchor_positions, start=1):
+            span_occurrence = records[pos].to_span_occurrence()
+            prompt_info = self._build_occurrence_prompt_info(token_text, span_occurrence)
+            if prompt_info is None:
+                continue
+            prepared.append((sample_index, pos, span_occurrence, prompt_info))
+        if not prepared:
+            return [], {}
+
+        anchor_labels = {}
+        if getattr(self, "use_llm_candidate_filter", False):
+            # anchor 即送入"候选合并 + 逐样本判定"的单次 LLM 调用(与
+            # wikidata_llm_candidate_merge_experiment 对齐),返回每个 anchor 的描述。
+            fft_samples = []
+            for sample_index, pos, span_occurrence, prompt_info in prepared:
+                chunk_node = span_occurrence.chunk_node
+                doc_node = getattr(chunk_node, "doc_node", None)
+                title = getattr(doc_node, "doc_name", None) if doc_node is not None else None
+                fft_samples.append(
+                    {
+                        "sample_order": sample_index,
+                        "title": title,
+                        "matched_text": prompt_info.get("matched_text") or "",
+                        "context_text": prompt_info.get("context_text") or "",
+                    }
+                )
+            candidate_bank, sample_sense_descriptions = self._run_combined_merge_for_samples(
+                sem_node, fft_samples
+            )
+            if not candidate_bank:
+                return [], {}
+            valid_descriptions = {candidate["description"] for candidate in candidate_bank}
+            for sample_index, pos, _span_occurrence, _prompt_info in prepared:
+                description = sample_sense_descriptions.get(sample_index)
+                if description in valid_descriptions:
+                    anchor_labels[pos] = description
+            return candidate_bank, anchor_labels
+
+        candidate_bank = self._load_sem_description_candidate_bank(
+            sem_node, self._sem_description_candidate_bank_cache
+        )
+        if not candidate_bank:
+            return [], {}
+        if getattr(self, "use_llm_semantic_labeler", False):
+            top_candidates = self._predict_descriptions_from_prompt_infos_with_llm(
+                token_text,
+                [prompt_info for _idx, _pos, _occ, prompt_info in prepared],
+                candidate_bank,
+            )
+            for (_idx, pos, _occ, _prompt_info), top_candidate in zip(prepared, top_candidates):
+                if top_candidate is not None:
+                    anchor_labels[pos] = top_candidate["description"]
+        else:
+            for _idx, pos, span_occurrence, _prompt_info in prepared:
+                top_candidate = self._predict_description_for_span_occurrence(
+                    token_text, span_occurrence, candidate_bank, self.sem_description_model
+                )
+                if top_candidate is not None:
+                    anchor_labels[pos] = top_candidate["description"]
+        return candidate_bank, anchor_labels
+
+    # 用 cross-encoder 对所有 occurrence 全量打分,返回按 pos 索引的
+    # (ce_top1, ce_scores, ce_margin)。CE 模型缺失时返回空 dict。
+    def _full_cross_encoder_over_records(self, token_text, records, candidate_bank):
+        model = self.sem_description_model
+        if model is None or not candidate_bank:
+            return {}, {}, {}
+        pairs = []
+        slices = []
+        for pos, text_embedding in enumerate(records):
+            span_occurrence = text_embedding.to_span_occurrence()
+            prompt_info = self._build_occurrence_prompt_info(token_text, span_occurrence)
+            if prompt_info is None:
+                continue
+            for candidate in candidate_bank:
+                pairs.append((prompt_info["prompt_text"], candidate["hypothesis"]))
+            slices.append((pos, len(candidate_bank)))
+        if not pairs:
+            return {}, {}, {}
+        raw_scores = model.predict(
+            pairs,
+            batch_size=min(self.sem_description_batch_size, len(pairs)),
+            show_progress_bar=False,
+        )
+        scores = extract_cross_encoder_scores(raw_scores, model)
+        ce_top1, ce_scores, ce_margin = {}, {}, {}
+        cursor = 0
+        for pos, count in slices:
+            window = scores[cursor:cursor + count]
+            cursor += count
+            ranked = sorted(
+                zip(candidate_bank, window),
+                key=lambda item: float(item[1]),
+                reverse=True,
+            )
+            ce_scores[pos] = {c["description"]: float(s) for c, s in ranked}
+            ce_top1[pos] = ranked[0][0]["description"]
+            ce_margin[pos] = (
+                float(ranked[0][1]) - float(ranked[1][1]) if len(ranked) >= 2 else float("inf")
+            )
+        return ce_top1, ce_scores, ce_margin
+
+    # 构造 (mutual-)kNN 邻接表(list[set])。
+    def _build_anchor_knn_adjacency(self, embeddings, knn_k, knn_type):
+        n = len(embeddings)
+        normalized = _l2_normalize_rows(embeddings.astype(np.float32))
+        sims = normalized @ normalized.T
+        np.fill_diagonal(sims, -np.inf)
+        k = min(int(knn_k), max(0, n - 1))
+        knn_sets = [set() for _ in range(n)]
+        if k > 0:
+            for i in range(n):
+                nbrs = np.argpartition(-sims[i], k - 1)[:k]
+                knn_sets[i] = {int(j) for j in nbrs}
+        adjacency = [set() for _ in range(n)]
+        for i in range(n):
+            for j in knn_sets[i]:
+                if knn_type == "mutual":
+                    if i in knn_sets[j]:
+                        adjacency[i].add(j)
+                        adjacency[j].add(i)
+                else:
+                    adjacency[i].add(j)
+                    adjacency[j].add(i)
+        return adjacency
+
+    # 在 (mutual-)kNN 图上从 anchor 逐圈外扩传播。返回 labels/provenance/uncertain。
+    def _run_anchor_propagation_core(
+        self, records, embeddings, anchor_labels, ce_top1, ce_scores, ce_margin, spec
+    ):
+        n = len(records)
+        normalized = _l2_normalize_rows(embeddings.astype(np.float32))
+        adjacency = self._build_anchor_knn_adjacency(
+            embeddings, self._anchor_param("prop_knn_k"), spec["knn_type"]
+        )
+
+        use_margin = spec["use_margin"]
+        use_center = spec["use_center"]
+        rare_conservative = spec["rare_conservative"]
+        vote_ratio = float(self._anchor_param("prop_vote_ratio"))
+        weak_vote_ratio = float(self._anchor_param("prop_weak_vote_ratio"))
+        rare_vote_ratio = float(self._anchor_param("prop_rare_vote_ratio"))
+        high_margin = float(self._anchor_param("prop_high_margin"))
+        ce_oppose_gap = float(self._anchor_param("prop_ce_oppose_gap"))
+        rare_anchor_threshold = int(self._anchor_param("prop_rare_anchor_threshold"))
+        max_rounds = int(self._anchor_param("prop_max_rounds"))
+
+        labels = dict(anchor_labels)
+        provenance = {pos: "llm_anchor" for pos in anchor_labels}
+        anchor_set = set(anchor_labels)
+
+        anchor_class_counts = Counter(labels[pos] for pos in anchor_set)
+        rare_classes = {
+            desc for desc, cnt in anchor_class_counts.items() if cnt <= rare_anchor_threshold
+        }
+        class_centers = {}
+        for desc in anchor_class_counts:
+            members = [pos for pos in anchor_set if labels[pos] == desc]
+            center = normalized[members].mean(axis=0)
+            center = center / max(np.linalg.norm(center), 1e-12)
+            class_centers[desc] = center
+        center_descs = list(class_centers.keys())
+        center_matrix = (
+            np.stack([class_centers[d] for d in center_descs]).astype(np.float32)
+            if center_descs else None
+        )
+
+        def nearest_center_class(pos):
+            if center_matrix is None:
+                return None
+            sims = center_matrix @ normalized[pos]
+            return center_descs[int(np.argmax(sims))]
+
+        def ce_opposes(pos, candidate_desc):
+            if not use_margin:
+                return False
+            top1 = ce_top1.get(pos)
+            if top1 is None or top1 == candidate_desc:
+                return False
+            if ce_margin.get(pos, 0.0) < high_margin:
+                return False
+            scores = ce_scores.get(pos, {})
+            return scores.get(candidate_desc, -float("inf")) < scores.get(top1, float("inf")) - ce_oppose_gap
+
+        for _ in range(max_rounds):
+            snapshot = dict(labels)
+            new_labels = {}
+            for pos in range(n):
+                if pos in labels:
+                    continue
+                labeled_neighbors = [j for j in adjacency[pos] if j in snapshot]
+                if not labeled_neighbors:
+                    continue
+                votes = Counter(snapshot[j] for j in labeled_neighbors)
+                maj, maj_count = votes.most_common(1)[0]
+                ratio = maj_count / len(labeled_neighbors)
+                is_rare = maj in rare_classes
+                effective_vote_ratio = (
+                    rare_vote_ratio if (rare_conservative and is_rare) else vote_ratio
+                )
+                opposes = ce_opposes(pos, maj)
+                center_ok = use_center and (nearest_center_class(pos) == maj)
+                ce_t1 = ce_top1.get(pos)
+
+                chosen, prov = None, None
+                if ratio >= effective_vote_ratio:
+                    if opposes:
+                        if center_ok:
+                            chosen, prov = maj, "center_override"
+                    elif rare_conservative and is_rare and use_center and not center_ok and maj != ce_t1:
+                        pass
+                    else:
+                        prov = "neighbor_ce_agree" if maj == ce_t1 else "neighbor_override"
+                        chosen = maj
+                else:
+                    if use_center and center_ok and ratio >= weak_vote_ratio and not opposes:
+                        chosen, prov = maj, "center_support"
+
+                if chosen is not None:
+                    new_labels[pos] = (chosen, prov)
+
+            if not new_labels:
+                break
+            for pos, (lab, prov) in new_labels.items():
+                labels[pos] = lab
+                provenance[pos] = prov
+
+        uncertain_positions = set()
+        for pos in range(n):
+            if pos in labels:
+                continue
+            if use_margin and ce_margin.get(pos, -float("inf")) >= high_margin and ce_top1.get(pos):
+                labels[pos] = ce_top1[pos]
+                provenance[pos] = "ce_high_margin"
+            else:
+                uncertain_positions.add(pos)
+                provenance[pos] = "uncertain"
+
+        return {
+            "labels": labels,
+            "provenance": provenance,
+            "uncertain_positions": uncertain_positions,
+            "anchor_set": anchor_set,
+            "rare_classes": rare_classes,
+        }
+
+    # re_llm 收尾:对仍 uncertain 的 occurrence 真实再调一次 LLM 逐条判定。
+    def _relabel_uncertain_with_llm(self, token_text, pos_te_pairs, candidate_bank):
+        prepared = []
+        for pos, text_embedding in pos_te_pairs:
+            span_occurrence = text_embedding.to_span_occurrence()
+            prompt_info = self._build_occurrence_prompt_info(token_text, span_occurrence)
+            if prompt_info is None:
+                continue
+            prepared.append((pos, prompt_info))
+        if not prepared:
+            return {}
+        top_candidates = self._predict_descriptions_from_prompt_infos_with_llm(
+            token_text,
+            [prompt_info for _pos, prompt_info in prepared],
+            candidate_bank,
+        )
+        relabeled = {}
+        for (pos, _prompt_info), top_candidate in zip(prepared, top_candidates):
+            if top_candidate is not None:
+                relabeled[pos] = top_candidate["description"]
+        return relabeled
+
+    # Anchor 传播主入口:替换 _assign_sem_description_on_build 的 consensus/d1d2 路径。
+    def _assign_sem_description_anchor_propagation(self, sem_node, cluster_text_embeddings):
+        token_node = sem_node.token_node
+        token_text = token_node.token_text
+        spec = self._anchor_method_spec
+        records = list(cluster_text_embeddings)
+        n = len(records)
+
+        # 没有任何描述模型/标注器:回退单义节点(与既有 no_model 路径一致)。
+        if (
+            self.sem_description_model is None
+            and not getattr(self, "use_llm_semantic_labeler", False)
+            and not getattr(self, "use_llm_candidate_filter", False)
+        ):
+            sem_node.chunk_node_embed.clear()
+            return [sem_node]
+        if n == 0:
+            sem_node.chunk_node_embed.clear()
+            return [sem_node]
+
+        embeddings = np.stack([self._te_embed_to_numpy(te) for te in records]).astype(np.float32)
+
+        anchor_positions = self._sample_anchor_positions(embeddings)
+        candidate_bank, anchor_labels = self._label_anchor_positions(
+            sem_node, records, anchor_positions
+        )
+        if not candidate_bank or not anchor_labels:
+            # 无法消歧:保留为单义节点。
+            sem_node.chunk_node_embed.clear()
+            return [sem_node]
+
+        need_ce = spec["use_margin"] or spec["uncertain_mode"] == "ce_fallback"
+        if need_ce:
+            ce_top1, ce_scores, ce_margin = self._full_cross_encoder_over_records(
+                token_text, records, candidate_bank
+            )
+        else:
+            ce_top1, ce_scores, ce_margin = {}, {}, {}
+
+        prop = self._run_anchor_propagation_core(
+            records, embeddings, anchor_labels, ce_top1, ce_scores, ce_margin, spec
+        )
+        labels = prop["labels"]
+        provenance = prop["provenance"]
+        uncertain_positions = prop["uncertain_positions"]
+
+        # uncertain 收尾。
+        if spec["uncertain_mode"] == "ce_fallback":
+            for pos in uncertain_positions:
+                fallback = ce_top1.get(pos)
+                if fallback is not None:
+                    labels[pos] = fallback
+                    provenance[pos] = "uncertain_ce_fallback"
+        elif spec["uncertain_mode"] == "re_llm":
+            relabeled = self._relabel_uncertain_with_llm(
+                token_text,
+                [(pos, records[pos]) for pos in uncertain_positions],
+                candidate_bank,
+            )
+            for pos, description in relabeled.items():
+                labels[pos] = description
+                provenance[pos] = "uncertain_re_llm"
+
+        # 仍未标记(LLM/CE 兜底失败)的 occurrence -> 取已标记里的全局多数,确保可分组。
+        if len(labels) < n:
+            if not labels:
+                sem_node.chunk_node_embed.clear()
+                return [sem_node]
+            majority_description = Counter(labels.values()).most_common(1)[0][0]
+            for pos in range(n):
+                if pos not in labels:
+                    labels[pos] = majority_description
+                    provenance[pos] = "fallback_majority"
+
+        final_groups = defaultdict(list)
+        for pos, text_embedding in enumerate(records):
+            final_groups[labels[pos]].append(text_embedding)
+
+        self._log_sem_description_operation(
+            "anchor_propagation_assign",
+            token_text=token_text,
+            sem_node_id=sem_node.sem_node_id,
+            method=self.sem_assignment_method,
+            knn_type=spec["knn_type"],
+            uncertain_mode=spec["uncertain_mode"],
+            record_count=n,
+            anchor_count=len(prop["anchor_set"]),
+            uncertain_count=len(uncertain_positions),
+            rare_classes=sorted(prop["rare_classes"]),
+            description_counts={d: len(tes) for d, tes in final_groups.items()},
+            provenance_counts=dict(Counter(provenance.values())),
+        )
+
+        # 单义:直接给原节点写描述。
+        if len(final_groups) <= 1:
+            sem_node.description = next(iter(final_groups))
+            sem_node.chunk_node_embed.clear()
+            return [sem_node]
+
+        # 多义:用各 description 子集替换原节点(与 split 路径一致)。
+        self.deleted_merged_sem_logs.append(
+            {
+                "deleted_sem_node_id": sem_node.sem_node_id,
+                "kept_sem_node_id": None,
+                "token_text": token_text,
+                "description": "anchor_propagation_split",
+                "deleted_chunk_count": len(sem_node.chunk_node_list),
+            }
+        )
+        try:
+            self.sem_nodes.remove(sem_node)
+        except ValueError:
+            pass
+        sem_node.chunk_node_embed.clear()
+
+        new_sem_nodes = []
+        for description, tes in final_groups.items():
+            if not tes:
+                continue
+            new_node = self._create_sem_node_from_cluster_subset(token_node, description, tes)
+            new_sem_nodes.append(new_node)
+            self._log_sem_description_operation(
+                "create_anchor_propagation_sem_node",
+                token_text=token_text,
+                source_sem_node_id=sem_node.sem_node_id,
+                sem_node_id=new_node.sem_node_id,
+                description=description,
+                sample_count=len(tes),
+            )
+        token_node.has_semantic = bool(new_sem_nodes)
+        self._reset_sem_node_ids()
         return new_sem_nodes
 
     # Create a stable in-memory key for matching span occurrences.

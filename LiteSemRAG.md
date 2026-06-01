@@ -56,6 +56,11 @@ LiteSemRAG(
     use_llm_candidate_filter=False,
     use_llm_semantic_labeler=False,
     disambiguate_query_sense=True,
+    sem_assignment_method="Anchor-F-mutual [ce_fallback]",
+    anchor_fraction=0.15,
+    anchor_fft_ratio=0.70,
+    anchor_min_count=2,
+    prop_knn_k=8,
 )
 ```
 
@@ -96,6 +101,30 @@ Important parameters:
   (When `use_llm_candidate_filter` is on, the sampled FFT occurrences are already
   judged by the combined merge call; the labeler then only applies to the
   remaining non-sampled / danger-zone occurrences.)
+- `sem_assignment_method` selects how `finalize()` assigns descriptions / splits
+  senses for tokens that pass the occurrence gate. Two families:
+  - **FFT family** (`"FFT-CE"` / `"FFT-LLM"`, or any non-`Anchor-*` name): the
+    original path — FFT sampling → per-sample judgment → consensus gate →
+    d1/d2 medoid split, driven by `use_llm_candidate_filter` /
+    `use_llm_semantic_labeler` as before. Unchanged and never removed.
+  - **Anchor family** (the new default): ports
+    `hotpotqa_anchor_propagation_compare.ipynb`. A small `anchor_fraction` of
+    occurrences (70% FFT-selected + 30% random) is labeled by the existing
+    candidate-merge LLM path (or the cross-encoder when no LLM is enabled), then
+    those labels propagate over a `(mutual-)kNN` graph; the cross-encoder acts as
+    a "veto". Records grouped by propagated description become the split senses.
+    All twelve notebook variants are selectable by name:
+    `Anchor-C [ce_fallback|re_llm]`, `Anchor-D [...]`,
+    `Anchor-E-{plain,mutual} [...]`, `Anchor-F-{plain,mutual} [...]`
+    (C=plain/D=mutual kNN; E adds CE margin veto; F adds anchor-center + rare-class
+    conservatism). `[ce_fallback]` resolves leftover `uncertain` records with the
+    CE top-1; `[re_llm]` re-asks the LLM per occurrence. Default:
+    `"Anchor-F-mutual [ce_fallback]"`.
+- `anchor_fraction`, `anchor_fft_ratio`, `anchor_min_count`, `prop_knn_k` are the
+  core tunable anchor hyper-parameters. The remaining notebook hyper-parameters
+  (vote ratios, `high_margin`, `ce_oppose_gap`, rare thresholds, `max_rounds`)
+  keep their notebook defaults in `ANCHOR_PROP_DEFAULTS` and can be overridden on
+  `self.anchor_prop_params` after construction.
 - `disambiguate_query_sense` enables query-time sense disambiguation. When a
   query span resolves to a token that built multiple *described* semantic nodes
   during indexing (a genuinely multi-sense token), the exact match is chosen by
@@ -273,7 +302,13 @@ Main steps:
    FFT samples yield multiple coherent predicted descriptions, it can split the
    token's occurrences into multiple `SemNode` objects; non-sampled and
    danger-zone occurrences are then assigned by medoid / d1-d2 distance (falling
-   back to the cross-encoder or labeler as configured).
+   back to the cross-encoder or labeler as configured). When `sem_assignment_method`
+   names an `Anchor-*` variant, this method instead dispatches to
+   `_assign_sem_description_anchor_propagation()`, which labels an
+   `anchor_fraction` subset (via the same merge / cross-encoder path), propagates
+   the labels over a `(mutual-)kNN` graph with an optional cross-encoder veto, and
+   groups records by propagated description into the split `SemNode` objects
+   (steps 1–2 above still supply the candidate bank and anchor labels).
 4. `merge_duplicate_description_sem_nodes()` later merges same-token semantic
    nodes with matching descriptions during `finalize()`.
 
