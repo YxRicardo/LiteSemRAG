@@ -1086,22 +1086,6 @@ class LiteSemRAG:
                 }
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-    # Build a compact snapshot for a semantic node before it is merged away.
-    def _build_sem_node_merge_snapshot(self, sem_node):
-        return {
-            "sem_node_id": sem_node.sem_node_id,
-            "chunk_count": len(getattr(sem_node, "chunk_node_list", [])),
-            "span_occurrence_count": len(getattr(sem_node, "span_occurrences", [])),
-            "retained_embed_count": len(getattr(sem_node, "retained_text_embeddings", [])),
-            "retained_embed_source_count": getattr(
-                sem_node,
-                "retained_text_embedding_source_count",
-                len(getattr(sem_node, "retained_text_embeddings", [])),
-            ),
-            "has_embed": sem_node.embed is not None,
-            "pending_embed_rebuild": bool(getattr(sem_node, "pending_embed_rebuild", False)),
-        }
-
     # Record a deduplicated Wikidata lookup failure for later inspection.
     def _log_wikidata_no_result(self, term, stage, reason):
         log_key = (str(term), str(stage), str(reason))
@@ -3085,8 +3069,6 @@ class LiteSemRAG:
         self.log_time("Finished token node finalization.")
         self._print_sem_build_stats()
 
-        self.merge_duplicate_description_sem_nodes()
-        self.log_time("Finished merging sem nodes by description.")
         if not self.sem_nodes:
             raise ValueError("Cannot finalize graph: no semantic nodes were created.")
         self.build_modifier_postings()
@@ -5224,159 +5206,6 @@ class LiteSemRAG:
         new_sem_node.df = 0
         new_sem_node.idf = 0
         return new_sem_node
-
-    # Merge semantic nodes that share the same predicted description.
-    def _merge_sem_node_group(self, sem_group):
-        primary_sem = sem_group[0]
-        merged_chunk_nodes = []
-        merged_chunk_edge_weights = []
-        merged_span_occurrences = []
-        merged_embeds = []
-        merged_retained_text_embeddings = []
-        merged_retained_source_count = 0
-
-        for sem_node in sem_group:
-            merged_chunk_nodes.extend(sem_node.chunk_node_list)
-            merged_chunk_edge_weights.extend(sem_node.chunk_edge_weight)
-            merged_span_occurrences.extend(getattr(sem_node, "span_occurrences", []))
-            merged_retained_text_embeddings.extend(getattr(sem_node, "retained_text_embeddings", []))
-            merged_retained_source_count += getattr(
-                sem_node,
-                "retained_text_embedding_source_count",
-                len(getattr(sem_node, "retained_text_embeddings", [])),
-            )
-            if sem_node.embed is not None:
-                merged_embeds.append(sem_node.embed)
-
-        primary_sem.chunk_node_list = merged_chunk_nodes
-        primary_sem.chunk_edge_weight = merged_chunk_edge_weights
-        primary_sem.span_occurrences = merged_span_occurrences
-        primary_sem.chunk_node_embed = []
-        primary_sem.retained_text_embeddings = self._sample_text_embeddings(
-            merged_retained_text_embeddings,
-            max_samples=self.sem_retained_embed_limit,
-        )
-        primary_sem.retained_text_embedding_source_count = max(
-            merged_retained_source_count,
-            len(merged_retained_text_embeddings),
-        )
-        primary_sem.pending_embed_rebuild = False
-        retained_embeds = [
-            text_embedding.embed
-            for text_embedding in merged_retained_text_embeddings
-            if text_embedding.embed is not None
-        ]
-        if retained_embeds:
-            primary_sem.embed = self._store_sem_embed(average_embeds(retained_embeds))
-        elif merged_embeds:
-            primary_sem.embed = self._store_sem_embed(torch.stack(merged_embeds).mean(dim=0))
-        primary_sem.tf_dict_by_chunk_id = None
-        primary_sem.chunk_len_dict_by_id = None
-        primary_sem.BM25 = None
-        primary_sem.df = 0
-        primary_sem.idf = 0
-        return primary_sem
-
-    # Assign descriptions, split ambiguous semantic nodes, and merge duplicates by description.
-    def merge_duplicate_description_sem_nodes(self):
-        redundant_sem_ids = set()
-        sem_nodes_changed = False
-        target_token_nodes = [
-            token_node for token_node in self.token_nodes
-            if len(token_node.sem_node_list) > 1
-        ]
-
-        total_token_nodes = len(target_token_nodes)
-        progress_update = self._make_progress_updater(
-            "merge_duplicate_description_sem_nodes",
-            total_token_nodes,
-        ) if total_token_nodes > 0 else None
-        if progress_update is not None:
-            progress_update(0, force=True)
-        for index, token_node in enumerate(target_token_nodes, start=1):
-            ordered_sem_list = []
-            seen_sem_ids = set()
-            for sem_node in token_node.sem_node_list:
-                sem_id = id(sem_node)
-                if sem_id in seen_sem_ids:
-                    continue
-                seen_sem_ids.add(sem_id)
-                ordered_sem_list.append(sem_node)
-
-            merge_groups = defaultdict(list)
-            for sem_node in ordered_sem_list:
-                if sem_node.description:
-                    merge_groups[sem_node.description].append(sem_node)
-
-            merged_sem_map = {}
-            for description, sem_group in merge_groups.items():
-                if len(sem_group) < 2:
-                    continue
-                merged_sem = self._merge_sem_node_group(sem_group)
-                merged_sem_map[description] = merged_sem
-                self._log_sem_description_operation(
-                    "merge_sem_nodes_with_same_description",
-                    token_text=token_node.token_text,
-                    description=description,
-                    kept_sem_node_id=merged_sem.sem_node_id,
-                    merged_sem_node_ids=[sem_node.sem_node_id for sem_node in sem_group],
-                    merged_sem_node_details=[
-                        self._build_sem_node_merge_snapshot(sem_node)
-                        for sem_node in sem_group
-                    ],
-                    retained_embed_count=len(getattr(merged_sem, "retained_text_embeddings", [])),
-                    retained_embed_source_count=getattr(
-                        merged_sem,
-                        "retained_text_embedding_source_count",
-                        len(getattr(merged_sem, "retained_text_embeddings", [])),
-                    ),
-                    merged_chunk_count=len(getattr(merged_sem, "chunk_node_list", [])),
-                )
-                for redundant_sem in sem_group[1:]:
-                    sem_nodes_changed = True
-                    redundant_sem_ids.add(id(redundant_sem))
-                    self.deleted_merged_sem_logs.append(
-                        {
-                            "deleted_sem_node_id": redundant_sem.sem_node_id,
-                            "kept_sem_node_id": merged_sem.sem_node_id,
-                            "token_text": token_node.token_text,
-                            "description": description,
-                            "deleted_chunk_count": len(redundant_sem.chunk_node_list),
-                        }
-                    )
-
-            if merged_sem_map:
-                deduped_sem_list = []
-                added_sem_ids = set()
-                for sem_node in ordered_sem_list:
-                    if id(sem_node) in redundant_sem_ids:
-                        continue
-                    target_sem = merged_sem_map.get(sem_node.description, sem_node)
-                    target_sem_id = id(target_sem)
-                    if target_sem_id in added_sem_ids:
-                        continue
-                    added_sem_ids.add(target_sem_id)
-                    deduped_sem_list.append(target_sem)
-                token_node.sem_node_list = deduped_sem_list
-            else:
-                token_node.sem_node_list = ordered_sem_list
-            token_node.has_semantic = len(token_node.sem_node_list) > 0
-            progress_update(index)
-
-        if not redundant_sem_ids and not sem_nodes_changed:
-            if total_token_nodes > 0:
-                progress_update(total_token_nodes, force=True)
-                print()
-            return
-
-        self.sem_nodes = [
-            sem_node for sem_node in self.sem_nodes
-            if id(sem_node) not in redundant_sem_ids
-        ]
-        self._reset_sem_node_ids()
-        if total_token_nodes > 0:
-            progress_update(total_token_nodes, force=True)
-            print()
 
     # Format semantic-description logs as plain text.
     # Format one operation event as a single line for the chronological timeline view.

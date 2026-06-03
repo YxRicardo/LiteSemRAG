@@ -309,14 +309,12 @@ Main steps:
    the labels over a `(mutual-)kNN` graph with an optional cross-encoder veto, and
    groups records by propagated description into the split `SemNode` objects
    (steps 1–2 above still supply the candidate bank and anchor labels).
-4. `merge_duplicate_description_sem_nodes()` later merges same-token semantic
-   nodes with matching descriptions during `finalize()`.
 
 Prompt context is controlled by `sem_description_prompt_context_mode`; supported
 helpers include sentence-only, neighboring-sentence, full-chunk, and
 boundary-extended context extraction.
 
-Description, split, merge, and no-result events are stored in memory and written
+Description, split, and no-result events are stored in memory and written
 by `save_sem_description_logs()` or automatically by `finalize()` under
 `logs/sem_description_*.log`.
 
@@ -335,17 +333,15 @@ Current finalize order:
 5. `finalize_token_nodes()` builds every token's semantic node(s) from its fully
    accumulated `embeds_buffer` (sense split or basic node, per
    `min_occurrences_for_description`), then clears the buffer.
-6. `merge_duplicate_description_sem_nodes()` merges same-description semantic
-   nodes.
-7. Validate semantic nodes exist.
-8. `build_modifier_postings()` builds head/modifier postings.
-9. `assign_idf()` computes token and semantic-node IDF.
-10. `get_sem_BM25()` computes per-sem-node chunk BM25 scores.
-11. `build_query_database()` stacks normalized semantic-node embeddings.
-12. `build_phrase_query()` builds the word-to-phrase inverted index.
-13. `build_chunk2sem_edge()` rebuilds chunk-to-sem reverse edges.
-14. `save_doc_to_json()` writes `index_documents.json`.
-15. `_save_sem_description_logs_to_timestamped_file()` writes a timestamped log
+6. Validate semantic nodes exist.
+7. `build_modifier_postings()` builds head/modifier postings.
+8. `assign_idf()` computes token and semantic-node IDF.
+9. `get_sem_BM25()` computes per-sem-node chunk BM25 scores.
+10. `build_query_database()` stacks normalized semantic-node embeddings.
+11. `build_phrase_query()` builds the word-to-phrase inverted index.
+12. `build_chunk2sem_edge()` rebuilds chunk-to-sem reverse edges.
+13. `save_doc_to_json()` writes `index_documents.json`.
+14. `_save_sem_description_logs_to_timestamped_file()` writes a timestamped log
     under `logs/`.
 
 `finalize()` raises a `ValueError` for empty graphs or missing semantic-node
