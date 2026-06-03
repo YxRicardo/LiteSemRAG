@@ -181,7 +181,17 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_
         if debug_mode:
             _debug_keep("entity", ent, stage=debug_stage)
 
-        entity_spans.append((normalize_text(ent.text), ent.start_char, ent.end_char))
+        preserve_leading_article = ent.label_.upper() == "WORK_OF_ART"
+        entity_spans.append(
+            (
+                normalize_text(
+                    ent.text,
+                    preserve_leading_article=preserve_leading_article,
+                ),
+                ent.start_char,
+                ent.end_char,
+            )
+        )
         token_intervals.append((ent.start, ent.end))
         char_intervals.append((ent.start_char, ent.end_char))
 
@@ -246,6 +256,29 @@ def _trim_residual_span(span):
     while start < end and (span.doc[end - 1].is_stop or span.doc[end - 1].is_punct):
         end -= 1
     return span.doc[start:end]
+
+
+def _trim_leading_poss(span):
+    start = span.start
+    end = span.end
+    doc = span.doc
+    while start < end and doc[start].dep_ == "poss":
+        start += 1
+    if start >= end:
+        return span
+    return doc[start:end]
+
+
+def _normalize_phrase_from_span(span, *, preserve_leading_article=False):
+    trimmed = _trim_leading_poss(span)
+    phrase_text = trimmed.text.strip()
+    return (
+        normalize_text(phrase_text, preserve_leading_article=preserve_leading_article),
+        trimmed.start_char,
+        trimmed.end_char,
+        trimmed.start,
+        trimmed.end,
+    )
 
 
 def _protected_entities_inside_span(span, protected_entity_records):
@@ -670,10 +703,12 @@ def extract_important_spans(
                     debug_stage="noun_chunk_filter",
                 ):
                     continue
-                important_phrases.append(
-                    (normalize_text(residual.text.strip()), residual.start_char, residual.end_char)
+                phrase_norm, start_char, end_char, start_token, end_token = _normalize_phrase_from_span(
+                    residual,
+                    preserve_leading_article=_is_title_like_noun_chunk(residual),
                 )
-                phrase_token_spans.append((residual.start, residual.end))
+                important_phrases.append((phrase_norm, start_char, end_char))
+                phrase_token_spans.append((start_token, end_token))
                 if _is_title_like_noun_chunk(residual):
                     _append_protected_span_record(
                         protected_entity_records,
@@ -684,9 +719,9 @@ def extract_important_spans(
                     phrase_audit_records.append(
                         _build_phrase_audit_record(
                             doc,
-                            normalize_text(residual.text.strip()),
-                            residual.start_char,
-                            residual.end_char,
+                            phrase_norm,
+                            start_char,
+                            end_char,
                             "noun_chunk_residual",
                             protected_entity_records,
                         )
@@ -701,7 +736,11 @@ def extract_important_spans(
         ):
             continue
 
-        important_phrases.append((normalize_text(noun_chunk.text.strip()), start_char, end_char))
+        phrase_norm, start_char, end_char, start_token, end_token = _normalize_phrase_from_span(
+            noun_chunk,
+            preserve_leading_article=_is_title_like_noun_chunk(noun_chunk),
+        )
+        important_phrases.append((phrase_norm, start_char, end_char))
         phrase_token_spans.append((start_token, end_token))
         if _is_title_like_noun_chunk(noun_chunk):
             _append_protected_span_record(
@@ -713,7 +752,7 @@ def extract_important_spans(
             phrase_audit_records.append(
                 _build_phrase_audit_record(
                     doc,
-                    normalize_text(noun_chunk.text.strip()),
+                    phrase_norm,
                     start_char,
                     end_char,
                     "noun_chunk",
@@ -786,7 +825,7 @@ def extract_important_spans(
 
 
 # Normalize text for matching by lowercasing words and removing leading articles.
-def normalize_text(text: str) -> str:
+def normalize_text(text: str, *, preserve_leading_article: bool = False) -> str:
     # Normalize one word while preserving meaningful acronyms.
     def process_word(word: str) -> str:
         if re.search(r'[A-Z]{2,}', word):
@@ -797,8 +836,10 @@ def normalize_text(text: str) -> str:
     if not words:
         return ""
 
-                          
-    if words[0].lower() in {"the", "a", "an"}:
+    if (
+        not preserve_leading_article
+        and words[0].lower() in {"the", "a", "an"}
+    ):
         words = words[1:]
 
     return ' '.join(process_word(word) for word in words)
@@ -846,9 +887,11 @@ def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
                     debug_mode=debug_mode,
                 ):
                     continue
-                important_phrases.append(
-                    (normalize_text(residual.text.strip()), residual.start_char, residual.end_char)
+                phrase_norm, start_char, end_char, _, _ = _normalize_phrase_from_span(
+                    residual,
+                    preserve_leading_article=_is_title_like_noun_chunk(residual),
                 )
+                important_phrases.append((phrase_norm, start_char, end_char))
             continue
 
         if not _is_valid_noun_chunk(
@@ -857,9 +900,11 @@ def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
             debug_mode=debug_mode,
         ):
             continue
-        important_phrases.append(
-            (normalize_text(noun_chunk.text.strip()), noun_chunk.start_char, noun_chunk.end_char)
+        phrase_norm, start_char, end_char, _, _ = _normalize_phrase_from_span(
+            noun_chunk,
+            preserve_leading_article=_is_title_like_noun_chunk(noun_chunk),
         )
+        important_phrases.append((phrase_norm, start_char, end_char))
 
     return important_phrases, num_ents
 

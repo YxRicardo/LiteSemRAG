@@ -59,7 +59,7 @@ from utils import (
     sem_embed_sim,
 )
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 # Anchor 传播分配法的默认数值超参(对齐
 # jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb)。只有少数核心项
@@ -68,6 +68,7 @@ ANCHOR_PROP_DEFAULTS = {
     "anchor_fraction": 0.15,        # anchor 占全部 occurrence 的比例
     "anchor_fft_ratio": 0.70,       # anchor 中由 FFT 选出的比例(其余 random)
     "anchor_min_count": 2,          # anchor 最少个数
+    "anchor_max_count": 20,         # anchor 个数上限(防止高频词把过多样本塞进单次 LLM 判定)
     "anchor_random_state": 42,      # anchor 随机采样种子
     "prop_knn_k": 8,                # 构图近邻数 k
     "prop_vote_ratio": 0.60,        # 普通类采纳所需近邻多数比例
@@ -469,6 +470,9 @@ class TokenNode:
     compositional_modifier_texts: list = field(default_factory=list)
     compositional_modifier_texts_norm: list = field(default_factory=list)
     headed_phrase_records: dict = field(default_factory=dict)
+    # finalize 时 semantic_type_cls 算出的 embedding 集中度;None 表示从未走过
+    # s_mean 闸门(entity/原子短语单义,或出现次数未达阈值的 basic 节点)。
+    s_mean: float | None = None
 
     # Initialize optional token metadata after dataclass construction.
     def __post_init__(self):
@@ -676,6 +680,7 @@ class LiteSemRAG:
                  anchor_fraction=ANCHOR_PROP_DEFAULTS["anchor_fraction"],
                  anchor_fft_ratio=ANCHOR_PROP_DEFAULTS["anchor_fft_ratio"],
                  anchor_min_count=ANCHOR_PROP_DEFAULTS["anchor_min_count"],
+                 anchor_max_count=ANCHOR_PROP_DEFAULTS["anchor_max_count"],
                  prop_knn_k=ANCHOR_PROP_DEFAULTS["prop_knn_k"],
                  phrase_audit_enabled=False,
                  phrase_audit_cache_path="cache/phrase_protection_audit.jsonl"):
@@ -762,6 +767,7 @@ class LiteSemRAG:
         self.anchor_prop_params["anchor_fraction"] = float(anchor_fraction)
         self.anchor_prop_params["anchor_fft_ratio"] = float(anchor_fft_ratio)
         self.anchor_prop_params["anchor_min_count"] = max(1, int(anchor_min_count))
+        self.anchor_prop_params["anchor_max_count"] = max(1, int(anchor_max_count))
         self.anchor_prop_params["prop_knn_k"] = max(1, int(prop_knn_k))
         self._set_sem_assignment_method(sem_assignment_method)
         self.sem_description_batch_size = 32
@@ -1591,6 +1597,9 @@ class LiteSemRAG:
         # 恒为 0(只在 finalize 的 assign_idf 里赋值),该分支从未生效;且即便
         # 生效,它会把"高频多义词"(如 bank)误判为单义,与目标相悖,故已移除。
         s_mean = get_s_mean([i.embed for i in token_node.embeds_buffer])
+        # 持久化到 token_node,供 finalize 之后的统计/检视使用(embeds_buffer 随后被清空,
+        # 原始全量出现序列不再保留,只能在此刻把这个值存下来)。
+        token_node.s_mean = float(s_mean)
         return not (s_mean > self.tau_conc)
 
     # Look up a token node by its surface text.
@@ -1868,6 +1877,9 @@ class LiteSemRAG:
             token_node.compositional_modifier_texts_norm = []
         if not hasattr(token_node, "headed_phrase_records"):
             token_node.headed_phrase_records = {}
+        # schema 6:finalize 时持久化的 embedding 集中度;旧 pickle 没有,记为 None。
+        if not hasattr(token_node, "s_mean"):
+            token_node.s_mean = None
         # 索引期 anomaly 机制已移除:丢弃旧 pickle 残留的 anomaly_section 属性。
         if hasattr(token_node, "anomaly_section"):
             del token_node.anomaly_section
@@ -4340,10 +4352,13 @@ class LiteSemRAG:
         fraction = float(self._anchor_param("anchor_fraction"))
         fft_ratio = float(self._anchor_param("anchor_fft_ratio"))
         min_count = int(self._anchor_param("anchor_min_count"))
+        max_count = int(self._anchor_param("anchor_max_count"))
         random_state = int(self._anchor_param("anchor_random_state"))
 
         n_anchor = max(min_count, int(round(fraction * n_records)))
-        n_anchor = min(n_anchor, n_records)
+        # 封顶:高频词的 occurrence 很多,fraction 会让 anchor 线性膨胀,导致一次性塞给
+        # LLM 判定的样本过多(准确率下降 + 成本上升)。用 anchor_max_count 截断。
+        n_anchor = min(n_anchor, n_records, max_count)
         n_fft = min(n_anchor, int(round(fft_ratio * n_anchor)))
         n_rand = n_anchor - n_fft
 
@@ -6277,6 +6292,7 @@ class LiteSemRAG:
             result[token_node.token_text] = {
                 "token_node_id": token_node.token_node_id,
                 "sem_count": sem_count,
+                "s_mean": getattr(token_node, "s_mean", None),
                 "sem_nodes": [],
             }
 
@@ -6294,6 +6310,30 @@ class LiteSemRAG:
 
         return result
 
+    # Aggregate the persisted s_mean over all token nodes with >= min_sem_count sem nodes.
+    def compute_multi_sem_smean_stats(self, min_sem_count=2):
+        # 统计口径:全图中拥有 >= min_sem_count 个 sem 节点的 token,不受显示截断影响。
+        # s_mean 在 finalize 的 semantic_type_cls 里持久化;走多义切分的 token 必然有值,
+        # 但 entity/原子短语(force_single)若因后续合并恰好有多个 sem,则 s_mean 为 None,
+        # 这类样本计入 token 总数但不计入平均,用 missing 计数单独反映。
+        total = 0
+        smean_values = []
+        for token_node in self.token_nodes:
+            if len(token_node.sem_node_list) < min_sem_count:
+                continue
+            total += 1
+            s_mean = getattr(token_node, "s_mean", None)
+            if s_mean is not None:
+                smean_values.append(float(s_mean))
+        mean_smean = (sum(smean_values) / len(smean_values)) if smean_values else None
+        return {
+            "min_sem_count": min_sem_count,
+            "token_count": total,
+            "smean_available_count": len(smean_values),
+            "smean_missing_count": total - len(smean_values),
+            "mean_smean": mean_smean,
+        }
+
     # Return token nodes with semantic nodes that have descriptions.
     def inspect_described_sem_token_nodes(self, max_sentences_per_sem=3):
         result = {}
@@ -6309,6 +6349,7 @@ class LiteSemRAG:
             result[token_node.token_text] = {
                 "token_node_id": token_node.token_node_id,
                 "sem_count": len(described_sem_nodes),
+                "s_mean": getattr(token_node, "s_mean", None),
                 "sem_nodes": [],
             }
 
@@ -6371,6 +6412,7 @@ class LiteSemRAG:
             selected_data[token_text] = {
                 "token_node_id": token_info["token_node_id"],
                 "sem_count": token_info["sem_count"],
+                "s_mean": token_info.get("s_mean"),
                 "displayed_sem_count": len(sem_nodes),
                 "total_chunk_count": sum(sem_info["chunk_count"] for sem_info in token_info["sem_nodes"]),
                 "sem_nodes": sem_nodes,
@@ -6409,13 +6451,42 @@ class LiteSemRAG:
         return limited_data
 
     # Format semantic-node inspection results as plain text.
+    # Render the s_mean aggregate as a one-line plain-text summary.
+    def _format_multi_sem_smean_summary_text(self, smean_stats):
+        mean_smean = smean_stats.get("mean_smean")
+        mean_text = f"{mean_smean:.4f}" if mean_smean is not None else "N/A"
+        return (
+            f"[s_mean summary] token nodes with >= {smean_stats['min_sem_count']} sem nodes: "
+            f"{smean_stats['token_count']} | mean s_mean = {mean_text} "
+            f"(over {smean_stats['smean_available_count']} with s_mean, "
+            f"{smean_stats['smean_missing_count']} missing)"
+        )
+
+    # Render the s_mean aggregate as an HTML summary box.
+    def _build_multi_sem_smean_summary_html(self, smean_stats):
+        mean_smean = smean_stats.get("mean_smean")
+        mean_text = f"{mean_smean:.4f}" if mean_smean is not None else "N/A"
+        return (
+            "<div style='font-family:Arial, sans-serif; margin-bottom:12px; padding:10px 12px; "
+            "background:#eef7ee; border:1px solid #cfe3cf; border-radius:8px;'>"
+            f"<strong>s_mean summary</strong> — token nodes with &ge; {smean_stats['min_sem_count']} sem nodes: "
+            f"<strong>{smean_stats['token_count']}</strong> | "
+            f"mean s_mean = <strong>{escape(mean_text)}</strong> "
+            f"<span style='color:#666;'>(over {smean_stats['smean_available_count']} with s_mean, "
+            f"{smean_stats['smean_missing_count']} missing)</span>"
+            "</div>"
+        )
+
     def _format_multi_sem_token_nodes_text(self, inspect_data):
         lines = []
 
         for token_text, token_info in inspect_data.items():
+            s_mean = token_info.get("s_mean")
+            s_mean_text = f"{s_mean:.4f}" if s_mean is not None else "N/A"
             lines.append(
                 f"[Token] {token_text} | token_node_id={token_info['token_node_id']} | "
                 f"sem_count={token_info['sem_count']} | "
+                f"s_mean={s_mean_text} | "
                 f"displayed_sem_count={token_info['displayed_sem_count']} | "
                 f"total_chunk_count={token_info['total_chunk_count']} | "
                 f"displayed_example_count={token_info.get('displayed_example_count', 'all')}"
@@ -6456,10 +6527,13 @@ class LiteSemRAG:
             token_header = (
                 f"{escape(token_text)}"
             )
+            s_mean = token_info.get("s_mean")
+            s_mean_text = f"{s_mean:.4f}" if s_mean is not None else "N/A"
             token_meta = (
                 f"<span style='color:#666;'>"
                 f"token_node_id={token_info['token_node_id']} | "
                 f"sem_count={token_info['sem_count']}, "
+                f"s_mean={s_mean_text}, "
                 f"displayed_sem_count={token_info['displayed_sem_count']}, "
                 f"total_chunk_count={token_info['total_chunk_count']}, "
                 f"displayed_example_count={token_info.get('displayed_example_count', 'all')}"
@@ -6533,6 +6607,10 @@ class LiteSemRAG:
             max_examples_per_token=max_examples_per_token,
         )
 
+        # 在全图(不受 token_contains / max_token_nodes 截断影响)上统计 >= min_sem_count
+        # 的 token 的 s_mean 平均值,作为汇总信息展示。
+        smean_stats = self.compute_multi_sem_smean_stats(min_sem_count=min_sem_count)
+
         if not inspect_data:
             empty_text = "No token nodes matched the multi-semantic condition."
             if as_html:
@@ -6546,11 +6624,16 @@ class LiteSemRAG:
         if as_html:
             try:
                 from IPython.display import HTML
-                return HTML(self._build_multi_sem_token_nodes_html(inspect_data, open_details=open_details))
+                return HTML(
+                    self._build_multi_sem_smean_summary_html(smean_stats)
+                    + self._build_multi_sem_token_nodes_html(inspect_data, open_details=open_details)
+                )
             except ImportError:
                 pass
 
-        return self._format_multi_sem_token_nodes_text(inspect_data)
+        summary_text = self._format_multi_sem_smean_summary_text(smean_stats)
+        body_text = self._format_multi_sem_token_nodes_text(inspect_data)
+        return f"{summary_text}\n\n{body_text}" if summary_text else body_text
 
     # Display token nodes whose semantic nodes have descriptions.
     def show_described_sem_token_nodes(
