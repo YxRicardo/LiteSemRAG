@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import traceback
+from bisect import bisect_right
 from html import escape
 from collections import Counter, defaultdict
 from itertools import combinations
@@ -59,7 +60,7 @@ from utils import (
     sem_embed_sim,
 )
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 # Anchor 传播分配法的默认数值超参(对齐
 # jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb)。只有少数核心项
@@ -159,6 +160,18 @@ COMPOSITIONAL_QUERY_ROLE_WEIGHT = {
     "modifier": 0.2,
 }
 
+# Chunk-level bounded co-occurrence boosting (chunk_cooccur_query) defaults.
+# 每个 chunk 只取 top-k pair boost 求平均;ChunkScore = BaseEvidence * (1 + λ * PairBoost)。
+COOCCUR_TOP_K_PAIR_BOOSTS = 3
+COOCCUR_LAMBDA = 0.3
+# local_evidence_level:目前没有句子边界数据,统一按 same chunk = 0.4。
+# phrase/modifier=1.0、same sentence=0.7 两档保留常量,后续若接入句子/短语关系再启用。
+COOCCUR_LOCAL_EVIDENCE = {
+    "phrase": 1.0,
+    "sentence": 0.7,
+    "chunk": 0.4,
+}
+
 # Recursion limit used while pickling the deeply linked node graph.
 DEEP_PICKLE_RECURSION_LIMIT = 1_000_000
 # Worker-thread stack size (bytes) so a high recursion limit cannot crash the
@@ -229,6 +242,7 @@ class CoOccurrenceGraph:
         self.weighted_chunk_node_list = []
         self.ranked_sem_node_list = []
         self.ranked_chunk_BM25 = []
+        self.pair_edge_weight = {}
 
     # Build weighted co-occurrence links between semantic nodes that share chunks.
     def build_edges(self):
@@ -358,6 +372,73 @@ class CoOccurrenceGraph:
             print(token_weight_map)
             print(weight_map)
             print(self.weighted_chunk_node_list)
+    # Chunk-level bounded boosting: compute global edge strengths WITHOUT mutating node_weight.
+    #
+    # Unlike build_edges(), this never folds edge weight into node_weight; it only returns a
+    # lookup of normalized-overlap weights keyed by the unordered pair of semantic-node ids.
+    def build_pair_edges(self):
+        self.pair_edge_weight = {}
+        for node_a, node_b in combinations(self.node_list, 2):
+            if node_a.sem_node is node_b.sem_node:
+                continue
+            weight = get_COG_edge_weight(node_a.sem_node, node_b.sem_node)
+            if weight <= 0:
+                continue
+            key = frozenset((id(node_a.sem_node), id(node_b.sem_node)))
+            if weight > self.pair_edge_weight.get(key, 0):
+                self.pair_edge_weight[key] = weight
+        return self.pair_edge_weight
+
+    # Chunk-level bounded boosting: BaseEvidence(c) for every candidate chunk.
+    #
+    # Each node contributes node_level_weight * BM25[c] (role/level weight, NOT edge weight),
+    # reusing the existing phrase/head/modifier grouped aggregation. Computed over ALL nodes
+    # (connected + isolated), so isolated chunks with strong base evidence still rank.
+    def assign_base_evidence(self):
+        weight_map = {}
+        token_record_map = defaultdict(set)
+        token_weight_map = {}
+        grouped_nodes = []
+
+        for node in self.node_list:
+            node.node_weight = node.node_level_weight
+
+        for node in self.node_list:
+            if node.query_group_id is not None:
+                grouped_nodes.append(node)
+                continue
+            for chunk_node in node.sem_node.chunk_node_list:
+                chunk_node_id = chunk_node.chunk_node_id
+                token_text = node.sem_node.token_node.token_text
+                if token_text in token_record_map[chunk_node_id]:
+                    continue
+                bm25_score = node.node_weight * node.sem_node.BM25[chunk_node_id]
+                weight_map[chunk_node_id] = weight_map.get(chunk_node_id, 0) + bm25_score
+                token_weight_map.setdefault(chunk_node_id, []).append(
+                    f"Token:{token_text},Score:{bm25_score:.4f}"
+                )
+                token_record_map[chunk_node_id].add(token_text)
+
+        self._assign_grouped_chunk_weight(grouped_nodes, weight_map, token_weight_map)
+        return weight_map, token_weight_map
+
+    # Chunk-level bounded boosting: map each chunk id to the matched nodes appearing in it.
+    #
+    # Nodes are deduplicated per chunk by semantic-node identity, so head/modifier members of a
+    # query phrase are kept as distinct nodes (BaseEvidence phrase dedup does NOT apply here).
+    def nodes_by_chunk(self):
+        chunk_to_nodes = defaultdict(list)
+        seen_sem_ids = defaultdict(set)
+        for node in self.node_list:
+            sem_id = id(node.sem_node)
+            for chunk_node in node.sem_node.chunk_node_list:
+                chunk_node_id = chunk_node.chunk_node_id
+                if sem_id in seen_sem_ids[chunk_node_id]:
+                    continue
+                seen_sem_ids[chunk_node_id].add(sem_id)
+                chunk_to_nodes[chunk_node_id].append(node)
+        return chunk_to_nodes
+
     # Rank chunks within each semantic node level using accumulated BM25 scores.
     def rank_chunk_by_BM25(self):
         self.rank_sem_node_by_level()
@@ -446,6 +527,8 @@ class ChunkNode:
     sem_node_list: list = field(default_factory=list)
     length_norm: float = 0
     num_tokens: int | None = None
+    # schema 7: sorted sentence-end char offsets (spaCy sent.end_char), aligned with chunk_text.
+    sentence_boundaries: list | None = None
 
 @dataclass
 class TokenNode:
@@ -480,6 +563,16 @@ class TokenNode:
         self.descriptions = None
         self.wikidata_info_loaded = None
 
+# Map a span's start offset to the index of its chunk sentence using precomputed
+# sentence boundaries (schema 7). Returns None when boundaries or the offset are absent.
+def sentence_id_for_span(chunk_node, span_start):
+    if span_start is None or chunk_node is None:
+        return None
+    boundaries = getattr(chunk_node, "sentence_boundaries", None)
+    if not boundaries:
+        return None
+    return bisect_right(boundaries, span_start)
+
 @dataclass
 class TextEmbedding:
     embed: object
@@ -496,6 +589,8 @@ class TextEmbedding:
     modifier_texts_norm: list = field(default_factory=list)
     modifier_spans: list = field(default_factory=list)
     atomic_modifier_spans: list = field(default_factory=list)
+    # schema 7: index-time sentence index of this span within its chunk (None if unknown).
+    sentence_id: int | None = None
 
     # Convert a retained text embedding into a span occurrence record.
     def to_span_occurrence(self):
@@ -506,6 +601,9 @@ class TextEmbedding:
             and self.span_end is not None
         ):
             span_text = self.chunk_node.chunk_text[self.span_start:self.span_end]
+        sentence_id = self.sentence_id
+        if sentence_id is None:
+            sentence_id = sentence_id_for_span(self.chunk_node, self.span_start)
         return SpanOccurrence(
             chunk_node=self.chunk_node,
             span_start=self.span_start,
@@ -520,6 +618,7 @@ class TextEmbedding:
             modifier_texts_norm=list(self.modifier_texts_norm or []),
             modifier_spans=list(self.modifier_spans or []),
             atomic_modifier_spans=list(self.atomic_modifier_spans or []),
+            sentence_id=sentence_id,
         )
 
 @dataclass
@@ -537,6 +636,8 @@ class SpanOccurrence:
     modifier_texts_norm: list = field(default_factory=list)
     modifier_spans: list = field(default_factory=list)
     atomic_modifier_spans: list = field(default_factory=list)
+    # schema 7: index-time sentence index of this span within its chunk (None if unknown).
+    sentence_id: int | None = None
 
     # Return the span boundaries when both endpoints are available.
     def get_span_tuple(self):
@@ -588,6 +689,7 @@ class SemNode:
                 modifier_texts_norm=list(getattr(span_occurrence, "modifier_texts_norm", []) or []),
                 modifier_spans=list(getattr(span_occurrence, "modifier_spans", []) or []),
                 atomic_modifier_spans=list(getattr(span_occurrence, "atomic_modifier_spans", []) or []),
+                sentence_id=getattr(span_occurrence, "sentence_id", None),
             )
         )
         if edge_weight is not None:
@@ -1025,11 +1127,12 @@ class LiteSemRAG:
         return new_doc_node
 
     # Create and register a chunk node under a document node.
-    def create_chunk_node(self, chunk_text, doc_node, num_tokens=None):
+    def create_chunk_node(self, chunk_text, doc_node, num_tokens=None, sentence_boundaries=None):
         new_chunk_node = ChunkNode(chunk_text, self._new_node_id("chunk"), doc_node)
         if num_tokens is None:
             num_tokens = get_num_tokens(chunk_text, self.nlp)
         new_chunk_node.num_tokens = num_tokens
+        new_chunk_node.sentence_boundaries = sentence_boundaries
         self.chunk_nodes.append(new_chunk_node)
         doc_node.chunk_node_list.append(new_chunk_node)
         return new_chunk_node
@@ -1810,6 +1913,9 @@ class LiteSemRAG:
         for chunk_node in getattr(self, "chunk_nodes", []):
             if not hasattr(chunk_node, "sem_node_list") and hasattr(chunk_node, "proto_node_list"):
                 chunk_node.sem_node_list = chunk_node.proto_node_list
+            # schema 7: precomputed sentence boundaries; absent on older pickles.
+            if not hasattr(chunk_node, "sentence_boundaries"):
+                chunk_node.sentence_boundaries = None
         for sem_node in getattr(self, "sem_nodes", []):
             self._ensure_sem_node_backward_compatible_attrs(sem_node)
             for text_embedding in sem_node.retained_text_embeddings:
@@ -1844,6 +1950,10 @@ class LiteSemRAG:
             occurrence.modifier_spans = []
         if not hasattr(occurrence, "atomic_modifier_spans"):
             occurrence.atomic_modifier_spans = []
+        # schema 7: index-time sentence index; None on older pickles triggers the
+        # query-time char-offset fallback in _nodes_share_sentence.
+        if not hasattr(occurrence, "sentence_id"):
+            occurrence.sentence_id = None
 
     # Populate missing token fields introduced after older saved graph versions.
     def _ensure_token_node_backward_compatible_attrs(self, token_node):
@@ -2617,14 +2727,11 @@ class LiteSemRAG:
 
         return rerank_chunks, rerank_chunk_ids
 
-    # Retrieve chunks using exact, fuzzy, and semantic matches organized by match level.
-    def multi_level_query(self, query_text, top_k_chunk=10, top_k_each_isolated_chunk=2, isolate_chunk_ratio=0.2, isolate_retrieve_mode='sequential',print_important_tokens=True, search_mode='broad'):
-        query_text, query_tokens, resolved_matches = self._resolve_query_matches(
-            query_text,
-            search_mode=search_mode,
-            print_important_tokens=print_important_tokens,
-            expand_compositional=True,
-        )
+    # Build the co-occurrence node infos (low/high level sem-info tuples) from resolved matches.
+    #
+    # Shared by multi_level_query (legacy) and chunk_cooccur_query. Returns the low-level and
+    # high-level sem-info lists plus token-debug lists; optionally prints the token breakdown.
+    def _collect_query_cooccurrence_sems(self, resolved_matches, search_mode, print_important_tokens):
         query_tokens = []
         low_level_tokens = []
         high_level_tokens = []
@@ -2692,6 +2799,188 @@ class LiteSemRAG:
             print(f"query tokens: {[text for text in query_tokens]}")
             print(f"low level tokens: {[text for text in low_level_tokens]}")
             print(f"high level tokens: {[text for text in high_level_tokens]}")
+
+        return low_level_sems, high_level_sems
+
+    # Chunk-level bounded co-occurrence boosting query.
+    #
+    # ChunkScore(c) = BaseEvidence(c) * (1 + λ * PairBoost(c)), where PairBoost(c) averages the
+    # top-k pair boosts and a pair boost only fires when a candidate chunk contains BOTH endpoints
+    # of a co-occurrence edge. No connected/isolated quota — every candidate ranks by ChunkScore.
+    #
+    # Returns (chunk_texts, chunk_ids, debug_info) where debug_info is the per-chunk score record.
+    def chunk_cooccur_query(
+        self,
+        query_text,
+        top_k_chunk=10,
+        top_k_pair_boosts=COOCCUR_TOP_K_PAIR_BOOSTS,
+        lambda_boost=COOCCUR_LAMBDA,
+        print_important_tokens=True,
+        search_mode='broad',
+    ):
+        query_text, _, resolved_matches = self._resolve_query_matches(
+            query_text,
+            search_mode=search_mode,
+            print_important_tokens=print_important_tokens,
+            expand_compositional=True,
+        )
+        low_level_sems, high_level_sems = self._collect_query_cooccurrence_sems(
+            resolved_matches, search_mode, print_important_tokens
+        )
+
+        graph = CoOccurrenceGraph(low_level_sems + high_level_sems)
+        pair_edge_weight = graph.build_pair_edges()
+        base_evidence, token_weight_map = graph.assign_base_evidence()
+        chunk_to_nodes = graph.nodes_by_chunk()
+
+        sentence_boundary_cache = {}
+        scored_chunks = []
+        for chunk_node_id, base in base_evidence.items():
+            nodes = chunk_to_nodes.get(chunk_node_id, [])
+            pair_details = []
+            for node_a, node_b in combinations(nodes, 2):
+                key = frozenset((id(node_a.sem_node), id(node_b.sem_node)))
+                global_edge_weight = pair_edge_weight.get(key)
+                if global_edge_weight is None:
+                    continue
+                local_evidence = self._local_evidence_level(
+                    node_a, node_b, chunk_node_id, sentence_boundary_cache
+                )
+                pair_boost = global_edge_weight * local_evidence
+                pair_details.append({
+                    "semantic_node_1": node_a.sem_node.token_node.token_text,
+                    "semantic_node_2": node_b.sem_node.token_node.token_text,
+                    "global_edge_weight": global_edge_weight,
+                    "local_evidence_level": local_evidence,
+                    "pair_boost": pair_boost,
+                })
+
+            pair_details.sort(key=lambda detail: detail["pair_boost"], reverse=True)
+            top_pairs = pair_details[:top_k_pair_boosts]
+            if top_pairs:
+                pair_boost_value = sum(d["pair_boost"] for d in top_pairs) / len(top_pairs)
+            else:
+                pair_boost_value = 0.0
+            final_score = base * (1 + lambda_boost * pair_boost_value)
+            scored_chunks.append({
+                "chunk_id": chunk_node_id,
+                "base_evidence": base,
+                "pair_boost": pair_boost_value,
+                "final_score": final_score,
+                "top_pairs": top_pairs,
+            })
+
+        scored_chunks.sort(key=lambda record: record["final_score"], reverse=True)
+        top_chunks = scored_chunks[:top_k_chunk]
+        retrieved_chunk_ids = [record["chunk_id"] for record in top_chunks]
+
+        if print_important_tokens:
+            print(token_weight_map)
+            for record in top_chunks:
+                print(
+                    f"chunk {record['chunk_id']}: base={record['base_evidence']:.4f}, "
+                    f"pair_boost={record['pair_boost']:.4f}, final={record['final_score']:.4f}, "
+                    f"pairs={record['top_pairs']}"
+                )
+
+        return self.chunk_id2text(retrieved_chunk_ids), retrieved_chunk_ids, top_chunks
+
+    # Chunk-level bounded boosting: local evidence level for a co-occurring node pair.
+    #
+    # Three tiers (highest applicable wins):
+    #   - phrase / modifier relation (1.0): the two nodes were split from the same compositional
+    #     query phrase (shared query_group_id, i.e. head + its modifier), so the query treats them
+    #     as one phrase. Query-side gating, no positional check.
+    #   - same sentence (0.7): both nodes have an occurrence inside the same chunk sentence,
+    #     decided from the stored span char-offsets.
+    #   - same chunk (0.4): they only share the chunk.
+    def _local_evidence_level(self, node_a, node_b, chunk_node_id, sentence_boundary_cache=None):
+        group_a = getattr(node_a, "query_group_id", None)
+        group_b = getattr(node_b, "query_group_id", None)
+        if group_a is not None and group_a == group_b:
+            return COOCCUR_LOCAL_EVIDENCE["phrase"]
+        if sentence_boundary_cache is not None and self._nodes_share_sentence(
+            node_a.sem_node, node_b.sem_node, chunk_node_id, sentence_boundary_cache
+        ):
+            return COOCCUR_LOCAL_EVIDENCE["sentence"]
+        return COOCCUR_LOCAL_EVIDENCE["chunk"]
+
+    # Collect the span occurrences of a sem node within one chunk.
+    def _sem_node_occurrences_in_chunk(self, sem_node, chunk_node_id):
+        occurrences = []
+        for occurrence in getattr(sem_node, "span_occurrences", []) or []:
+            chunk_node = getattr(occurrence, "chunk_node", None)
+            if chunk_node is None or chunk_node.chunk_node_id != chunk_node_id:
+                continue
+            occurrences.append(occurrence)
+        return occurrences
+
+    # Resolve the chunk text for a sem node occurrence in a given chunk.
+    def _chunk_text_for_sem_node(self, sem_node, chunk_node_id):
+        for chunk_node in getattr(sem_node, "chunk_node_list", []) or []:
+            if chunk_node.chunk_node_id == chunk_node_id:
+                return chunk_node.chunk_text
+        return None
+
+    # Sentence-ending punctuation offsets for a chunk, cached by chunk id.
+    def _chunk_sentence_boundaries(self, chunk_text, chunk_node_id, cache):
+        if chunk_node_id in cache:
+            return cache[chunk_node_id]
+        boundaries = [idx for idx, ch in enumerate(chunk_text) if ch in ".!?"]
+        cache[chunk_node_id] = boundaries
+        return boundaries
+
+    # Sentence index of a char position = number of sentence boundaries strictly before it.
+    @staticmethod
+    def _sentence_index_of(position, boundaries):
+        lo, hi = 0, len(boundaries)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if boundaries[mid] < position:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    # True when both sem nodes have an occurrence inside the same chunk sentence.
+    #
+    # Fast path: index-time sentence ids (schema 7) — pure int-set intersection.
+    # Fallback: derive sentence index from span char-offsets via a .!? scan, for old
+    # pickles whose occurrences/chunks predate the precomputed boundaries.
+    def _nodes_share_sentence(self, sem_a, sem_b, chunk_node_id, cache):
+        occ_a = self._sem_node_occurrences_in_chunk(sem_a, chunk_node_id)
+        occ_b = self._sem_node_occurrences_in_chunk(sem_b, chunk_node_id)
+        if not occ_a or not occ_b:
+            return False
+
+        sids_a = {o.sentence_id for o in occ_a if getattr(o, "sentence_id", None) is not None}
+        sids_b = {o.sentence_id for o in occ_b if getattr(o, "sentence_id", None) is not None}
+        if sids_a and sids_b:
+            return bool(sids_a & sids_b)
+
+        chunk_text = self._chunk_text_for_sem_node(sem_a, chunk_node_id)
+        if not chunk_text:
+            return False
+        boundaries = self._chunk_sentence_boundaries(chunk_text, chunk_node_id, cache)
+        starts_a = [o.span_start for o in occ_a if getattr(o, "span_start", None) is not None]
+        starts_b = [o.span_start for o in occ_b if getattr(o, "span_start", None) is not None]
+        if not starts_a or not starts_b:
+            return False
+        sentences_a = {self._sentence_index_of(start, boundaries) for start in starts_a}
+        sentences_b = {self._sentence_index_of(start, boundaries) for start in starts_b}
+        return bool(sentences_a & sentences_b)
+
+    # Retrieve chunks using exact, fuzzy, and semantic matches organized by match level.
+    def multi_level_query(self, query_text, top_k_chunk=10, top_k_each_isolated_chunk=2, isolate_chunk_ratio=0.2, isolate_retrieve_mode='sequential',print_important_tokens=True, search_mode='broad'):
+        query_text, query_tokens, resolved_matches = self._resolve_query_matches(
+            query_text,
+            search_mode=search_mode,
+            print_important_tokens=print_important_tokens,
+            expand_compositional=True,
+        )
+        low_level_sems, high_level_sems = self._collect_query_cooccurrence_sems(
+            resolved_matches, search_mode, print_important_tokens
+        )
 
         co_occurrence_graph = CoOccurrenceGraph(low_level_sems + high_level_sems)
         co_occurrence_graph.build_edges()
@@ -6022,8 +6311,14 @@ class LiteSemRAG:
                     # Parse the chunk with spaCy once and reuse the doc across
                     # chunk-node sizing, span extraction, and phrase routing.
                     spacy_doc = self.nlp(chunk_text)
+                    # schema 7: record spaCy sentence-end offsets so span→sentence
+                    # mapping is precomputed at index time instead of per query.
+                    sentence_boundaries = [sent.end_char for sent in spacy_doc.sents]
                     new_chunk_node = self.create_chunk_node(
-                        chunk_text, new_doc_node, num_tokens=len(spacy_doc)
+                        chunk_text,
+                        new_doc_node,
+                        num_tokens=len(spacy_doc),
+                        sentence_boundaries=sentence_boundaries,
                     )
 
                     if getattr(self, "phrase_audit_enabled", False):
