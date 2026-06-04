@@ -512,6 +512,12 @@ class CoOccurrenceNode:
             self.node_level_weight = CO_OCCURRENCE_NODE_QUERY_WEIGHT[self.node_level]
         else:
             self.node_level_weight = role_weight
+        # Fold the per-match query weight into the effective node weight. This value
+        # is always in (0, 1]: exact matches pass 1.0 (no change); fuzzy matches pass
+        # the phrase coverage ratio (query words / matched-phrase words, <=1 because a
+        # fuzzy hit must contain every query word); semantic fallbacks pass the cosine
+        # similarity. Previously it was stored on the node but never read.
+        self.node_level_weight *= self.node_query_weight
 
 @dataclass
 class DocumentNode:
@@ -2325,6 +2331,10 @@ class LiteSemRAG:
                 )
             )
 
+        # Order contract: phrase/entity units (built above) MUST be appended before these
+        # single-token units. _resolve_query_matches() dedups a phrase's sub-tokens by scanning
+        # tokens_in_phrase as it walks this list in order, so a phrase has to be seen before its
+        # sub-tokens for the dedup to fire. Do not reorder these two loops.
         for token, start_char, end_char in important_tokens:
             if self._query_span_is_covered(start_char, end_char, covered_compositional_spans):
                 continue
@@ -2443,6 +2453,11 @@ class LiteSemRAG:
             expand_compositional=expand_compositional,
         )
         query_tokens = []
+        # The single live phrase/sub-token dedup. tokens_in_phrase is filled when a phrase/entity
+        # is matched (below) and is consulted to skip the phrase's standalone sub-tokens. This
+        # relies on _prepare_query_tokens emitting phrase units before their sub-token units.
+        # Note: only exact (token_node present) phrases register here, so a purely fuzzy phrase
+        # keeps its sub-tokens on purpose (complementary recall) -- see _collect_query_cooccurrence_sems.
         tokens_in_phrase = []
         resolved_matches = []
 
@@ -2715,13 +2730,17 @@ class LiteSemRAG:
     #
     # Shared by multi_level_query (legacy) and chunk_cooccur_query. Returns the low-level and
     # high-level sem-info lists plus token-debug lists; optionally prints the token breakdown.
-    def _collect_query_cooccurrence_sems(self, resolved_matches, search_mode, print_important_tokens):
+    #
+    # Phrase/sub-token dedup is NOT repeated here: _resolve_query_matches() already drops the
+    # sub-tokens of an exactly-matched phrase before they reach resolved_matches. A phrase that
+    # only matched fuzzily is resolved against a different (longer) sem node than its sub-tokens,
+    # so those sub-tokens are deliberately kept as complementary recall signals.
+    def _collect_query_cooccurrence_sems(self, resolved_matches, print_important_tokens):
         query_tokens = []
         low_level_tokens = []
         high_level_tokens = []
         low_level_sems = []
         high_level_sems = []
-        tokens_in_phrase = []
 
         def make_sem_info(sem_node, node_level, node_query_weight, match):
             if match.get("query_group_id") is None:
@@ -2740,8 +2759,6 @@ class LiteSemRAG:
         for match in resolved_matches:
             token_type = match["token_type"]
             token = match["token"]
-            if match.get("query_group_id") is None and token_type == "token" and token in tokens_in_phrase:
-                continue
             query_tokens.append(token)
             exact_match = match["exact_sem_node"] is not None
             fuzzy_match = len(match["fuzzy_sem_nodes"]) > 0
@@ -2752,8 +2769,6 @@ class LiteSemRAG:
                     low_level_sems.append(make_sem_info(max_sem_node, 0, 1, match))
                 else:
                     low_level_sems.append(make_sem_info(max_sem_node, 1, 1, match))
-                if (token_type == 'phrase' or token_type == 'ent') and search_mode != 'broad':
-                    tokens_in_phrase.extend(token.split(" "))
             if fuzzy_match:
                 for sem_node in match["fuzzy_sem_nodes"][:1]:
                     weight = count_words(token) / count_words(sem_node.token_node.token_text)
@@ -2809,7 +2824,7 @@ class LiteSemRAG:
             expand_compositional=True,
         )
         low_level_sems, high_level_sems = self._collect_query_cooccurrence_sems(
-            resolved_matches, search_mode, print_important_tokens
+            resolved_matches, print_important_tokens
         )
 
         graph = CoOccurrenceGraph(low_level_sems + high_level_sems)
@@ -2963,7 +2978,7 @@ class LiteSemRAG:
             expand_compositional=True,
         )
         low_level_sems, high_level_sems = self._collect_query_cooccurrence_sems(
-            resolved_matches, search_mode, print_important_tokens
+            resolved_matches, print_important_tokens
         )
 
         co_occurrence_graph = CoOccurrenceGraph(low_level_sems + high_level_sems)
