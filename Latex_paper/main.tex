@@ -20,7 +20,7 @@
 
 \begin{abstract}
 
-Graph-based Retrieval-Augmented Generation (RAG) has shown great potential for improving multi-level reasoning and structured evidence aggregation. However, existing graph-based RAG frameworks often rely heavily on large language models (LLMs) during indexing and querying, leading to high token consumption, computational cost, and latency overhead. In this paper, we propose \textbf{LiteSemRAG}, a lightweight and LLM-frugal semantic-aware graph retrieval framework. LiteSemRAG constructs a heterogeneous semantic graph by exploiting contextual token-level embeddings, explicitly separating surface lexical representations from context-dependent semantic meanings. The index further introduces phrase-aware span routing, which preserves lexicalized multiword expressions and named entities as complete lexical units while representing compositional noun phrases as coupled phrase--head--modifier structures. This design keeps the full phrase as surface evidence, creates a semantic head route for compositional aggregation, and retains modifiers as occurrence-level constraints. To robustly model polysemy, we introduce an anchor-guided semantic assignment mechanism for index-time semantic node construction. Once a span satisfies the S-mean dispersion criterion, LiteSemRAG retrieves all contextual occurrences, selects a small anchor set with farthest-first traversal and random supplementation, labels these anchors against candidate Wikidata meanings, and propagates the anchor labels over a mutual-kNN occurrence graph. The propagation uses cross-encoder margin scores as veto evidence: confident cross-encoder decisions block unreliable neighbor overrides, while low-margin cases can still be corrected by graph propagation. Remaining unresolved occurrences are assigned by cross-encoder fallback. When LLM assistance is used, it is restricted to sparse anchor labeling or semantic-preparation steps rather than repeated online graph construction or query-time reasoning. At query stage, LiteSemRAG applies the same phrase analysis to queries and performs group-aware semantic matching over full phrases, semantic heads, and modifiers before co-occurrence graph ranking and isolated semantic recovery. We evaluate LiteSemRAG on three benchmark datasets and experimental results show that LiteSemRAG achieves the best mean reciprocal rank (MRR@10) across all datasets and competitive or superior recall rate (Recall@10) compared to state-of-the-art LLM-based graph RAG systems. Meanwhile, LiteSemRAG uses far fewer LLM tokens and achieves strong efficiency improvements in both indexing and querying by minimizing dependence on generative LLM calls. These results demonstrate the effectiveness of LiteSemRAG, indicating that a strong semantic-aware graph retrieval framework can be achieved with only limited and targeted LLM use.
+Graph-based Retrieval-Augmented Generation (RAG) improves structured evidence aggregation, but many graph-based RAG frameworks rely on large language models (LLMs) during indexing and querying, causing high token cost and latency. We propose \textbf{LiteSemRAG}, a lightweight semantic-aware graph retrieval framework that minimizes generative LLM use. LiteSemRAG builds a heterogeneous semantic graph from contextual token-level embeddings, separating surface lexical anchors from context-dependent semantic nodes to model polysemy. The index further uses phrase-aware routing: lexicalized expressions are preserved as complete units, while compositional phrases are represented through phrase--head--modifier structures. To construct interpretable semantic nodes, LiteSemRAG applies anchor-guided semantic assignment, using sparse representative occurrences, mutual-kNN propagation, cross-encoder margin veto, and fallback scoring to assign contextual meanings without repeated LLM-centered graph construction. At query time, LiteSemRAG mirrors the phrase-aware index structure, resolves query units through exact, partial, and embedding-based semantic matching, and ranks chunks by combining direct semantic evidence with bounded local co-occurrence support. Experiments on three benchmarks show that LiteSemRAG achieves the best MRR@10 across all datasets and competitive or superior Recall@10 compared with state-of-the-art LLM-based graph RAG systems, while substantially reducing indexing and query cost.
 
 \end{abstract}
 
@@ -31,7 +31,7 @@ Retrieval-Augmented Generation, Graph-Based Retrieval, Heterogeneous Graph
 \section{Introduction}
 Retrieval-Augmented Generation (RAG) \cite{lewis2020retrieval,borgeaud2022improving,izacard2021leveraging,zhao2026retrieval} has become a fundamental paradigm for improving factual grounding and knowledge integration in large language models (LLMs) \cite{brown2020language,devlin2019bert}.  By augmenting generation with retrieval over external corpora, RAG systems can improve factuality, adaptability, and domain generalization in knowledge-intensive tasks \cite{guu2020retrieval}. Therefore, the quality and efficiency of the retrieval component have become critical factors in RAG systems. Early RAG systems mainly rely on flat chunk-level retrieval using dense or sparse representations~\cite{karpukhin2020dense,khattab2020colbert}. However, RAG systems with flat chunk-level retrieval often struggle with document structure, semantic variation, and multi-hop evidence dependencies. To address these limitations, recent work has introduced structure-aware and graph-based retrieval frameworks \cite{sarthi2024raptor,gutierrez2024hipporag,edge2024local,guo2024lightrag}. They construct hierarchical or graph-based index structures to enable multi-level reasoning and structured evidence aggregation. These approaches demonstrate that structured indexing can substantially improve retrieval effectiveness, particularly in complex reasoning scenarios. However, many existing graph-based RAG frameworks heavily rely on LLMs during both indexing and querying. Although LLMs provide powerful capabilities for semantic extraction, summarization, and reasoning, utilization of LLMs also introduces substantial computational overhead, high token consumption, latency variability, and sensitivity to the specific underlying model. These factors can significantly limit the practicality of such systems in resource-constrained or large-scale scenarios. NoLLMRAG~\cite{yunollmrag} first attempts to eliminate LLM dependence in graph-based RAG. However, it only relies on surface-level lexical and static statistical structures, which limits contextual and semantic understanding.
 
-In this paper, we propose \textbf{LiteSemRAG}, a lightweight and LLM-frugal semantic-aware graph retrieval framework. Unlike existing graph-based RAG frameworks that depend on repeated LLM calls for semantic extraction and reasoning, LiteSemRAG demonstrates that strong semantic-aware retrieval can be achieved with a mostly encoder-driven semantic graph construction pipeline, significantly reducing cost and improving scalability. LiteSemRAG constructs a heterogeneous semantic graph directly by exploiting contextual span-level embeddings. The heterogeneous semantic graph explicitly separates surface lexical representations (token nodes) from context-dependent semantic meanings (semantic nodes), enabling dynamic modeling of polysemy while avoiding LLM-centered graph construction. The index also distinguishes between lexicalized phrases and compositional phrases before semantic-node construction. Lexicalized expressions such as \emph{machine learning}, \emph{New York}, and \emph{White House} are indexed as complete phrase nodes. Compositional phrases such as \emph{American director} are represented as coupled phrase--head--modifier structures: the complete phrase is preserved as surface evidence, the semantic head \emph{director} provides an aggregation route, and \emph{American} is retained as a modifier constraint. This design reduces spurious phrase fragmentation while avoiding the loss of phrase-level evidence. To enhance robustness, LiteSemRAG uses an anchor-guided semantic assignment mechanism for lexical anchors whose contextual embeddings indicate possible polysemy. The index pipeline follows the \texttt{Anchor-E-mutual [ce\_fallback]} strategy: it samples a small anchor set with farthest-first traversal and random coverage, propagates anchor labels over a mutual-kNN occurrence graph, uses cross-encoder margins to veto unreliable neighbor overrides, and resolves remaining uncertain occurrences with cross-encoder fallback. Optional LLM assistance can be used for sparse anchor labeling or semantic-label preparation, but it is not used as the main mechanism for graph extraction, graph reasoning, or query-time retrieval. At query stage, LiteSemRAG mirrors the phrase-aware index structure. A compositional query is expanded into a group of full-phrase, head, and modifier semantic units, and the co-occurrence graph ranks chunks with group-aware contribution rules that avoid double counting while rewarding phrase/head/modifier agreement. Then an isolated semantic recovery mechanism recovers semantically relevant but structurally unsupported evidence. This design allows LiteSemRAG to preserve both structural reasoning and semantic coverage while maintaining computational efficiency.
+In this paper, we propose \textbf{LiteSemRAG}, a lightweight and LLM-frugal semantic-aware graph retrieval framework. Unlike existing graph-based RAG frameworks that depend on repeated LLM calls for semantic extraction and reasoning, LiteSemRAG demonstrates that strong semantic-aware retrieval can be achieved with a mostly encoder-driven semantic graph construction pipeline, significantly reducing cost and improving scalability. LiteSemRAG constructs a heterogeneous semantic graph directly by exploiting contextual span-level embeddings. The heterogeneous semantic graph explicitly separates surface lexical representations (token nodes) from context-dependent semantic meanings (semantic nodes), enabling dynamic modeling of polysemy while avoiding LLM-centered graph construction. The index also distinguishes between lexicalized phrases and compositional phrases before semantic-node construction. Lexicalized expressions such as \emph{machine learning}, \emph{New York}, and \emph{White House} are indexed as complete phrase nodes. Compositional phrases such as \emph{American director} are represented as coupled phrase--head--modifier structures: the complete phrase is preserved as surface evidence, the semantic head \emph{director} provides an aggregation route, and \emph{American} is retained as a modifier constraint. This design reduces spurious phrase fragmentation while avoiding the loss of phrase-level evidence. To enhance robustness, LiteSemRAG uses an anchor-guided semantic assignment mechanism for lexical anchors whose contextual embeddings indicate possible polysemy. The assignment process samples a small anchor set with farthest-first traversal and random coverage, propagates anchor labels over a mutual-kNN occurrence graph, uses cross-encoder margins to veto unreliable neighbor overrides, and resolves remaining uncertain occurrences with cross-encoder fallback. Optional LLM assistance can be used for sparse anchor labeling or semantic-label preparation, but it is not used as the main mechanism for graph extraction, graph reasoning, or query-time retrieval. At query stage, LiteSemRAG mirrors the phrase-aware index structure. A compositional query is expanded into a group of full-phrase, head, and modifier semantic units; exact, partial, and embedding-based matches select semantic nodes; and chunks are ranked by combining direct semantic evidence with bounded pairwise co-occurrence support. This design preserves phrase-level precision, head-level semantic aggregation, and modifier constraints while keeping retrieval a deterministic encoder-driven process.
 We evaluate LiteSemRAG on three widely used benchmarks: HotpotQA, SciFact, and FEVER. Experimental results show that LiteSemRAG achieves the best MRR@10 across all
 datasets and competitive or superior Recall@10 to two state-of-the-art LLM-based graph RAG systems. This design makes LiteSemRAG particularly suitable for large-scale retrieval systems where LLM-based indexing introduces prohibitive computational and monetary costs.
 The contributions of this paper are summarized as follows:
@@ -39,7 +39,7 @@ The contributions of this paper are summarized as follows:
     \item We propose a lightweight and LLM-frugal semantic-aware graph retrieval framework that explicitly models token polysemy through contextual embeddings.
     \item We introduce a phrase-aware index routing mechanism that preserves lexicalized phrases as complete semantic units and represents compositional phrases through coupled phrase--head--modifier structures.
     \item We introduce dynamic semantic node construction with anchor-guided semantic assignment, combining farthest-first anchor sampling, mutual-kNN label propagation, cross-encoder margin veto, and cross-encoder fallback to robustly derive interpretable semantic nodes from contextual span embeddings.
-    \item We design a group-aware two-step semantic retrieval strategy that combines composition-aware semantic matching, co-occurrence graph ranking, and isolated semantic recovery.
+    \item We design a group-aware semantic co-occurrence retrieval strategy that combines composition-aware semantic matching, direct semantic evidence, and bounded pairwise chunk support.
     \item We demonstrate that LiteSemRAG achieves competitive or superior retrieval performance compared to LLM-based graph RAG systems while significantly improving efficiency through minimal dependence on generative LLM calls.
 \end{itemize}
 
@@ -58,11 +58,11 @@ Recent work has explored structured retrieval to better support long-context rea
 static statistical structures, which can significantly limit its effectiveness in complex or multi-hop scenarios.
 
 \section{Approach}
-LiteSemRAG is a lightweight semantic retrieval framework that constructs a heterogeneous semantic graph to preserve contextual semantic meaning while minimizing dependence on generative LLM calls. The framework consists of two main components: \textbf{Heterogeneous Semantic Graph Index}, where semantic-aware structures are derived primarily from contextual token-level embeddings, and \textbf{Two-step Semantic-aware Retrieval}, where retrieval is performed through a two-step co-occurrence graph-based semantic reasoning process. Figure~\ref{query} illustrates the workflow of the two-step semantic-aware retrieval. It consists of two stages: \emph{Co-occurrence Graph Semantic Retrieval}, which captures semantic relationships through a semantic co-occurrence graph, and \emph{Isolated Semantic Recovery}, which recovers semantically relevant information that may be missed in the first stage. The ranked chunks retrieved from these two stages are then combined to produce the final results. Chunks obtained from Co-occurrence Graph Semantic Retrieval are prioritized over those from Isolated Semantic Recovery in the final ranking, while a user-defined hyperparameter controls the proportion of chunks selected from each stage.
+LiteSemRAG is a lightweight semantic retrieval framework that constructs a heterogeneous semantic graph to preserve contextual semantic meaning while minimizing dependence on generative LLM calls. The framework consists of two main components: \textbf{Heterogeneous Semantic Graph Index}, where semantic-aware structures are derived primarily from contextual token-level embeddings, and \textbf{Semantic Co-occurrence Retrieval}, where query spans are matched to semantic nodes and chunks are ranked by a unified evidence score. Figure~\ref{query} illustrates the query workflow. LiteSemRAG first analyzes the query with the same phrase-aware representation used during indexing, resolves each query unit to exact, partial, or embedding-based semantic-node matches, and then ranks candidate chunks by combining direct semantic evidence with bounded pairwise co-occurrence support. This design gives every matched semantic node a direct retrieval path while using co-occurrence evidence as a controlled boost rather than as a hard filtering stage.
 \begin{figure}[htb]
     \centering
     \includegraphics[width=1\linewidth]{query.jpg}
-    \caption{Overview of the two-step semantic-aware retrieval process}
+    \caption{Overview of the semantic co-occurrence retrieval process}
     \label{query}
 \end{figure}
 \subsection{Graph Structure}
@@ -94,11 +94,7 @@ Multiword phrases are not uniformly suitable as independent semantic units. Some
 
 For compositional phrases, LiteSemRAG creates a phrase--head relation rather than treating the full phrase as an isolated unit. For example, \emph{American director} is represented by the complete surface phrase \emph{American director}, the semantic head \emph{director}, and the modifier \emph{American}. The full phrase preserves exact surface evidence, while the head allows semantically related occurrences such as \emph{French director} and \emph{American director} to share an aggregation route. The modifier is retained as occurrence-level evidence and serves as a query-time constraint. This design prevents the graph from relying exclusively on sparse modifier-head combinations, but it also avoids discarding the original phrase.
 
-Formally, each occurrence can be viewed as containing an indexed lexical anchor, an evidence span, and optional compositional-group metadata:
-\[
-o = (c,\; a,\; z,\; M,\; r,\; g),
-\]
-where $c$ is the chunk, $a$ is the lexical anchor used for semantic discovery or matching, $z$ is the original evidence span, $M$ is the set of modifiers attached to the occurrence, $r$ is the role of the occurrence within a compositional group, and $g$ identifies the group. For lexicalized expressions, $a$ and $z$ are the same phrase and no compositional group is required. For compositional phrases, the full phrase and the head form related anchors under the same group, while modifiers are retained as constraints on the occurrence. This representation allows semantic-node construction to operate on compact lexical anchors while preserving phrase-level evidence for interpretation and modifier-aware retrieval.
+Formally, each occurrence can be viewed as containing an indexed lexical anchor, an evidence span, and optional compositional-group metadata $o = (c,\; a,\; z,\; M,\; r,\; g)$, where $c$ is the chunk, $a$ is the lexical anchor used for semantic discovery or matching, $z$ is the original evidence span, $M$ is the set of modifiers attached to the occurrence, $r$ is the role of the occurrence within a compositional group, and $g$ identifies the group. For lexicalized expressions, $a$ and $z$ are the same phrase and no compositional group is required. For compositional phrases, the full phrase and the head form related anchors under the same group, while modifiers are retained as constraints on the occurrence. This representation allows semantic-node construction to operate on compact lexical anchors while preserving phrase-level evidence for interpretation and modifier-aware retrieval.
 
 \subsubsection{Dynamic semantic node creation}
 
@@ -114,25 +110,17 @@ $,
 where $\tau_{\text{idf}}$ and $\tau_{\text{disp}}$ are predefined thresholds. If this condition is not satisfied, the span is treated as single-semantic and one semantic node is created by averaging all contextual span embeddings.
 
 \subsubsection{Anchor-Guided Semantic Assignment.}
-When the S-mean criterion indicates that a span may be polysemous, LiteSemRAG performs anchor-guided semantic assignment rather than committing to geometry-only clustering or exhaustive semantic judgment for every occurrence. The index-time assignment method is \texttt{Anchor-E-mutual [ce\_fallback]}. Its design goal is to use a small number of explicitly judged anchor occurrences to steer label propagation, while using the cross-encoder as a conservative verifier when graph propagation conflicts with a confident semantic judgment. The first step is to select a small anchor set $A_t$ from $O_t$. A fixed fraction of anchors is selected by \emph{farthest-first traversal} (FFT), and the remaining anchors are sampled randomly from the non-selected occurrences. Starting from an initial occurrence, FFT repeatedly selects the occurrence whose embedding has the largest distance to its nearest already selected embedding:
+When the S-mean criterion indicates that a span may be polysemous, LiteSemRAG performs anchor-guided semantic assignment rather than committing to geometry-only clustering or exhaustive semantic judgment for every occurrence. The design goal is to use a small number of explicitly judged anchor occurrences to steer label propagation, while using the cross-encoder as a conservative verifier when graph propagation conflicts with a confident semantic judgment. The first step is to select a small anchor set $A_t$ from $O_t$. A fixed fraction of anchors is selected by \emph{farthest-first traversal} (FFT), and the remaining anchors are sampled randomly from the non-selected occurrences. Starting from an initial occurrence, FFT repeatedly selects the occurrence whose embedding has the largest distance to its nearest already selected embedding:
 \[
 o^* = \arg\max_{o_i \in O_t \setminus A_t} \min_{o_j \in A_t} d(e_i,e_j),
 \]
 where $d(e_i,e_j)=1-\cos(e_i,e_j)$. FFT encourages anchors to cover boundary and minority regions in the embedding space, while random supplementation reduces deterministic sampling bias and gives dense regions a chance to contribute anchors.
 
 \subsubsection{Anchor Labeling and Candidate Meanings.}
-For the routed lexical anchor $t$, LiteSemRAG retrieves candidate meanings $M_t = \{m_1,m_2,\dots,m_r\}$ from Wikidata according to the surface form of the span. Each candidate meaning is represented by its textual description and alias information. For every anchor occurrence $o_i \in A_t$, a semantic judge compares the local occurrence context with each candidate meaning and assigns the best semantic label:
-\[
-y_i = \arg\max_{m \in M_t} f_{P}(o_i,t,m),
-\]
-where $f_{P}(\cdot)$ denotes the score from the selected semantic judge. In the default encoder-only setting, this judge is the cross-encoder used for semantic-description scoring. In the LLM-assisted setting, the same anchor interface can use an LLM-based candidate merge and labeler, but only for the sparse anchor subset. Because candidate meanings are retrieved from an external knowledge source together with explicit textual descriptions, the assigned labels are human-readable sense descriptions rather than opaque cluster IDs. This property allows each generated semantic node to expose a concrete explanation of the meaning it represents.
+For the routed lexical anchor $t$, LiteSemRAG retrieves candidate meanings $M_t = \{m_1,m_2,\dots,m_r\}$ from Wikidata according to the surface form of the span. Each candidate meaning is represented by its textual description and alias information. For every anchor occurrence $o_i \in A_t$, a semantic judge compares the local occurrence context with each candidate meaning and assigns the best semantic label $y_i = \arg\max_{m \in M_t} f_{P}(o_i,t,m)$, where $f_{P}(\cdot)$ denotes the score from the selected semantic judge. In the default encoder-only setting, this judge is the cross-encoder used for semantic-description scoring. In the LLM-assisted setting, the same anchor interface can use an LLM-based candidate merge and labeler, but only for the sparse anchor subset. Because candidate meanings are retrieved from an external knowledge source together with explicit textual descriptions, the assigned labels are human-readable sense descriptions rather than opaque cluster IDs. This property allows each generated semantic node to expose a concrete explanation of the meaning it represents.
 
 \subsubsection{Consensus-Based Early Exit.}
-After anchor labeling, LiteSemRAG first checks whether the anchors already form a strong semantic consensus. Let $n_y$ denote the number of anchors assigned to candidate meaning $y$. If
-\[
-\frac{\max_y n_y}{|A_t|} \geq \tau_{\text{cons}},
-\]
-where $\tau_{\text{cons}}$ is a consensus threshold, LiteSemRAG treats the span as effectively single-semantic in the current corpus and assigns the majority anchor label to all occurrences of $t$. This early-exit rule avoids unnecessary semantic splitting when the anchor evidence indicates that nearly all observed contexts share the same meaning.
+After anchor labeling, LiteSemRAG first checks whether the anchors already form a strong semantic consensus. Let $n_y$ denote the number of anchors assigned to candidate meaning $y$. If $\max_y n_y / |A_t| \geq \tau_{\text{cons}}$, where $\tau_{\text{cons}}$ is a consensus threshold, LiteSemRAG treats the span as effectively single-semantic in the current corpus and assigns the majority anchor label to all occurrences of $t$. This early-exit rule avoids unnecessary semantic splitting when the anchor evidence indicates that nearly all observed contexts share the same meaning.
 
 \subsubsection{Mutual-kNN Label Propagation.}
 If no strong consensus is observed, the span is treated as potentially multi-semantic. LiteSemRAG builds a mutual-kNN graph over the normalized occurrence embeddings. Let $\mathcal{N}_k(i)$ denote the $k$ nearest neighbors of occurrence $o_i$ under cosine distance. An undirected edge is created only when the neighbor relation is reciprocal:
@@ -151,7 +139,7 @@ Propagation proceeds in rounds from the labeled anchors. For an unlabeled occurr
 then $y$ can be propagated when $\rho_u(y)$ exceeds the required vote threshold. This iterative procedure expands anchor labels through locally coherent embedding neighborhoods without invoking a semantic judge for every easy occurrence.
 
 \subsubsection{Cross-Encoder Margin Veto.}
-The \texttt{Anchor-E-mutual [ce\_fallback]} strategy augments mutual-kNN voting with cross-encoder margin evidence. LiteSemRAG computes cross-encoder scores between each occurrence and every retained candidate meaning. Let $y^{\text{CE}}_u$ be the cross-encoder top-1 label for occurrence $o_u$, and let
+LiteSemRAG augments mutual-kNN voting with cross-encoder margin evidence. It computes cross-encoder scores between each occurrence and every retained candidate meaning. Let $y^{\text{CE}}_u$ be the cross-encoder top-1 label for occurrence $o_u$, and let
 \[
 \Delta_u = f_P(o_u,t,y^{\text{CE}}_u) -
 \max_{y \neq y^{\text{CE}}_u} f_P(o_u,t,y)
@@ -159,118 +147,76 @@ The \texttt{Anchor-E-mutual [ce\_fallback]} strategy augments mutual-kNN voting 
 be the top-1 margin. If neighbor voting proposes a label that conflicts with $y^{\text{CE}}_u$, and the cross-encoder margin is high while the proposed label has a substantially lower score, the cross-encoder veto blocks the propagation decision. This prevents a dense local neighborhood from overwriting cases where the semantic judge is strongly confident. Conversely, when the cross-encoder margin is low, the method allows locally consistent neighbor evidence to override the cross-encoder top-1 label. The assignment rule therefore uses graph propagation mainly for ambiguous cases, while preserving confident semantic judgments when the candidate-level evidence is clear.
 
 \subsubsection{Uncertain Cases and Semantic-Node Creation.}
-After propagation stops, some occurrences may remain unlabeled because they have no reliable labeled mutual neighbors, because their vote ratio is too weak, or because the cross-encoder veto blocks their propagated label. In \texttt{Anchor-E-mutual [ce\_fallback]}, these uncertain occurrences are resolved by cross-encoder fallback:
-\[
-y_u = y^{\text{CE}}_u.
-\]
-Thus, anchor propagation is allowed to correct low-confidence or locally inconsistent cross-encoder decisions, but the system still has a deterministic semantic fallback for cases where graph evidence is insufficient. After all occurrences are assigned semantic labels, LiteSemRAG creates one semantic node for each retained meaning. The anchor embedding of semantic node $s_y$ is computed by averaging all contextual embeddings assigned to $y$:
-\[
-e_{s_y} = \frac{1}{|O_y|} \sum_{o_i \in O_y} e_i,
-\]
-where $O_y$ denotes the set of occurrences assigned to meaning $y$. Chunk nodes are then linked to the corresponding semantic nodes according to the occurrence-level assignments, and the original token node remains connected to all of its semantic nodes as a lexical anchor. Because each occurrence retains its evidence span, a semantic edge can still expose the original phrase surface and modifiers even when semantic discovery was performed on a head token. The final graph therefore keeps both compact semantic anchors and phrase-level evidence.
+After propagation stops, some occurrences may remain unlabeled because they have no reliable labeled mutual neighbors, because their vote ratio is too weak, or because the cross-encoder veto blocks their propagated label. These uncertain occurrences are resolved by cross-encoder fallback, i.e., $y_u = y^{\text{CE}}_u$. Thus, anchor propagation is allowed to correct low-confidence or locally inconsistent cross-encoder decisions, but the system still has a deterministic semantic fallback for cases where graph evidence is insufficient. After all occurrences are assigned semantic labels, LiteSemRAG creates one semantic node for each retained meaning. The anchor embedding of semantic node $s_y$ is computed by averaging all contextual embeddings assigned to $y$, $e_{s_y} = |O_y|^{-1} \sum_{o_i \in O_y} e_i$, where $O_y$ denotes the set of occurrences assigned to meaning $y$. Chunk nodes are then linked to the corresponding semantic nodes according to the occurrence-level assignments, and the original token node remains connected to all of its semantic nodes as a lexical anchor. Because each occurrence retains its evidence span, a semantic edge can still expose the original phrase surface and modifiers even when semantic discovery was performed on a head token. The final graph therefore keeps both compact semantic anchors and phrase-level evidence.
 
 \subsubsection{Design Rationale}
-This dynamic semantic node creation process allows LiteSemRAG to: 1) explicitly model polysemy without LLM-centered graph construction, 2) avoid committing semantic-node boundaries to embedding geometry alone, 3) use sparse anchor supervision to correct low-confidence cross-encoder confusions, and 4) maintain robustness by combining mutual-kNN locality with cross-encoder fallback. In particular, \texttt{Anchor-E-mutual [ce\_fallback]} provides a compact speed-accuracy tradeoff. FFT and random sampling expose a small but diverse set of anchors; mutual-kNN propagation limits label spread to reciprocal local neighborhoods; the cross-encoder veto prevents aggressive neighbor overrides; and CE fallback gives every remaining occurrence a semantic assignment. In addition, the retrieval of candidate meanings from an external knowledge base provides explicit textual explanations for semantic labels, allowing each semantic node to be tied to a concrete description rather than an opaque latent group. LiteSemRAG therefore separates surface lexical representation from contextual semantic representation while constructing semantic nodes that are both semantically grounded and interpretable. Token nodes act as lexical anchor points, while semantic nodes capture contextual meanings derived from occurrence-level span embeddings with attached textual semantic explanations, thereby making multi-sense assignments easier to inspect and validate.
+This dynamic semantic node creation process allows LiteSemRAG to: 1) explicitly model polysemy without LLM-centered graph construction, 2) avoid committing semantic-node boundaries to embedding geometry alone, 3) use sparse anchor supervision to correct low-confidence cross-encoder confusions, and 4) maintain robustness by combining mutual-kNN locality with cross-encoder fallback. The resulting assignment strategy provides a compact speed-accuracy tradeoff. FFT and random sampling expose a small but diverse set of anchors; mutual-kNN propagation limits label spread to reciprocal local neighborhoods; the cross-encoder veto prevents aggressive neighbor overrides; and CE fallback gives every remaining occurrence a semantic assignment. In addition, the retrieval of candidate meanings from an external knowledge base provides explicit textual explanations for semantic labels, allowing each semantic node to be tied to a concrete description rather than an opaque latent group. LiteSemRAG therefore separates surface lexical representation from contextual semantic representation while constructing semantic nodes that are both semantically grounded and interpretable. Token nodes act as lexical anchor points, while semantic nodes capture contextual meanings derived from occurrence-level span embeddings with attached textual semantic explanations, thereby making multi-sense assignments easier to inspect and validate.
 
-\subsection{Co-occurrence Graph Semantic Retrieval}
-At query stage, LiteSemRAG first applies the same phrase analysis used during indexing, so that the query representation is aligned with the phrase-aware graph structure. Each resulting query unit $u_q$ is encoded into a contextual semantic embedding $e_q$ using the same token-level text encoder.
+\subsection{Semantic Co-occurrence Retrieval}
+At query stage, LiteSemRAG mirrors the phrase-aware index representation and ranks chunks with a unified semantic evidence score. The goal is to preserve lexical precision for exact phrase evidence, use semantic nodes to handle contextual meaning, and reward chunks where multiple query-relevant meanings provide local support for each other. Given a query, LiteSemRAG first constructs query units, resolves these units to semantic-node candidates, computes direct chunk evidence, and finally applies a bounded co-occurrence boost over semantic-node pairs that appear in the same candidate chunk.
 
 \subsubsection{Composition-Aware Query Unit Construction}
 For lexicalized query spans, the query unit remains the complete surface phrase. For compositional query spans, LiteSemRAG constructs a query group consisting of the full phrase, its semantic head, and its modifier units. For example, the query span \emph{American director} is represented by a full-phrase unit \emph{American director}, a head unit \emph{director}, and a modifier unit \emph{American}. The full phrase preserves exact lexical evidence when such a phrase is present in the index. The head unit supports aggregation over semantically related occurrences that share the same head. The modifier unit provides an auxiliary constraint for distinguishing surface realizations under the same head.
 
-Let a compositional query group be denoted as
-\[
-g_q = (p_q,\; h_q,\; M_q),
-\]
-where $p_q$ is the full phrase, $h_q$ is the semantic head, and $M_q$ is the set of modifier units. Each member of the group is assigned a role weight $\beta_r$, with the full phrase receiving the largest weight, the head receiving an intermediate weight, and modifiers receiving smaller auxiliary weights:
-\[
-\beta_{\text{phrase}} > \beta_{\text{head}} > \beta_{\text{modifier}}.
-\]
-Standalone query tokens whose character spans are already covered by a compositional phrase are not treated as independent query targets. This avoids double counting the same evidence while still allowing the full phrase, head, and modifiers to contribute through the shared group.
+Let a compositional query group be denoted as $g_q = (p_q,\; h_q,\; M_q)$, where $p_q$ is the full phrase, $h_q$ is the semantic head, and $M_q$ is the set of modifier units. Each member of the group is assigned a role weight $\beta_r$, with $\beta_{\text{phrase}} > \beta_{\text{head}} > \beta_{\text{modifier}}$. Standalone query tokens whose character spans are already covered by a compositional phrase are not treated as independent query targets. This avoids double counting the same evidence while still allowing the full phrase, head, and modifiers to contribute through the shared group.
 
 \subsubsection{Multi-Level Semantic Matching}
-For each query unit $u_q$ with embedding $e_q$, LiteSemRAG directly retrieves candidate \textbf{semantic nodes}. Matching is performed at three levels, defined by the textual properties of the corresponding token nodes:
+For each query unit $u_q$ with contextual embedding $e_q$, LiteSemRAG retrieves candidate \textbf{semantic nodes} rather than directly retrieving chunks. Matching is performed through three complementary routes:
 
 \begin{itemize}
-    \item \textbf{Exact match:} Semantic nodes whose associated token node is identical to $u_q$.
+    \item \textbf{Exact match:} semantic nodes attached to the same token or phrase anchor as $u_q$.
     
-    \item \textbf{Partial match:} Semantic nodes whose associated token node shares the phrase-level lexical evidence required by $u_q$.
+    \item \textbf{Partial match:} semantic nodes attached to indexed phrase anchors that share the required phrase-level lexical evidence with $u_q$.
     
-    \item \textbf{Similarity match:} Semantic nodes whose embeddings are similar to $e_q$ according to cosine similarity.
+    \item \textbf{Similarity match:} semantic nodes whose embeddings are closest to $e_q$ when lexical matching does not provide sufficient candidates.
 \end{itemize}
-Each matching level is assigned a predefined node-level weight:
-$
-\alpha_{\text{exact}} > \alpha_{\text{partial}} > \alpha_{\text{similarity}}.
-$
-For exact and partial matching, candidate semantic nodes are first identified through their linked token nodes. Specifically, exact matching retrieves the token node whose surface form is identical to the query unit $u_q$, while partial matching retrieves phrase anchors with compatible word-level evidence. For each matched token node $t$, only its best semantic node is retained based on embedding similarity:
-$
-s^*(t) = \arg\max_{s \in S(t)} \cos(e_q, e_s),
-$
-where $\mathcal{S}(t)$ denotes the set of semantic nodes linked to token node $t$, $e_q$ is the embedding of the query unit, and $e_s$ is the anchor embedding of semantic node $s$.
-Since exact matching corresponds to a unique token node, it yields a single semantic node. In contrast, partial matching may retrieve multiple token nodes, each contributing its best semantic node. To control the number of candidates, we retain at most the top-$k$ semantic nodes ranked by similarity, where $k$ is a user-specified hyperparameter.
-For similarity matching, the search is performed directly over semantic nodes without requiring token-level constraints. Semantic nodes are also ranked according to cosine similarity, and the top-$k$ most similar semantic nodes are retained. This design allows retrieval to operate directly at the semantic level while preserving lexical precision through token-level constraints.
 
-\subsubsection{Co-occurrence graph node weighting}
-To capture relationships among matched semantic nodes, we construct a query-specific semantic co-occurrence graph. For semantic nodes $i$ and $j$, the edge weight is defined as:
+For exact matching, if the matched lexical anchor has multiple described semantic nodes, LiteSemRAG selects the semantic node whose textual description best matches the query context. If description-level disambiguation is unavailable or inconclusive, the selected semantic node is $s^*(t) = \arg\max_{s \in S(t)} \cos(e_q, e_s)$, where $S(t)$ denotes the semantic nodes linked to lexical anchor $t$, and $e_s$ is the semantic-node embedding. Partial matching follows the same semantic-node selection principle after retrieving compatible phrase anchors. Similarity matching is used as a fallback over the semantic-node embedding space and contributes a confidence proportional to its cosine similarity. These routes produce a set of matched semantic nodes $S_q$, where each semantic node is associated with an effective query weight $\eta_s$ determined by match confidence and, for compositional query units, by the role weight of the phrase, head, or modifier member.
+
+\subsubsection{Direct Semantic Evidence}
+The first component of chunk scoring measures how strongly a candidate chunk directly supports the matched query semantics. For a semantic node $s \in S_q$ and a chunk $c$, LiteSemRAG uses a semantic BM25-style contribution:
+\[
+\mathrm{BM25}(s,c) =
+G(s)
+\cdot
+\frac{f(s,c) (k_1 + 1)}
+{f(s,c) + k_1 \left(1 - b + b \frac{|c|}{\mathrm{avgcl}}\right)},
+\]
+where $G(s)$ is the chunk-level discriminative weight of semantic node $s$, $f(s,c)$ is the frequency of $s$ in chunk $c$, $|c|$ is the chunk length, and $\mathrm{avgcl}$ is the average chunk length. The direct semantic evidence score is then $\mathrm{Base}(c) = \sum_{s \in S_q(c)} \eta_s \cdot \mathrm{BM25}(s,c)$, where $S_q(c)$ is the set of matched semantic nodes appearing in chunk $c$. This score gives every matched semantic node a direct retrieval path, including nodes that do not co-occur with other query nodes.
+
+For compositional query groups, direct evidence uses a group-aware aggregation rule. If a chunk contains the full-phrase semantic evidence for a group, the phrase contribution is used as the primary group contribution and the corresponding head or modifier members from the same group are not counted again. If the full phrase is absent, head and modifier units can jointly contribute according to their role weights. This rule reflects the asymmetric importance of phrase, head, and modifier evidence: exact phrase evidence is strongest, head evidence supports semantic aggregation, and modifier evidence refines the intended surface realization.
+
+\subsubsection{Bounded Pairwise Co-occurrence Boosting}
+The second component of chunk scoring rewards chunks where multiple matched semantic nodes support each other. For semantic nodes $i$ and $j$, LiteSemRAG defines a corpus-level co-occurrence strength:
 \[
 w_{ij} =
 \frac{|C(i) \cap C(j)|}
 {\sqrt{|C(i)| \cdot |C(j)|}},
 \]
-where $C(i)$ denotes the set of chunks containing semantic node $i$. This cosine-style normalized co-occurrence metric suppresses globally frequent semantics while emphasizing meaningful associations.
-For each semantic node $s$, we compute its node weight:
+where $C(i)$ denotes the set of chunks containing semantic node $i$. This normalized overlap suppresses globally frequent semantics while emphasizing pairs that co-occur consistently across the corpus.
+
+For a candidate chunk $c$, a semantic-node pair contributes a local boost only when both endpoints appear in $c$. The local evidence level $\ell_c(i,j)$ distinguishes stronger sentence-level support from weaker chunk-level support:
 \[
-W(s) =
-\left(
-\sum_{j \in N(s)} w_{sj}
-\right)
-\cdot
-\alpha_{\text{level}(s)}
-\cdot
-\beta_{\text{role}(s)}
-\cdot
-\cos(e_q, e_s),
+\ell_c(i,j) =
+\begin{cases}
+\ell_{\text{sent}}, & \text{same sentence in } c,\\
+\ell_{\text{chunk}}, & \text{same chunk but different sentences}.
+\end{cases}
 \]
-where $N(s)$ denotes neighboring semantic nodes in the co-occurrence graph, $\alpha_{\text{level}(s)}$ is the node-level weight corresponding to its semantic matching level, and $\beta_{\text{role}(s)}$ is the compositional-role weight. For query units that do not belong to a compositional group, $\beta_{\text{role}(s)}=1$. This formulation integrates co-occurrence graph structural information, lexical matching confidence, compositional role importance, and semantic similarity.
-
-\subsubsection{Chunk Scoring}
-\label{chunk scoring}
-Chunks connected to the selected semantic nodes are ranked by using a BM25-style semantic-level score:
+Pairs formed only by different members of the same compositional query group are not used for this boost, because their phrase-level relation is already represented by the direct group-aware evidence. The pair contribution is therefore $\pi_c(i,j) = w_{ij} \cdot \ell_c(i,j)$. To prevent a long chunk or a dense semantic region from dominating the score through many weak pairs, LiteSemRAG averages only the top-$K$ pair contributions in each chunk:
 \[
-\text{Score}(c) =
-\sum_{s \in S(c)}
-W(s)
-\cdot
-G(s)
-\cdot
-\frac{f(s,c) (k_1 + 1)}
-{f(s,c) + k_1 \left(1 - b + b \frac{|c|}{\text{avgcl}}\right)},
+\mathrm{PairBoost}(c) =
+\frac{1}{|\mathcal{P}_K(c)|}
+\sum_{(i,j) \in \mathcal{P}_K(c)}
+\pi_c(i,j),
 \]
-In the above formulation, $S(c)$ denotes the set of semantic nodes that appear in chunk $c$. The term $W(s)$ represents the weight of semantic node $s$. The quantity $G(s)$ denotes the chunk-level discriminative weight of semantic node $s$, computed based on its distribution across chunks (such as Inverse Document Frequency). The term $f(s,c)$ denotes the frequency of semantic node $s$ in chunk $c$. The symbol $|c|$ represents the length of chunk $c$, and $\text{avgcl}$ denotes the average chunk length across the corpus. The hyperparameters $k_1$ and $b$ follow the standard BM25 formulation and control term-frequency saturation and length normalization, respectively. Note that each semantic node contributes at most once to the semantic-level score, even if it appears multiple times within the same chunk.
+where $\mathcal{P}_K(c)$ contains the highest-scoring semantic-node pairs in chunk $c$ and $\mathrm{PairBoost}(c)=0$ when no valid pair is available.
 
-For compositional query groups, chunk scoring further applies a group-aware aggregation rule. If a chunk contains the full-phrase semantic evidence for a group, the phrase-level contribution is used as the primary group contribution and the corresponding head or modifier members from the same group are not counted again. If the full phrase is absent, the head and modifier units can jointly contribute according to their role weights. This rule reflects the asymmetric importance of phrase, head, and modifier evidence: exact phrase evidence is strongest, head evidence supports semantic aggregation, and modifier evidence refines the intended surface realization.
+\subsubsection{Final Chunk Ranking}
+The final retrieval score combines direct evidence and bounded co-occurrence support as $\mathrm{Score}(c) = \mathrm{Base}(c) \cdot (1 + \lambda \cdot \mathrm{PairBoost}(c))$, where $\lambda$ controls the strength of the co-occurrence boost. This multiplicative form treats direct semantic evidence as the primary signal and uses co-occurrence as supporting evidence. A chunk that contains a strong individual semantic match can still rank through $\mathrm{Base}(c)$, while a chunk that jointly supports several query-relevant meanings receives an additional boost. Compared with a hard two-stage retrieval strategy, this unified ranking avoids separating pair-supported and single-node evidence into different retrieval pools; all candidate chunks are ranked by the same score, and co-occurrence improves the rank only when it is locally verified inside the candidate chunk.
 
-\subsection{Isolated Semantic Recovery}
-While co-occurrence graph semantic retrieval captures structurally supported semantic relationships, certain matched semantic nodes may remain weakly supported by the co-occurrence graph. This occurs when a semantic node matches the query but does not participate in significant co-occurrence relationships with other matched semantic nodes, or when it belongs to a lower-priority member of a compositional query group. To avoid missing potential relevant evidence, we introduce an \emph{Isolated Semantic Recovery} stage. Note that each isolated semantic node $s \in S_q^{(\text{iso})}$ corresponds to a query-matched semantic meaning whose evidence may be useful even without strong graph connectivity.
-
-\subsubsection{Token- and Group-Family Weight Propagation}
-Token elements serve as lexical anchors at the multi-level semantic matching phase. As a result, multiple semantic nodes in the co-occurrence graph may correspond to the same original token element or to related members of the same compositional group. For an isolated semantic node $s$, if there exist semantic nodes 
-$\{s'_i\}$ in the co-occurrence graph that share the same original token 
-or query group as $s$, we propagate their node weights to $s$. Specifically, the propagated weight assigned to $s$ is defined as the sum of the co-occurrence graph node weights of all such matching nodes:
-\[
-W_{\text{prop}}(s) = \sum_{s'_i \in \mathcal{M}(s)} W(s'_i),
-\]
-where $\mathcal{M}(s)$ denotes the set of semantic nodes in the co-occurrence graph that share the same original token or compositional group as $s$. If $\mathcal{M}(s)$ is empty, no weight is propagated and $s$ does not 
-receive any co-occurrence node weight.
-\subsubsection{Isolated Node Ranking}
-We divide isolated semantic nodes into two groups: \textbf{Upper Group}: Semantic nodes receiving propagated co-occurrence weight;    \textbf{Lower Group}: Semantic nodes without propagated co-occurrence weight.
-Nodes in Upper Group are ranked by $\text{Score}(s) = W_{\text{prop}}(s) \cdot \cos(e_q, e_s)$, where $e_q$ is the embedding of the corresponding query unit and $e_s$ is the anchor embedding of semantic node, while nodes in Lower Group are ranked solely by semantic similarity $\text{Score} = \cos(e_q, e_s)$. Two groups are combined while Upper Group is ranked ahead of Lower group, reflecting the assumption that nodes inheriting structural importance are more likely to be relevant.
-\subsubsection{Chunk Ranking and Retrieval} 
-For each ranked isolated semantic node $s$ in the combined group, we collect its associated chunks and rank them independently using the same BM25-style semantic-level scoring function in Section~\ref{chunk scoring}. To promote semantic diversity in the final retrieval results, we employ a round-robin selection strategy across the ranked semantic nodes. Specifically, we iteratively traverse the ordered list of semantic nodes and select the next $K$ highest-ranked chunks from each node in turn. After reaching the last node, the process cycles back to the first node and continues in the same manner. This cyclic retrieval procedure repeats until the desired number of chunks is obtained or all candidate chunks have been exhausted.
-
-Isolated Semantic Recovery serves as a structured fallback mechanism. It leverages token-level and compositional-group relationships to propagate semantic importance from the co-occurrence graph. This allows the framework to recover semantically relevant but structurally unsupported evidence, particularly in cases where co-occurrence relationships are sparse or incomplete. 
 \subsection{Extensibility of the Index Graph}
-In the current framework, we restrict retrieval to co-occurrence-aware semantic ranking and isolated semantic recovery to maintain computational efficiency and robustness. However, the underlying structure of LiteSemRAG's heterogeneous semantic index graph naturally supports more complex graph-based reasoning operations. The heterogeneous graph structure connects documents, chunks, semantic nodes, and token nodes in a bidirectional manner. This design enables flexible traversal across different elements and levels, allowing more advanced operations, including multi-hop semantic expansion, constrained subgraph extraction, and path-based relevance scoring. Therefore, LiteSemRAG should be viewed not only as a retrieval algorithm but also as a structured semantic indexing framework. The index graph provides a foundation for future extensions that incorporate deeper graph traversal strategies or reasoning mechanisms without requiring LLM-based graph construction.
+In the current framework, we restrict retrieval to direct semantic evidence and bounded co-occurrence-aware ranking to maintain computational efficiency and robustness. However, the underlying structure of LiteSemRAG's heterogeneous semantic index graph naturally supports more complex graph-based reasoning operations. The heterogeneous graph structure connects documents, chunks, semantic nodes, and token nodes in a bidirectional manner. This design enables flexible traversal across different elements and levels, allowing more advanced operations, including multi-hop semantic expansion, constrained subgraph extraction, and path-based relevance scoring. Therefore, LiteSemRAG should be viewed not only as a retrieval algorithm but also as a structured semantic indexing framework. The index graph provides a foundation for future extensions that incorporate deeper graph traversal strategies or reasoning mechanisms without requiring LLM-based graph construction.
 
 \section{Experiments}
 We evaluate LiteSemRAG against representative LLM-based graph RAG systems in terms of retrieval effectiveness and computational efficiency. Our experiments aim to answer the following questions:
@@ -300,21 +246,7 @@ We evaluate retrieval quality by using \emph{Recall@10} and \emph{MRR@10}. For e
 \]
 This measures the proportion of gold documents that are successfully retrieved within the top 10 results across the entire dataset.
 
-For each query $q$ in a query dataset $Q$, let $\text{rank}_q$ denote the rank position of the first retrieved document that belongs to $G_q$ within the top 10 results. If no gold document appears in the top 10, the reciprocal rank is defined as 0. The reciprocal rank is:
-\[
-\text{RR@10}(q) =
-\begin{cases}
-\frac{1}{\text{rank}_q}, & \text{if a gold document appears in top 10}, \\
-0, & \text{otherwise}.
-\end{cases}
-\]The Mean Reciprocal Rank at 10 is computed as:
-\[
-\text{MRR@10} =
-\frac{1}{|Q|}
-\sum_{q \in Q}
-\text{RR@10}(q).
-\]
-Recall@10 measures how completely the required evidence documents are retrieved, while MRR@10 evaluates how early at least one relevant document appears in the ranked chunk list. In addition, we report four efficiency metrics: Average Indexing Time per document (AIT), Average Query Time (AQT), average online generative-LLM Index Token Consumption per document (ITC), and average online generative-LLM Query Token Consumption (QTC). These metrics quantify both computational and cost efficiency.
+For each query $q$ in a query dataset $Q$, let $\text{rank}_q$ denote the rank position of the first retrieved document that belongs to $G_q$ within the top 10 results. If no gold document appears in the top 10, the reciprocal rank is defined as 0; otherwise, $\text{RR@10}(q)=1/\text{rank}_q$. The Mean Reciprocal Rank at 10 is computed as $\text{MRR@10}=|Q|^{-1}\sum_{q \in Q}\text{RR@10}(q)$. Recall@10 measures how completely the required evidence documents are retrieved, while MRR@10 evaluates how early at least one relevant document appears in the ranked chunk list. In addition, we report four efficiency metrics: Average Indexing Time per document (AIT), Average Query Time (AQT), average online generative-LLM Index Token Consumption per document (ITC), and average online generative-LLM Query Token Consumption (QTC). These metrics quantify both computational and cost efficiency.
 
 \subsection{Retrieval Performance}
 \begin{table*}[t]
@@ -383,20 +315,20 @@ Table~\ref{tab:token_results} reports online generative-LLM tokens used by the b
 
 
 \subsection{Ablation Study}
-To evaluate the contribution of the two-step semantic-aware retrieval strategy, we conduct an ablation study using a broad search and reranking retrieval variant. In this setting, we first retrieve all semantic nodes matched by the query. All chunks connected to these semantic nodes are then collected, and a \textbf{jina-reranker-v3} reranker is applied to rank the candidate chunks. If the number of candidate chunks becomes extremely large, we randomly sample 100 chunks as reranking candidates. The top-10 chunks are selected as the final results. This ablation removes the two-step semantic-aware retrieval mechanism while preserving the same semantic index graph and matching process. In particular, both methods use the identical index graph constructed during the indexing stage and rely on the same token-level text encoder to generate contextual embeddings. The only difference lies in the retrieval strategy applied at query time. Table~\ref{tab:ablation_results} compares the standard LiteSemRAG and the broad search and reranking variant in terms of Recall@10 (R@10), MRR@10 (M@10), and Average Query Time (AQT). Since both methods operate on the same index graph, the comparison isolates the effect of the retrieval strategy itself. The results show that the proposed two-step semantic-aware retrieval significantly outperforms the broad retrieval baseline, demonstrating that the performance gains of LiteSemRAG primarily arise from the semantic-aware co-occurrence graph retrieval mechanism rather than the use of the token-level text encoder alone.
+To evaluate the contribution of the semantic co-occurrence retrieval strategy, we conduct an ablation study using a broad search and reranking retrieval variant. In this setting, we first retrieve all semantic nodes matched by the query. All chunks connected to these semantic nodes are then collected, and a \textbf{jina-reranker-v3} reranker is applied to rank the candidate chunks. If the number of candidate chunks becomes extremely large, we randomly sample 100 chunks as reranking candidates. The top-10 chunks are selected as the final results. This ablation removes the bounded semantic co-occurrence scoring mechanism while preserving the same semantic index graph and matching process. In particular, both methods use the identical index graph constructed during the indexing stage and rely on the same token-level text encoder to generate contextual embeddings. The only difference lies in the retrieval strategy applied at query time. Table~\ref{tab:ablation_results} compares the standard LiteSemRAG and the broad search and reranking variant in terms of Recall@10 (R@10), MRR@10 (M@10), and Average Query Time (AQT). Since both methods operate on the same index graph, the comparison isolates the effect of the retrieval strategy itself. The results show that the proposed semantic co-occurrence retrieval significantly outperforms the broad retrieval baseline, demonstrating that the performance gains of LiteSemRAG primarily arise from group-aware semantic matching and locally verified co-occurrence scoring rather than the use of the token-level text encoder alone.
 
 \begin{table*}[t]
 \centering
 \small
 \setlength{\tabcolsep}{5pt}
-\caption{Ablation study on two-step semantic-aware retrieval}
+\caption{Ablation study on semantic co-occurrence retrieval}
 \label{tab:ablation_results}
 \begin{tabular}{cccccccccc}
 \hline
 \multirow{2}{*}{Method}  & \multicolumn{3}{c}{HotpotQA} & \multicolumn{3}{c}{SciFact} & \multicolumn{3}{c}{Fever} \\ \cline{2-10} 
                          & R@10     & M@10    & AQT     & R@10     & M@10    & AQT    & R@10    & M@10   & AQT    \\ \hline
 Broad search and reranking & 32.5\%   & 0.197   & 2.85s   & 14.9\%   & 0.056   & 2.97s  & 46.7\%  & 0.251  & 3.24s  \\
-Two-step semantic-aware  & 73.5\%   & 0.694   & 0.24s   & 92.3\%   & 0.692   & 0.69s  & 88.3\%  & 0.806  & 0.47s  \\ \hline
+Semantic co-occurrence  & 73.5\%   & 0.694   & 0.24s   & 92.3\%   & 0.692   & 0.69s  & 88.3\%  & 0.806  & 0.47s  \\ \hline
 \end{tabular}
 \end{table*}
 
@@ -414,7 +346,7 @@ In this experiment, LiteSemRAG first constructs contextual span embeddings using
 \begin{tabular}{lcccccc}
 \hline
 Method & Samples & Alg. Assigned & CE Fallback & Agr. w/ Full CE & Agr. w/ LLM & Class Counts \\ \hline
-Anchor-E mutual + propagation & 10 & 113 & 37 & 130/150 (86.7\%) & 133/150 (88.7\%) & 77 / 73 \\
+Anchor-guided propagation & 10 & 113 & 37 & 130/150 (86.7\%) & 133/150 (88.7\%) & 77 / 73 \\
 Full cross-encoder & 150 & N/A & 150 & 150/150 (100\%) & 137/150 (91.3\%) & 81 / 69 \\
 LLM semantic labeling & 150 & N/A & N/A & 137/150 (91.3\%) & 150/150 (100\%) & 86 / 64 \\ \hline
 \end{tabular}
@@ -428,7 +360,7 @@ Overall, this additional experiment supports the claim that representative-sampl
 
 
 \section{Conclusion}
-In this paper, we proposed LiteSemRAG, a lightweight and LLM-frugal semantic-aware graph retrieval framework for Retrieval-Augmented Generation. LiteSemRAG constructs a heterogeneous semantic graph from contextual span embeddings, explicitly separating surface lexical forms from context-dependent semantic meanings to model token polysemy without LLM-centered graph construction or reasoning. The index further adds phrase-aware routing, preserving lexicalized phrases as complete lexical anchors and representing compositional phrases as coupled phrase--head--modifier structures. The query process mirrors this structure through composition-aware query units and group-aware co-occurrence scoring, allowing phrase evidence, semantic heads, and modifiers to contribute without redundant counting. The framework introduces dynamic semantic node construction based on anchor-guided semantic assignment, combining farthest-first anchor sampling, mutual-kNN label propagation, cross-encoder margin veto, and cross-encoder fallback, together with a two-step semantic-aware retrieval strategy. Because semantic nodes are attached to textual meaning descriptions rather than only latent embedding clusters, LiteSemRAG also provides an interpretable basis for inspecting and validating discovered senses. Experiments on three benchmark datasets show that LiteSemRAG achieves competitive or superior retrieval performance compared to LLM-based graph RAG systems while substantially improving indexing and querying efficiency through minimal and targeted LLM use.
+In this paper, we proposed LiteSemRAG, a lightweight and LLM-frugal semantic-aware graph retrieval framework for Retrieval-Augmented Generation. LiteSemRAG constructs a heterogeneous semantic graph from contextual span embeddings, explicitly separating surface lexical forms from context-dependent semantic meanings to model token polysemy without LLM-centered graph construction or reasoning. The index further adds phrase-aware routing, preserving lexicalized phrases as complete lexical anchors and representing compositional phrases as coupled phrase--head--modifier structures. The query process mirrors this structure through composition-aware query units and group-aware co-occurrence scoring, allowing phrase evidence, semantic heads, and modifiers to contribute without redundant counting. The framework introduces dynamic semantic node construction based on anchor-guided semantic assignment, combining farthest-first anchor sampling, mutual-kNN label propagation, cross-encoder margin veto, and cross-encoder fallback, together with semantic co-occurrence retrieval that combines direct semantic evidence with bounded pairwise chunk support. Because semantic nodes are attached to textual meaning descriptions rather than only latent embedding clusters, LiteSemRAG also provides an interpretable basis for inspecting and validating discovered senses. Experiments on three benchmark datasets show that LiteSemRAG achieves competitive or superior retrieval performance compared to LLM-based graph RAG systems while substantially improving indexing and querying efficiency through minimal and targeted LLM use.
 
 %
 % ---- Bibliography ----

@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -255,8 +256,15 @@ def _parse_batched_judgments(
     for item in judgments:
         if not isinstance(item, Mapping):
             continue
-        record_id = int(item.get("record_id"))
-        selected_index = int(item.get("selected_index"))
+        # Skip malformed entries (missing / non-numeric record_id or
+        # selected_index) instead of letting int(None) raise TypeError; the
+        # affected record then falls through to the `missing` check below, which
+        # raises a clear, record-scoped error instead of an opaque one.
+        try:
+            record_id = int(item.get("record_id"))
+            selected_index = int(item.get("selected_index"))
+        except (TypeError, ValueError):
+            continue
         if not 0 <= selected_index < len(candidate_bank):
             raise ValueError(
                 f"LLM selected invalid candidate index {selected_index}. payload={payload!r}"
@@ -462,7 +470,7 @@ def choose_wikidata_candidate_with_llm(
         candidate_bank_hash=bank_hash,
     )
 
-    with _open_cache(cache_path) as connection:
+    with closing(_open_cache(cache_path)) as connection:
         cache_row = _lookup_cache_row(connection, cache_key)
         if cache_row is not None:
             cached_resolution = _resolve_cached_candidate(cache_row, candidate_bank_list)
@@ -591,7 +599,7 @@ def choose_wikidata_candidates_with_llm_batch(
 
     results_by_id: dict[int, dict[str, Any]] = {}
     uncached_records = []
-    with _open_cache(cache_path) as connection:
+    with closing(_open_cache(cache_path)) as connection:
         for prepared in prepared_records:
             cache_row = _lookup_cache_row(connection, prepared["cache_key"])
             if cache_row is not None:

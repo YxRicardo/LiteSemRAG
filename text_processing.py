@@ -15,19 +15,21 @@ def clean_text(text):
     counter = 0
 
                            
-    for match in re.findall(r'\b[A-Z]{2,}\b', text):
+    # Stash matched spans behind unique placeholders so the later lower-casing
+    # skips them. Use re.sub (a single positional pass) instead of str.replace,
+    # which is an unbounded substring swap and would corrupt overlapping
+    # matches, e.g. "US USB" -> "US USb".
+    def _stash(match):
+        nonlocal counter
         placeholder = f"__PH_{counter}__"
-        placeholders[placeholder] = match
-        text = text.replace(match, placeholder)
+        placeholders[placeholder] = match.group(0)
         counter += 1
+        return placeholder
+
+    text = re.sub(r'\b[A-Z]{2,}\b', _stash, text)
 
                                 
-    pattern = r'\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'
-    for match in re.findall(pattern, text):
-        placeholder = f"__PH_{counter}__"
-        placeholders[placeholder] = match
-        text = text.replace(match, placeholder)
-        counter += 1
+    text = re.sub(r'\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', _stash, text)
 
                
     text = re.sub(r"[\"']", "", text)

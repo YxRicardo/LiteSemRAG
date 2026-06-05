@@ -60,7 +60,7 @@ from utils import (
     sem_embed_sim,
 )
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 # Anchor 传播分配法的默认数值超参(对齐
 # jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb)。只有少数核心项
@@ -164,10 +164,15 @@ COMPOSITIONAL_QUERY_ROLE_WEIGHT = {
 # 每个 chunk 只取 top-k pair boost 求平均;ChunkScore = BaseEvidence * (1 + λ * PairBoost)。
 COOCCUR_TOP_K_PAIR_BOOSTS = 3
 COOCCUR_LAMBDA = 0.3
-# local_evidence_level:目前没有句子边界数据,统一按 same chunk = 0.4。
-# phrase/modifier=1.0、same sentence=0.7 两档保留常量,后续若接入句子/短语关系再启用。
+# Candidate-pool cutoff: only the top-N chunks by BaseEvidence get the (expensive) pair-boost
+# pass; the rest keep pair_boost=0 and still rank by their base evidence. Because the boost is
+# bounded (<= λ ≈ 30%), a chunk far down the base ranking cannot realistically overtake the pool,
+# so this caps the pair-combination cost without changing the top results. Set to None to disable.
+COOCCUR_CANDIDATE_POOL_SIZE = 200
+# local_evidence_level:两档。same sentence=0.7(两端点 occurrence 落在同一句),否则 same chunk=0.4。
+# 不再有 phrase 档:"真成短语"由 base_evidence 里满格命中的完整 phrase node 表达(且 base 层已对
+# 同 group 做 phrase 优先去重),pair boost 无需也不应再用 query_group_id 顶格加成(会重复计分/虚高)。
 COOCCUR_LOCAL_EVIDENCE = {
-    "phrase": 1.0,
     "sentence": 0.7,
     "chunk": 0.4,
 }
@@ -184,6 +189,12 @@ DEEP_PICKLE_STACK_SIZE = 512 * 1024 * 1024
 # (DocumentNode -> ChunkNode -> SemNode -> TokenNode -> ...) can exceed the
 # default recursion limit. We raise the limit and run the dump on a worker
 # thread with a large stack, which keeps the native stack from overflowing.
+#
+# NOTE: sys.setrecursionlimit() and threading.stack_size() are process-global,
+# not thread-local, so no other thread should rely on the default recursion
+# depth while a dump is in flight. In practice save_data() / save_data_split()
+# run when no other indexing/query threads are active; the worker restores the
+# previous limit in a finally block.
 def deep_pickle_dump(obj, fileobj, protocol=pickle.HIGHEST_PROTOCOL):
     error = {}
 
@@ -562,6 +573,8 @@ class TokenNode:
     # finalize 时 semantic_type_cls 算出的 embedding 集中度;None 表示从未走过
     # s_mean 闸门(entity/原子短语单义,或出现次数未达阈值的 basic 节点)。
     s_mean: float | None = None
+    # schema 8: Anchor 传播中由 LLM 直接判定的 anchor 样本记录。
+    llm_anchor_sample_assignments: list = field(default_factory=list)
 
     # Initialize optional token metadata after dataclass construction.
     def __post_init__(self):
@@ -769,8 +782,10 @@ class LiteSemRAG:
                  min_description_candidates=3,
                  use_llm_candidate_filter=False,
                  llm_candidate_filter_use_api=True,
+                 llm_candidate_filter_provider="openai",
                  llm_candidate_filter_api_model=None,
                  llm_candidate_filter_cache_path="cache/wikidata_definition_filter_cache.sqlite3",
+                 llm_candidate_filter_max_tokens=4096,
                  use_llm_semantic_labeler=False,
                  disambiguate_query_sense=True,
                  llm_semantic_labeler_provider="openai",
@@ -790,6 +805,7 @@ class LiteSemRAG:
                  anchor_min_count=ANCHOR_PROP_DEFAULTS["anchor_min_count"],
                  anchor_max_count=ANCHOR_PROP_DEFAULTS["anchor_max_count"],
                  prop_knn_k=ANCHOR_PROP_DEFAULTS["prop_knn_k"],
+                 tau_conc=0.90,
                  phrase_audit_enabled=False,
                  phrase_audit_cache_path="cache/phrase_protection_audit.jsonl"):
         self.doc_nodes = []
@@ -808,7 +824,9 @@ class LiteSemRAG:
         # 设为 None 则所有 token 都只建单节点、无描述;设为 1 则所有 token 都做描述。
         self.min_occurrences_for_description = min_occurrences_for_description
         self.token_node_query = {}
-        self.tau_conc = 0.90
+        # s_mean 闸门:某 token 各次出现 embedding 的平均相似度高于该阈值 →
+        # 语义集中,判为单义不切分(_is_token_polysemous_by_s_mean)。值越大越倾向多义切分。
+        self.tau_conc = float(tau_conc)
         self.tau_disp = 0.78
         self.device = device
         self.query_database = None
@@ -838,8 +856,13 @@ class LiteSemRAG:
         self.llm_candidate_filter_candidate_limit = 10
         self.use_llm_candidate_filter = bool(use_llm_candidate_filter)
         self.llm_candidate_filter_use_api = bool(llm_candidate_filter_use_api)
+        self.llm_candidate_filter_provider = llm_candidate_filter_provider
         self.llm_candidate_filter_api_model = llm_candidate_filter_api_model
         self.llm_candidate_filter_cache_path = llm_candidate_filter_cache_path
+        # gpt-5* 是 reasoning 模型,max_completion_tokens 预算由隐藏推理 token 与可见
+        # 输出共享;合并多义项 + 判 FFT 样本的 JSON 输出较长,1024 容易被截断导致
+        # 解析失败 / 空 definitions(被记成 no_candidate_definitions),故默认放大。
+        self.llm_candidate_filter_max_tokens = max(1, int(llm_candidate_filter_max_tokens))
         self.llm_candidate_filter = None
         self.llm_candidate_filter_total_tokens = 0
         self.llm_candidate_filter_prompt_tokens = 0
@@ -908,6 +931,7 @@ class LiteSemRAG:
         # candidate-merge + FFT-sample-judgment LLM call (use_llm_candidate_filter).
         self._combined_merge_sample_sense_descriptions = {}
         self.llm_candidate_filter_result_cache = {}
+        self.llm_anchor_sample_assignment_count = 0
         self.sem_build_count = 0
         self._reset_sem_build_stats()
         self.phrase_audit_enabled = bool(phrase_audit_enabled)
@@ -955,8 +979,10 @@ class LiteSemRAG:
 
             self.llm_candidate_filter = WikidataDefinitionFilter(
                 use_api=self.llm_candidate_filter_use_api,
+                api_provider=self.llm_candidate_filter_provider,
                 api_model=self.llm_candidate_filter_api_model,
                 cache_path=self.llm_candidate_filter_cache_path,
+                max_tokens=getattr(self, "llm_candidate_filter_max_tokens", 4096),
             )
         return self.llm_candidate_filter
 
@@ -1033,6 +1059,12 @@ class LiteSemRAG:
         self.wikidata_no_result_logs = []
         self._wikidata_no_result_keys = set()
 
+    # Clear persisted per-token LLM anchor assignment records before rebuilding sem nodes.
+    def _reset_llm_anchor_sample_assignments(self):
+        self.llm_anchor_sample_assignment_count = 0
+        for token_node in getattr(self, "token_nodes", []) or []:
+            token_node.llm_anchor_sample_assignments = []
+
     # Append a structured semantic-description operation log entry.
     def _log_sem_description_operation(self, event_type, **payload):
         self.sem_description_operation_logs.append(
@@ -1105,10 +1137,6 @@ class LiteSemRAG:
                 "reason": str(reason),
             }
         )
-
-    # Reset semantic-node build counters.
-    def _reset_sem_build_stats(self):
-        self.sem_build_count = 0
 
     # Create and register a document node.
     def create_doc_node(self, doc_name):
@@ -1525,6 +1553,8 @@ class LiteSemRAG:
 
     # Reset the per-session counters that track who reaches the full sem-build path.
     def _reset_sem_build_stats(self):
+        # 已构建的语义节点总数(build_sem_node 每产出一个节点 +1)。
+        self.sem_build_count = 0
         # 进入 build_sem_node 的 token/span 数(= finalize 时出现次数达到
         # min_occurrences_for_description、足够走完整建节点路径的 token/phrase)。
         self.sem_stats_passed_occurrence = 0
@@ -1608,36 +1638,47 @@ class LiteSemRAG:
         self.llm_semantic_label_cache_misses = 0
         self.fft_propagation_wall_time = 0.0
 
-    # Print total index-through-finalize time and average time per indexed document.
-    def _print_index_session_timing(self):
+    # Build the index-session running-info lines (total/avg time, LLM token usage,
+    # wall times). Returns an empty list when no index session has been started.
+    # Shared by the console summary (_print_index_session_timing) and the saved
+    # sem-description log so both show the same end-of-index report.
+    def _format_index_session_timing(self):
         if self.index_session_start_time is None:
-            return
+            return []
 
+        lines = []
         elapsed = time.perf_counter() - self.index_session_start_time
-        print(f"Index + finalize elapsed time: {elapsed:.2f}s")
+        lines.append(f"Index + finalize elapsed time: {elapsed:.2f}s")
+        lines.append(f"Indexed document count: {self.index_session_document_count}")
         if self.index_session_document_count > 0:
             avg_seconds = elapsed / self.index_session_document_count
-            print(f"Average time per indexed document: {avg_seconds:.4f}s")
+            lines.append(f"Average time per indexed document: {avg_seconds:.4f}s")
         if getattr(self, "use_llm_candidate_filter", False):
-            print(
+            lines.append(
                 "LLM candidate filter tokens: "
                 f"total={self.llm_candidate_filter_total_tokens}, "
                 f"prompt={self.llm_candidate_filter_prompt_tokens}, "
                 f"completion={self.llm_candidate_filter_completion_tokens}"
             )
-            print(
+            lines.append(
                 "LLM candidate filter wall time: "
                 f"total={self.llm_candidate_filter_total_wall_time:.2f}s, "
                 f"api_wait={self.llm_candidate_filter_api_wait_wall_time:.2f}s"
             )
         if getattr(self, "use_llm_semantic_labeler", False):
-            print(
+            lines.append(
                 "LLM semantic labeler tokens: "
                 f"total={self.llm_semantic_label_total_tokens}, "
                 f"cache_hits={self.llm_semantic_label_cache_hits}, "
                 f"cache_misses={self.llm_semantic_label_cache_misses}"
             )
-        print(f"FFT propagation wall time: {self.fft_propagation_wall_time:.2f}s")
+        lines.append(f"FFT propagation wall time: {self.fft_propagation_wall_time:.2f}s")
+        return lines
+
+    # Print total index-through-finalize time and average time per indexed document.
+    def _print_index_session_timing(self):
+        for line in self._format_index_session_timing():
+            print(line)
 
     # Create a throttled console progress updater for long loops.
     def _make_progress_updater(self, label, total, min_interval=0.2, show_remaining=False):
@@ -1649,7 +1690,13 @@ class LiteSemRAG:
             if not force and processed < total and (now - last_update_time[0]) < min_interval:
                 return
             last_update_time[0] = now
-            remaining_text = f" | remaining: {max(total - processed, 0)}" if show_remaining else ""
+            # Right-align `remaining` to the width of `total` so a shrinking value
+            # never leaves stale trailing digits on terminals that ignore \033[K
+            # (e.g. Jupyter output cells, which honor \r but not erase-to-EOL).
+            remaining = max(total - processed, 0)
+            remaining_text = (
+                f" | remaining: {remaining:>{len(str(total))}}" if show_remaining else ""
+            )
             print(
                 f"\r\033[K{label}: {processed}/{total}{remaining_text}",
                 end="",
@@ -1721,6 +1768,16 @@ class LiteSemRAG:
             del self.index_session_sample_count
         if not hasattr(self, "llm_semantic_labeler_batch_size"):
             self.llm_semantic_labeler_batch_size = 10
+        if not hasattr(self, "llm_anchor_sample_assignment_count"):
+            self.llm_anchor_sample_assignment_count = 0
+        for token_node in getattr(self, "token_nodes", []) or []:
+            if not hasattr(token_node, "llm_anchor_sample_assignments"):
+                token_node.llm_anchor_sample_assignments = []
+        if not getattr(self, "llm_anchor_sample_assignment_count", 0):
+            self.llm_anchor_sample_assignment_count = sum(
+                len(getattr(token_node, "llm_anchor_sample_assignments", []) or [])
+                for token_node in getattr(self, "token_nodes", []) or []
+            )
         if getattr(self, "schema_version", None) == CURRENT_SCHEMA_VERSION:
             return
         if not hasattr(self, "phrase_analyzer"):
@@ -1783,10 +1840,14 @@ class LiteSemRAG:
             self.use_llm_candidate_filter = False
         if not hasattr(self, "llm_candidate_filter_use_api"):
             self.llm_candidate_filter_use_api = True
+        if not hasattr(self, "llm_candidate_filter_provider"):
+            self.llm_candidate_filter_provider = "openai"
         if not hasattr(self, "llm_candidate_filter_api_model"):
             self.llm_candidate_filter_api_model = None
         if not hasattr(self, "llm_candidate_filter_cache_path"):
             self.llm_candidate_filter_cache_path = "cache/wikidata_definition_filter_cache.sqlite3"
+        if not hasattr(self, "llm_candidate_filter_max_tokens"):
+            self.llm_candidate_filter_max_tokens = 4096
         if not hasattr(self, "llm_candidate_filter"):
             self.llm_candidate_filter = None
         if not hasattr(self, "llm_candidate_filter_total_tokens"):
@@ -1873,6 +1934,8 @@ class LiteSemRAG:
             self._combined_merge_sample_sense_descriptions = {}
         if not hasattr(self, "llm_candidate_filter_result_cache"):
             self.llm_candidate_filter_result_cache = {}
+        if not hasattr(self, "llm_anchor_sample_assignment_count"):
+            self.llm_anchor_sample_assignment_count = 0
         if not hasattr(self, "phrase_audit_enabled"):
             self.phrase_audit_enabled = False
         if not hasattr(self, "phrase_audit_cache_path"):
@@ -1980,6 +2043,9 @@ class LiteSemRAG:
         # schema 6:finalize 时持久化的 embedding 集中度;旧 pickle 没有,记为 None。
         if not hasattr(token_node, "s_mean"):
             token_node.s_mean = None
+        # schema 8:Anchor LLM 样本语义分配记录;旧 pickle 没有,记为空列表。
+        if not hasattr(token_node, "llm_anchor_sample_assignments"):
+            token_node.llm_anchor_sample_assignments = []
         # 索引期 anomaly 机制已移除:丢弃旧 pickle 残留的 anomaly_section 属性。
         if hasattr(token_node, "anomaly_section"):
             del token_node.anomaly_section
@@ -2806,17 +2872,47 @@ class LiteSemRAG:
     # ChunkScore(c) = BaseEvidence(c) * (1 + λ * PairBoost(c)), where PairBoost(c) averages the
     # top-k pair boosts and a pair boost only fires when a candidate chunk contains BOTH endpoints
     # of a co-occurrence edge. No connected/isolated quota — every candidate ranks by ChunkScore.
+    # The pair-boost pass is restricted to the top `candidate_pool_size` chunks by base evidence.
     #
-    # Returns (chunk_texts, chunk_ids, debug_info) where debug_info is the per-chunk score record.
+    # Returns (chunk_texts, chunk_ids, debug_info). debug_info is a structured dict: params,
+    # resolved_matches, token_weight_map, all_scored_chunks (full sorted), and top_chunks.
     def chunk_cooccur_query(
         self,
         query_text,
         top_k_chunk=10,
         top_k_pair_boosts=COOCCUR_TOP_K_PAIR_BOOSTS,
         lambda_boost=COOCCUR_LAMBDA,
+        candidate_pool_size=COOCCUR_CANDIDATE_POOL_SIZE,
         print_important_tokens=True,
         search_mode='broad',
     ):
+        # ---- Parameter validation (fail loud instead of silently degrading) ----
+        # bool is a subclass of int, so reject it explicitly to avoid True being read as 1.
+        if isinstance(top_k_chunk, bool) or not isinstance(top_k_chunk, int) or top_k_chunk < 1:
+            raise ValueError(f"top_k_chunk must be a positive int, got {top_k_chunk!r}")
+        if (
+            isinstance(top_k_pair_boosts, bool)
+            or not isinstance(top_k_pair_boosts, int)
+            or top_k_pair_boosts < 1
+        ):
+            # >=1 enforced on purpose: 0/negative would silently switch off the pair boost.
+            raise ValueError(
+                f"top_k_pair_boosts must be a positive int, got {top_k_pair_boosts!r}"
+            )
+        if isinstance(lambda_boost, bool) or not isinstance(lambda_boost, (int, float)) or lambda_boost < 0:
+            # negative lambda would turn co-occurrence evidence into a penalty.
+            raise ValueError(f"lambda_boost must be a non-negative number, got {lambda_boost!r}")
+        if candidate_pool_size is not None and (
+            isinstance(candidate_pool_size, bool)
+            or not isinstance(candidate_pool_size, int)
+            or candidate_pool_size < 1
+        ):
+            raise ValueError(
+                f"candidate_pool_size must be a positive int or None, got {candidate_pool_size!r}"
+            )
+        if search_mode not in {"broad", "precise"}:
+            raise ValueError(f"search_mode must be 'broad' or 'precise', got {search_mode!r}")
+
         query_text, _, resolved_matches = self._resolve_query_matches(
             query_text,
             search_mode=search_mode,
@@ -2832,12 +2928,44 @@ class LiteSemRAG:
         base_evidence, token_weight_map = graph.assign_base_evidence()
         chunk_to_nodes = graph.nodes_by_chunk()
 
+        # Candidate-pool cutoff: restrict the pair-boost pass to the top chunks by base evidence.
+        # Chunks outside the pool keep pair_boost=0 (final_score == base) and still compete in the
+        # final ranking, but we skip their O(n^2) pair combinations. None => score every chunk.
+        if candidate_pool_size is not None and len(base_evidence) > candidate_pool_size:
+            pool_chunk_ids = {
+                chunk_node_id
+                for chunk_node_id, _ in sorted(
+                    base_evidence.items(), key=lambda kv: kv[1], reverse=True
+                )[:candidate_pool_size]
+            }
+        else:
+            pool_chunk_ids = None
+
         sentence_boundary_cache = {}
         scored_chunks = []
         for chunk_node_id, base in base_evidence.items():
+            if pool_chunk_ids is not None and chunk_node_id not in pool_chunk_ids:
+                scored_chunks.append({
+                    "chunk_id": chunk_node_id,
+                    "base_evidence": base,
+                    "pair_boost": 0.0,
+                    "final_score": base,
+                    "top_pairs": [],
+                })
+                continue
             nodes = chunk_to_nodes.get(chunk_node_id, [])
             pair_details = []
             for node_a, node_b in combinations(nodes, 2):
+                # Group-level collapse: skip pairs whose two nodes were split from the SAME
+                # compositional query phrase (same non-None query_group_id). Their co-occurrence
+                # inside a chunk is expected by construction, not cross-concept interaction, and
+                # the "real phrase" signal is already carried by the full phrase node in
+                # assign_base_evidence. Cross-group pairs and token pairs are unaffected.
+                if (
+                    node_a.query_group_id is not None
+                    and node_a.query_group_id == node_b.query_group_id
+                ):
+                    continue
                 key = frozenset((id(node_a.sem_node), id(node_b.sem_node)))
                 global_edge_weight = pair_edge_weight.get(key)
                 if global_edge_weight is None:
@@ -2845,12 +2973,21 @@ class LiteSemRAG:
                 local_evidence = self._local_evidence_level(
                     node_a, node_b, chunk_node_id, sentence_boundary_cache
                 )
-                pair_boost = global_edge_weight * local_evidence
+                # Endpoint reliability: node_level_weight already folds match level
+                # (exact/fuzzy/semantic-fallback), compositional role, and the per-match
+                # query weight (cosine / phrase coverage). Multiply by the geometric mean
+                # so a pair anchored on a weak semantic fallback or a low-weight modifier
+                # cannot boost a chunk as much as a pair of strong exact matches.
+                endpoint_reliability = (
+                    node_a.node_level_weight * node_b.node_level_weight
+                ) ** 0.5
+                pair_boost = global_edge_weight * local_evidence * endpoint_reliability
                 pair_details.append({
                     "semantic_node_1": node_a.sem_node.token_node.token_text,
                     "semantic_node_2": node_b.sem_node.token_node.token_text,
                     "global_edge_weight": global_edge_weight,
                     "local_evidence_level": local_evidence,
+                    "endpoint_reliability": endpoint_reliability,
                     "pair_boost": pair_boost,
                 })
 
@@ -2882,22 +3019,43 @@ class LiteSemRAG:
                     f"pairs={record['top_pairs']}"
                 )
 
-        return self.chunk_id2text(retrieved_chunk_ids), retrieved_chunk_ids, top_chunks
+        # Structured debug payload (third return value). Keeps the full picture so notebooks /
+        # eval scripts can explain why a chunk did or did not reach top-k: base-vs-final ranking,
+        # which tokens contributed base evidence, and the candidate-pool size that was applied.
+        # `top_chunks` stays accessible under the same key for existing callers.
+        debug_info = {
+            "params": {
+                "top_k_chunk": top_k_chunk,
+                "top_k_pair_boosts": top_k_pair_boosts,
+                "lambda_boost": lambda_boost,
+                "candidate_pool_size": candidate_pool_size,
+                "search_mode": search_mode,
+            },
+            "resolved_matches": resolved_matches,
+            "token_weight_map": token_weight_map,
+            "candidate_pool_applied": pool_chunk_ids is not None,
+            "num_scored_chunks": len(scored_chunks),
+            "all_scored_chunks": scored_chunks,
+            "top_chunks": top_chunks,
+        }
+
+        return self.chunk_id2text(retrieved_chunk_ids), retrieved_chunk_ids, debug_info
 
     # Chunk-level bounded boosting: local evidence level for a co-occurring node pair.
     #
-    # Three tiers (highest applicable wins):
-    #   - phrase / modifier relation (1.0): the two nodes were split from the same compositional
-    #     query phrase (shared query_group_id, i.e. head + its modifier), so the query treats them
-    #     as one phrase. Query-side gating, no positional check.
+    # Two tiers (chunk-side verified, highest applicable wins):
     #   - same sentence (0.7): both nodes have an occurrence inside the same chunk sentence,
-    #     decided from the stored span char-offsets.
+    #     decided from index-time sentence ids (schema 7) or the chunk's stored sentence
+    #     boundaries. This is real chunk-side positional evidence, not query-side grouping.
     #   - same chunk (0.4): they only share the chunk.
+    #
+    # There is deliberately no "phrase" tier keyed on query_group_id: that only encodes that the
+    # two nodes were split from one compositional query phrase, which says nothing about whether
+    # they actually form a phrase inside THIS chunk. The "real phrase" signal is carried instead by
+    # the full phrase node matching exactly in assign_base_evidence (weight 1.0, with same-group
+    # head/modifier suppressed there), so re-boosting it here would double-count / inflate chunks
+    # where the two words merely co-occur apart.
     def _local_evidence_level(self, node_a, node_b, chunk_node_id, sentence_boundary_cache=None):
-        group_a = getattr(node_a, "query_group_id", None)
-        group_b = getattr(node_b, "query_group_id", None)
-        if group_a is not None and group_a == group_b:
-            return COOCCUR_LOCAL_EVIDENCE["phrase"]
         if sentence_boundary_cache is not None and self._nodes_share_sentence(
             node_a.sem_node, node_b.sem_node, chunk_node_id, sentence_boundary_cache
         ):
@@ -2914,18 +3072,25 @@ class LiteSemRAG:
             occurrences.append(occurrence)
         return occurrences
 
-    # Resolve the chunk text for a sem node occurrence in a given chunk.
-    def _chunk_text_for_sem_node(self, sem_node, chunk_node_id):
+    # Resolve the ChunkNode a sem node occurs in, by chunk id.
+    def _chunk_node_for_sem_node(self, sem_node, chunk_node_id):
         for chunk_node in getattr(sem_node, "chunk_node_list", []) or []:
             if chunk_node.chunk_node_id == chunk_node_id:
-                return chunk_node.chunk_text
+                return chunk_node
         return None
 
-    # Sentence-ending punctuation offsets for a chunk, cached by chunk id.
-    def _chunk_sentence_boundaries(self, chunk_text, chunk_node_id, cache):
+    # Sentence-boundary char offsets for a chunk, cached by chunk id.
+    #
+    # Prefer the index-time spaCy boundaries (ChunkNode.sentence_boundaries, schema 7: sorted
+    # sent.end_char offsets). Fall back to a .!? scan only for pre-schema-7 chunks that never
+    # stored them — that scan misjudges abbreviations / decimals / numbering and is last resort.
+    def _chunk_sentence_boundaries(self, chunk_node, chunk_node_id, cache):
         if chunk_node_id in cache:
             return cache[chunk_node_id]
-        boundaries = [idx for idx, ch in enumerate(chunk_text) if ch in ".!?"]
+        boundaries = list(getattr(chunk_node, "sentence_boundaries", None) or [])
+        if not boundaries:
+            chunk_text = getattr(chunk_node, "chunk_text", "") or ""
+            boundaries = [idx for idx, ch in enumerate(chunk_text) if ch in ".!?"]
         cache[chunk_node_id] = boundaries
         return boundaries
 
@@ -2944,8 +3109,9 @@ class LiteSemRAG:
     # True when both sem nodes have an occurrence inside the same chunk sentence.
     #
     # Fast path: index-time sentence ids (schema 7) — pure int-set intersection.
-    # Fallback: derive sentence index from span char-offsets via a .!? scan, for old
-    # pickles whose occurrences/chunks predate the precomputed boundaries.
+    # Fallback: derive sentence index from span char-offsets, using the chunk's stored
+    # sentence boundaries when available and a .!? scan only as a last resort, for old
+    # pickles whose occurrences predate the precomputed sentence ids.
     def _nodes_share_sentence(self, sem_a, sem_b, chunk_node_id, cache):
         occ_a = self._sem_node_occurrences_in_chunk(sem_a, chunk_node_id)
         occ_b = self._sem_node_occurrences_in_chunk(sem_b, chunk_node_id)
@@ -2957,10 +3123,12 @@ class LiteSemRAG:
         if sids_a and sids_b:
             return bool(sids_a & sids_b)
 
-        chunk_text = self._chunk_text_for_sem_node(sem_a, chunk_node_id)
-        if not chunk_text:
+        chunk_node = self._chunk_node_for_sem_node(sem_a, chunk_node_id)
+        if chunk_node is None:
             return False
-        boundaries = self._chunk_sentence_boundaries(chunk_text, chunk_node_id, cache)
+        boundaries = self._chunk_sentence_boundaries(chunk_node, chunk_node_id, cache)
+        if not boundaries:
+            return False
         starts_a = [o.span_start for o in occ_a if getattr(o, "span_start", None) is not None]
         starts_b = [o.span_start for o in occ_b if getattr(o, "span_start", None) is not None]
         if not starts_a or not starts_b:
@@ -3127,6 +3295,7 @@ class LiteSemRAG:
         # The combined merge stores sample_order -> description per token; clear it
         # so a fresh finalize re-runs the combined LLM call against current samples.
         self._combined_merge_sample_sense_descriptions = {}
+        self._reset_llm_anchor_sample_assignments()
 
         min_occ = getattr(self, "min_occurrences_for_description", None)
 
@@ -3411,12 +3580,12 @@ class LiteSemRAG:
                 llm_filter_use_cache=False,
                 llm_filter_write_cache=False,
             )
-        except ValueError:
+        except ValueError as exc:
             candidate_bank_cache[token_text] = []
             self._log_wikidata_no_result(
                 token_text,
                 "sem_description",
-                "no_candidate_definitions",
+                getattr(exc, "empty_reason", "no_candidate_definitions"),
             )
             return []
         finally:
@@ -3511,13 +3680,13 @@ class LiteSemRAG:
                 llm_filter_use_api=self.llm_candidate_filter_use_api,
                 fft_samples=fft_samples,
             )
-        except ValueError:
+        except ValueError as exc:
             self._sem_description_candidate_bank_cache[token_text] = []
             self._combined_merge_sample_sense_descriptions[token_text] = {}
             self._log_wikidata_no_result(
                 token_text,
                 "sem_description",
-                "no_candidate_definitions",
+                getattr(exc, "empty_reason", "no_candidate_definitions"),
             )
             return [], {}
         finally:
@@ -4682,6 +4851,105 @@ class LiteSemRAG:
             )
         return prompt_info
 
+    # Return raw LLM sample judgments from the combined candidate-merge call.
+    def _combined_sample_judgments_by_order(self, token_text):
+        cached_result = getattr(self, "llm_candidate_filter_result_cache", {}).get(token_text) or {}
+        metadata = cached_result.get("metadata") or {}
+        raw_judgments = metadata.get("sample_judgments") or []
+        judgments_by_order = {}
+        for item in raw_judgments:
+            if not isinstance(item, dict):
+                continue
+            try:
+                sample_order = int(item.get("sample_order"))
+            except (TypeError, ValueError):
+                continue
+            judgments_by_order[sample_order] = dict(item)
+        return judgments_by_order
+
+    # Find the candidate-bank row matching a description assigned by an LLM sample judgment.
+    def _candidate_by_description(self, candidate_bank, description):
+        if not description:
+            return None
+        for candidate in candidate_bank or []:
+            if candidate.get("description") == description:
+                return candidate
+        return None
+
+    # Persist one LLM-labeled Anchor sample under its token node.
+    def _record_llm_anchor_sample_assignment(
+        self,
+        token_node,
+        sem_node,
+        *,
+        source,
+        sample_order,
+        anchor_position,
+        span_occurrence,
+        prompt_info,
+        description=None,
+        top_candidate=None,
+        raw_judgment=None,
+        accepted_as_anchor_label=False,
+    ):
+        if not hasattr(token_node, "llm_anchor_sample_assignments"):
+            token_node.llm_anchor_sample_assignments = []
+
+        chunk_node = span_occurrence.chunk_node
+        doc_node = getattr(chunk_node, "doc_node", None)
+        if description is None and top_candidate is not None:
+            description = top_candidate.get("description")
+        record = {
+            "record_index": len(token_node.llm_anchor_sample_assignments),
+            "global_record_index": getattr(self, "llm_anchor_sample_assignment_count", 0),
+            "token_text": token_node.token_text,
+            "token_node_id": token_node.token_node_id,
+            "source_sem_node_id": sem_node.sem_node_id if sem_node is not None else None,
+            "sem_assignment_method": self.sem_assignment_method,
+            "source": source,
+            "sample_role": "anchor",
+            "sample_order": sample_order,
+            "anchor_position": anchor_position,
+            "accepted_as_anchor_label": bool(accepted_as_anchor_label),
+            "assigned_description": description,
+            "chunk_node_id": chunk_node.chunk_node_id,
+            "doc_name": getattr(doc_node, "doc_name", None),
+            "span_start": span_occurrence.span_start,
+            "span_end": span_occurrence.span_end,
+            "span_text": span_occurrence.span_text,
+            "matched_text": (prompt_info or {}).get("matched_text"),
+            "context_text": (prompt_info or {}).get("context_text"),
+        }
+
+        if top_candidate is not None:
+            record.update(
+                {
+                    "predicted_entity_id": top_candidate.get("entity_id"),
+                    "predicted_label": top_candidate.get("label"),
+                    "predicted_definition": top_candidate.get("definition"),
+                    "prediction_score": top_candidate.get("score"),
+                    "prediction_method": top_candidate.get("prediction_method", source),
+                    "llm_reason": top_candidate.get("llm_reason"),
+                    "llm_cache_hit": top_candidate.get("llm_cache_hit"),
+                }
+            )
+        if raw_judgment is not None:
+            record.update(
+                {
+                    "judgment": raw_judgment.get("judgment"),
+                    "sense_id": raw_judgment.get("sense_id"),
+                    "confidence": raw_judgment.get("confidence"),
+                    "reason": raw_judgment.get("reason"),
+                    "raw_sample_judgment": dict(raw_judgment),
+                }
+            )
+
+        token_node.llm_anchor_sample_assignments.append(record)
+        self.llm_anchor_sample_assignment_count = (
+            getattr(self, "llm_anchor_sample_assignment_count", 0) + 1
+        )
+        return record
+
     # 标注 anchor 子集 + 取候选库。返回 (candidate_bank, {pos: description})。
     def _label_anchor_positions(self, sem_node, records, anchor_positions):
         token_text = sem_node.token_node.token_text
@@ -4715,13 +4983,29 @@ class LiteSemRAG:
             candidate_bank, sample_sense_descriptions = self._run_combined_merge_for_samples(
                 sem_node, fft_samples
             )
+            judgments_by_order = self._combined_sample_judgments_by_order(token_text)
+            valid_descriptions = {candidate["description"] for candidate in candidate_bank}
+            for sample_index, pos, span_occurrence, prompt_info in prepared:
+                description = sample_sense_descriptions.get(sample_index)
+                top_candidate = self._candidate_by_description(candidate_bank, description)
+                accepted = description in valid_descriptions
+                self._record_llm_anchor_sample_assignment(
+                    sem_node.token_node,
+                    sem_node,
+                    source="llm_candidate_merge",
+                    sample_order=sample_index,
+                    anchor_position=pos,
+                    span_occurrence=span_occurrence,
+                    prompt_info=prompt_info,
+                    description=description,
+                    top_candidate=top_candidate,
+                    raw_judgment=judgments_by_order.get(sample_index),
+                    accepted_as_anchor_label=accepted,
+                )
+                if accepted:
+                    anchor_labels[pos] = description
             if not candidate_bank:
                 return [], {}
-            valid_descriptions = {candidate["description"] for candidate in candidate_bank}
-            for sample_index, pos, _span_occurrence, _prompt_info in prepared:
-                description = sample_sense_descriptions.get(sample_index)
-                if description in valid_descriptions:
-                    anchor_labels[pos] = description
             return candidate_bank, anchor_labels
 
         candidate_bank = self._load_sem_description_candidate_bank(
@@ -4735,9 +5019,31 @@ class LiteSemRAG:
                 [prompt_info for _idx, _pos, _occ, prompt_info in prepared],
                 candidate_bank,
             )
-            for (_idx, pos, _occ, _prompt_info), top_candidate in zip(prepared, top_candidates):
-                if top_candidate is not None:
-                    anchor_labels[pos] = top_candidate["description"]
+            for (idx, pos, span_occurrence, prompt_info), top_candidate in zip(prepared, top_candidates):
+                if top_candidate is None:
+                    self._record_llm_anchor_sample_assignment(
+                        sem_node.token_node,
+                        sem_node,
+                        source="llm_semantic_labeler",
+                        sample_order=idx,
+                        anchor_position=pos,
+                        span_occurrence=span_occurrence,
+                        prompt_info=prompt_info,
+                        accepted_as_anchor_label=False,
+                    )
+                    continue
+                anchor_labels[pos] = top_candidate["description"]
+                self._record_llm_anchor_sample_assignment(
+                    sem_node.token_node,
+                    sem_node,
+                    source="llm_semantic_labeler",
+                    sample_order=idx,
+                    anchor_position=pos,
+                    span_occurrence=span_occurrence,
+                    prompt_info=prompt_info,
+                    top_candidate=top_candidate,
+                    accepted_as_anchor_label=True,
+                )
         else:
             for _idx, pos, span_occurrence, _prompt_info in prepared:
                 top_candidate = self._predict_description_for_span_occurrence(
@@ -5324,14 +5630,6 @@ class LiteSemRAG:
         }
         sample_events = [e for e in operations if e.get("event_type") in sample_assignment_event_types]
         merge_events = [e for e in operations if e.get("event_type") == "merge_sem_nodes_with_same_description"]
-        handled_event_types = (
-            {"assign_description_by_consensus",
-             "split_sem_node_by_sample_labels",
-             "create_split_sem_node",
-             "merge_sem_nodes_with_same_description"}
-            | sample_assignment_event_types
-        )
-        misc_events = [e for e in operations if e.get("event_type") not in handled_event_types]
 
         create_split_by_source = defaultdict(list)
         for event in create_split_events:
@@ -5358,6 +5656,12 @@ class LiteSemRAG:
         }
 
         lines = []
+        timing_lines = self._format_index_session_timing()
+        if timing_lines:
+            lines.append("=== Index session running info ===")
+            lines.append("")
+            lines.extend(timing_lines)
+            lines.append("")
         lines.append("=== Semantic description log ===")
         lines.append("")
         lines.append(timeline_text)
@@ -5607,18 +5911,6 @@ class LiteSemRAG:
                     )
                 )
 
-        if misc_events:
-            lines.append("")
-            lines.append(f"[6] Other operations ({len(misc_events)})")
-            for event in misc_events:
-                event_type = event.get("event_type", "unknown")
-                payload = ", ".join(
-                    f"{key}={value!r}"
-                    for key, value in event.items()
-                    if key != "event_type"
-                )
-                lines.append(f"  [{event_type}] {payload}")
-
         return "\n".join(lines)
 
     # Format a per-sample assignment event into a single human-readable line.
@@ -5715,25 +6007,41 @@ class LiteSemRAG:
             "</details>"
         )
 
-    # Render the LiteSemRAG configuration (simple self.* attributes) as a JSON-formatted block.
+    # Render the LiteSemRAG configuration (self.* attributes) as a JSON-formatted block.
+    # Scalar attributes are dumped verbatim; small JSON-serializable containers (config
+    # dicts/lists such as anchor_prop_params) are expanded so the dump shows their real
+    # values instead of "<dict>". Runtime handles, large graph containers, per-token
+    # caches, and log buffers are skipped.
     def _format_self_config_text(self):
-        # Skip runtime handles, large graph containers, queues, indexes, and log buffers.
         skip_field_names = set(RUNTIME_FIELD_NAMES) | {
             "doc_nodes", "chunk_nodes", "token_nodes", "phrase_token_nodes", "sem_nodes",
             "token_node_query", "phrase_index", "modifier_postings", "query_database",
             "predicted_sem_description_logs", "deleted_merged_sem_logs",
             "sem_description_operation_logs", "wikidata_no_result_logs",
             "_wikidata_no_result_keys", "_sem_description_candidate_bank_cache",
+            "_combined_merge_sample_sense_descriptions",
+            "llm_candidate_filter_result_cache",
         }
-        allowed_types = (str, int, float, bool, type(None))
+        scalar_types = (str, int, float, bool, type(None))
+        # Cap on the serialized length of an expanded container so large runtime
+        # caches that slipped past skip_field_names still render as "<dict>".
+        max_container_chars = 4000
         config = {}
         for name, value in sorted(vars(self).items()):
             if name in skip_field_names:
                 continue
-            if isinstance(value, allowed_types):
+            if isinstance(value, scalar_types):
                 config[name] = value
-            else:
-                config[name] = f"<{type(value).__name__}>"
+                continue
+            if isinstance(value, (dict, list, tuple)):
+                try:
+                    serialized = json.dumps(value, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    serialized = None
+                if serialized is not None and len(serialized) <= max_container_chars:
+                    config[name] = json.loads(serialized)
+                    continue
+            config[name] = f"<{type(value).__name__}>"
         return json.dumps(config, indent=2, ensure_ascii=False, default=str)
 
     # Save semantic-description logs and return the output path.
@@ -6278,6 +6586,18 @@ class LiteSemRAG:
             finally:
                 safe_queue_put(result_queue, None)
 
+        # Thread-safety invariant (graph mutation is intentionally lock-free):
+        # this is a strict single-producer -> single-encoder -> single-consumer
+        # pipeline, and mutable graph state is partitioned by exclusive owner:
+        #   - cpu_preprocess_worker is the SOLE writer of doc_nodes / chunk_nodes
+        #     / doc_node_map and the SOLE caller of self.nlp;
+        #   - the main consumer loop below is the SOLE writer of token nodes
+        #     (via process_embeds);
+        #   - gpu_worker touches no graph state.
+        # The only shared mutable counters (preprocess_done / gpu_done /
+        # cpu_done) are guarded by progress_lock. Do NOT spawn a second worker
+        # for any stage without first adding locks around node creation and id
+        # allocation, or this partitioning (and its lock-free safety) breaks.
         preprocess_thread = threading.Thread(target=cpu_preprocess_worker)
         gpu_thread = threading.Thread(target=gpu_worker)
 
@@ -6588,6 +6908,342 @@ class LiteSemRAG:
             limited_data[token_text] = limited_token_info
 
         return limited_data
+
+    # Return token-grouped LLM assignments made for Anchor samples.
+    def inspect_llm_anchor_sample_assignments(self):
+        result = {}
+        for token_node in self.token_nodes:
+            records = list(getattr(token_node, "llm_anchor_sample_assignments", []) or [])
+            if not records:
+                continue
+            description_counts = Counter(
+                record.get("assigned_description") or "(unassigned)"
+                for record in records
+            )
+            source_counts = Counter(
+                record.get("source") or "unknown"
+                for record in records
+            )
+            result[token_node.token_text] = {
+                "token_node_id": token_node.token_node_id,
+                "sem_count": len(token_node.sem_node_list),
+                "s_mean": getattr(token_node, "s_mean", None),
+                "record_count": len(records),
+                "accepted_count": sum(
+                    1 for record in records if record.get("accepted_as_anchor_label")
+                ),
+                "description_counts": dict(description_counts),
+                "source_counts": dict(source_counts),
+                "records": records,
+            }
+        return result
+
+    # Filter, sort, and truncate LLM Anchor assignment inspection data.
+    def _select_llm_anchor_sample_assignments(
+            self,
+            inspect_data,
+            token_contains=None,
+            sort_by="record_count",
+            max_token_nodes=None,
+            max_records_per_token=None,
+    ):
+        items = list(inspect_data.items())
+        if token_contains:
+            keyword = token_contains.lower()
+            items = [
+                (token_text, token_info)
+                for token_text, token_info in items
+                if keyword in token_text.lower()
+            ]
+
+        if sort_by == "token_text":
+            items.sort(key=lambda x: x[0].lower())
+        elif sort_by == "accepted_count":
+            items.sort(key=lambda x: x[1]["accepted_count"], reverse=True)
+        elif sort_by == "sem_count":
+            items.sort(key=lambda x: x[1]["sem_count"], reverse=True)
+        else:
+            items.sort(key=lambda x: x[1]["record_count"], reverse=True)
+
+        if max_token_nodes is not None:
+            items = items[:max_token_nodes]
+
+        selected = {}
+        for token_text, token_info in items:
+            records = list(token_info["records"])
+            records.sort(
+                key=lambda record: (
+                    record.get("source_sem_node_id") if record.get("source_sem_node_id") is not None else -1,
+                    record.get("sample_order") if record.get("sample_order") is not None else -1,
+                    record.get("anchor_position") if record.get("anchor_position") is not None else -1,
+                )
+            )
+            if max_records_per_token is not None:
+                records = records[:max_records_per_token]
+            selected[token_text] = {
+                **token_info,
+                "displayed_record_count": len(records),
+                "records": records,
+            }
+        return selected
+
+    # Format LLM Anchor assignment inspection results as plain text.
+    def _format_llm_anchor_sample_assignments_text(self, inspect_data):
+        lines = []
+        for token_text, token_info in inspect_data.items():
+            s_mean = token_info.get("s_mean")
+            s_mean_text = f"{s_mean:.4f}" if s_mean is not None else "N/A"
+            lines.append(
+                f"[Token] {token_text} | token_node_id={token_info['token_node_id']} | "
+                f"sem_count={token_info['sem_count']} | s_mean={s_mean_text} | "
+                f"records={token_info['record_count']} | accepted={token_info['accepted_count']} | "
+                f"displayed={token_info.get('displayed_record_count', token_info['record_count'])}"
+            )
+            lines.append(f"  descriptions={token_info.get('description_counts', {})}")
+            lines.append(f"  sources={token_info.get('source_counts', {})}")
+            for idx, record in enumerate(token_info["records"], start=1):
+                lines.append(
+                    "  ({}) source={} | sample_order={} | anchor_position={} | "
+                    "accepted={} | description={!r} | doc={!r} | chunk_id={} | span=({}, {})".format(
+                        idx,
+                        record.get("source"),
+                        record.get("sample_order"),
+                        record.get("anchor_position"),
+                        record.get("accepted_as_anchor_label"),
+                        record.get("assigned_description"),
+                        record.get("doc_name"),
+                        record.get("chunk_node_id"),
+                        record.get("span_start"),
+                        record.get("span_end"),
+                    )
+                )
+                if record.get("judgment"):
+                    lines.append(
+                        "      judgment={} | confidence={} | reason={!r}".format(
+                            record.get("judgment"),
+                            record.get("confidence"),
+                            record.get("reason"),
+                        )
+                    )
+                if record.get("matched_text"):
+                    lines.append(f"      matched_text={record.get('matched_text')!r}")
+                if record.get("context_text"):
+                    lines.append(f"      context={record.get('context_text')}")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    # Format LLM Anchor assignment inspection results as clickable HTML details.
+    def _build_llm_anchor_sample_assignments_html(self, inspect_data, open_details=False):
+        total_tokens = len(inspect_data)
+        total_records = sum(info["record_count"] for info in inspect_data.values())
+        total_displayed = sum(
+            info.get("displayed_record_count", info["record_count"])
+            for info in inspect_data.values()
+        )
+        html_parts = [
+            "<div style='font-family:Arial, sans-serif; line-height:1.5;'>",
+            "<div style='margin-bottom:12px; padding:10px 12px; background:#f3f6f9; "
+            "border:1px solid #d8e0e8; border-radius:8px;'>"
+            f"<strong>LLM Anchor sample assignment token nodes:</strong> {total_tokens} | "
+            f"records: {total_records} | displayed records: {total_displayed}"
+            "</div>",
+        ]
+        open_attr = " open" if open_details else ""
+
+        for token_text, token_info in inspect_data.items():
+            s_mean = token_info.get("s_mean")
+            s_mean_text = f"{s_mean:.4f}" if s_mean is not None else "N/A"
+            desc_counts = ", ".join(
+                f"{desc}: {count}"
+                for desc, count in token_info.get("description_counts", {}).items()
+            ) or "-"
+            source_counts = ", ".join(
+                f"{source}: {count}"
+                for source, count in token_info.get("source_counts", {}).items()
+            ) or "-"
+            token_meta = (
+                f"token_node_id={token_info['token_node_id']} | "
+                f"sem_count={token_info['sem_count']}, "
+                f"s_mean={s_mean_text}, "
+                f"records={token_info['record_count']}, "
+                f"accepted={token_info['accepted_count']}, "
+                f"displayed={token_info.get('displayed_record_count', token_info['record_count'])}"
+            )
+            html_parts.append(
+                "<details style='margin:10px 0; border:1px solid #ddd; "
+                f"border-radius:8px; padding:8px 12px; background:#fafafa;'{open_attr}>"
+                f"<summary style='cursor:pointer; font-weight:700;'>{escape(token_text)}</summary>"
+                f"<div style='margin:6px 0 0 2px; font-size:12px; color:#666;'>{escape(token_meta)}</div>"
+                f"<div style='margin:4px 0 0 2px; font-size:12px; color:#666;'>descriptions: {escape(desc_counts)}</div>"
+                f"<div style='margin:4px 0 8px 2px; font-size:12px; color:#666;'>sources: {escape(source_counts)}</div>"
+            )
+
+            for record in token_info["records"]:
+                description = record.get("assigned_description") or "(unassigned)"
+                summary = (
+                    f"sample_order={record.get('sample_order')} | "
+                    f"anchor_position={record.get('anchor_position')} | "
+                    f"description={description} | "
+                    f"accepted={record.get('accepted_as_anchor_label')}"
+                )
+                meta = (
+                    f"source={record.get('source')} | method={record.get('sem_assignment_method')} | "
+                    f"doc={record.get('doc_name')} | chunk_id={record.get('chunk_node_id')} | "
+                    f"span=({record.get('span_start')}, {record.get('span_end')})"
+                )
+                judgment = (
+                    f"judgment={record.get('judgment')} | sense_id={record.get('sense_id')} | "
+                    f"confidence={record.get('confidence')} | reason={record.get('reason')}"
+                    if record.get("judgment") or record.get("reason")
+                    else ""
+                )
+                candidate = (
+                    f"entity_id={record.get('predicted_entity_id')} | "
+                    f"label={record.get('predicted_label')} | "
+                    f"definition={record.get('predicted_definition')}"
+                    if record.get("predicted_entity_id") or record.get("predicted_label")
+                    else ""
+                )
+                html_parts.append(
+                    "<details style='margin:8px 0 8px 16px; padding:8px 10px; "
+                    "border-left:4px solid #9467bd; background:#fff;'>"
+                    f"<summary style='cursor:pointer; font-weight:600;'>{escape(summary)}</summary>"
+                    f"<div style='font-size:12px; color:#666; margin-top:4px;'>{escape(meta)}</div>"
+                )
+                if judgment:
+                    html_parts.append(
+                        f"<div style='font-size:12px; color:#666; margin-top:4px;'>{escape(judgment)}</div>"
+                    )
+                if candidate:
+                    html_parts.append(
+                        f"<div style='font-size:12px; color:#666; margin-top:4px;'>{escape(candidate)}</div>"
+                    )
+                if record.get("matched_text"):
+                    html_parts.append(
+                        "<div style='margin-top:6px;'><strong>Matched text:</strong> "
+                        f"{escape(str(record.get('matched_text')))}</div>"
+                    )
+                if record.get("context_text"):
+                    html_parts.append(
+                        "<div style='margin-top:6px; white-space:pre-wrap;'>"
+                        f"{escape(str(record.get('context_text')))}</div>"
+                    )
+                html_parts.append("</details>")
+            html_parts.append("</details>")
+
+        html_parts.append("</div>")
+        return "".join(html_parts)
+
+    # Display LLM-labeled Anchor samples grouped by token node.
+    def show_llm_anchor_sample_assignments(
+            self,
+            as_html=True,
+            token_contains=None,
+            sort_by="record_count",
+            max_token_nodes=50,
+            max_records_per_token=20,
+            open_details=False,
+    ):
+        inspect_data = self.inspect_llm_anchor_sample_assignments()
+        inspect_data = self._select_llm_anchor_sample_assignments(
+            inspect_data,
+            token_contains=token_contains,
+            sort_by=sort_by,
+            max_token_nodes=max_token_nodes,
+            max_records_per_token=max_records_per_token,
+        )
+
+        if not inspect_data:
+            empty_text = "No LLM Anchor sample assignment records were found."
+            if as_html:
+                try:
+                    from IPython.display import HTML
+                    return HTML(f"<div>{escape(empty_text)}</div>")
+                except ImportError:
+                    return empty_text
+            return empty_text
+
+        if as_html:
+            try:
+                from IPython.display import HTML
+                return HTML(
+                    self._build_llm_anchor_sample_assignments_html(
+                        inspect_data,
+                        open_details=open_details,
+                    )
+                )
+            except ImportError:
+                pass
+
+        return self._format_llm_anchor_sample_assignments_text(inspect_data)
+
+    # 列顺序:把 token 级元信息放前面,原文(matched_text/context_text/span_text)放后面,
+    # 既能当表格扫一眼,又完整保留上下文文本,避免在 notebook 里渲染海量嵌套 <details>。
+    _LLM_ANCHOR_CSV_COLUMNS = [
+        "token_text", "token_node_id", "sem_count", "s_mean",
+        "source_sem_node_id", "sem_assignment_method", "source",
+        "sample_order", "anchor_position", "accepted_as_anchor_label",
+        "assigned_description",
+        "doc_name", "chunk_node_id", "span_start", "span_end",
+        "predicted_entity_id", "predicted_label", "predicted_definition",
+        "prediction_score", "prediction_method", "llm_cache_hit", "llm_reason",
+        "judgment", "sense_id", "confidence", "reason",
+        "matched_text", "context_text", "span_text",
+    ]
+
+    # 把所有 LLM Anchor 样本分配记录展平成一行一条、含原文的表格写入本地文件(默认 CSV)。
+    # 返回写出的文件路径。token_contains/sort_by 仅用于可选过滤/排序,默认导出全部记录。
+    def save_llm_anchor_sample_assignments_csv(
+            self,
+            output_path=None,
+            token_contains=None,
+            sort_by="record_count",
+            max_token_nodes=None,
+            max_records_per_token=None,
+    ):
+        import csv
+
+        inspect_data = self.inspect_llm_anchor_sample_assignments()
+        inspect_data = self._select_llm_anchor_sample_assignments(
+            inspect_data,
+            token_contains=token_contains,
+            sort_by=sort_by,
+            max_token_nodes=max_token_nodes,
+            max_records_per_token=max_records_per_token,
+        )
+
+        if output_path is None:
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            logs_dir = os.path.join(project_root, "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(logs_dir, f"llm_anchor_assignments_{timestamp}.csv")
+        else:
+            parent = os.path.dirname(os.path.abspath(output_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        columns = self._LLM_ANCHOR_CSV_COLUMNS
+        row_count = 0
+        with open(output_path, "w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for token_info in inspect_data.values():
+                token_meta = {
+                    "sem_count": token_info.get("sem_count"),
+                    "s_mean": token_info.get("s_mean"),
+                }
+                for record in token_info["records"]:
+                    row = {column: record.get(column) for column in columns}
+                    row.update(token_meta)
+                    writer.writerow(row)
+                    row_count += 1
+
+        print(
+            f"Saved {row_count} LLM Anchor sample assignment records "
+            f"({len(inspect_data)} token nodes) to {output_path}"
+        )
+        return output_path
 
     # Format semantic-node inspection results as plain text.
     # Render the s_mean aggregate as a one-line plain-text summary.
@@ -6961,7 +7617,10 @@ class LiteSemRAG:
         self._ensure_backward_compatible_attrs()
         if self.text_encoder is None or self.tokenizer is None:
             self._load_text_encoder()
-        self.save_doc_to_json()
+        # Loading must not write to disk: index_documents.json is refreshed by
+        # save_doc_to_json() at index/finalize time, not on deserialization.
+        # Writing here would let loading one graph overwrite another graph's
+        # doc-name list under the same working directory.
         if self.executor is None:
             self.executor = ThreadPoolExecutor(max_workers=4)
         if getattr(self, "encoder_lock", None) is None:

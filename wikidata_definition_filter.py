@@ -36,10 +36,9 @@ DEFAULT_MAX_TOKENS = 1024
 DEFAULT_API_MODEL = "gpt-5.4-mini"
 DEFAULT_API_KEY_FILE = "API_KEY"
 WIKIDATA_CANDIDATE_FILTER_VERSION = "merge_prompt_v5_coarse_examples"
-# Combined merge + per-sample judgment prompt, ported verbatim from
-# jupyter_notebooks/wikidata_llm_candidate_merge_experiment.ipynb. Only the JSON
-# payload shape is adapted to the engine; the instruction text is unchanged.
-WIKIDATA_CANDIDATE_MERGE_WITH_SAMPLES_VERSION = "merge_with_samples_prompt_v1"
+# Combined merge + per-sample judgment prompt, adapted from
+# jupyter_notebooks/wikidata_llm_candidate_merge_experiment.ipynb.
+WIKIDATA_CANDIDATE_MERGE_WITH_SAMPLES_VERSION = "merge_with_samples_prompt_v2"
 
 
 SYSTEM_PROMPT = """You are a conservative lexical-sense merger for a semantic retrieval system.
@@ -156,6 +155,7 @@ Default bias:
 - When uncertain, merge.
 - A merged sense must describe a general meaning, category, role, function, or concept. Do not write a merged sense as a description of one specific named object, work, organization, place, person, or identifier.
 - If the evidence only supports one specific named item and cannot be generalized into a reusable lexical meaning, discard that candidate instead of creating a specific named-object sense.
+- Always discard name-category senses such as given name, family name, surname, personal name, first name, forename, or given-name/family-name variants. Do not keep or merge a sense whose only meaning is that the target word is used as a person's name.
 
 Split only when:
 1. The meanings are genuinely different entity types or concepts, such as fruit vs company or financial bank vs river bank.
@@ -297,6 +297,7 @@ def fetch_wikidata_candidates(
 def build_llm_client(
     use_api: bool = False,
     *,
+    provider: str | None = None,
     model: str | None = None,
     api_key_file: str = DEFAULT_API_KEY_FILE,
 ) -> LocalLLMClient:
@@ -305,14 +306,19 @@ def build_llm_client(
     ``use_api=False`` (default) uses the local OpenAI-compatible server defined
     by environment variables (see ``LocalLLMConfig.from_env``).
 
-    ``use_api=True`` uses the OpenAI API with the key loaded from
-    ``api_key_file`` (defaults to ``API_KEY`` in the project root) and the
-    model defaults to ``gpt-5.4-mini``.
+    ``use_api=True`` uses a hosted API with the key loaded from
+    ``api_key_file`` (defaults to ``API_KEY`` in the project root).
+    ``provider`` selects ``openai`` (default) or ``deepseek``; DeepSeek always
+    uses ``deepseek-v4-flash``.
     """
     if use_api:
+        resolved_provider = (provider or "openai").strip().lower()
+        resolved_model = model
+        if resolved_model is None and resolved_provider == "openai":
+            resolved_model = DEFAULT_API_MODEL
         config = LocalLLMConfig.from_env(
-            provider="openai",
-            model=model or DEFAULT_API_MODEL,
+            provider=resolved_provider,
+            model=resolved_model,
             api_key_file=api_key_file,
         )
     else:
@@ -651,6 +657,7 @@ class WikidataDefinitionFilter:
         llm_client: LocalLLMClient | None = None,
         *,
         use_api: bool = False,
+        api_provider: str | None = None,
         api_model: str | None = None,
         api_key_file: str = DEFAULT_API_KEY_FILE,
         config: LocalLLMConfig | None = None,
@@ -664,6 +671,7 @@ class WikidataDefinitionFilter:
             else:
                 llm_client = build_llm_client(
                     use_api=use_api,
+                    provider=api_provider,
                     model=api_model,
                     api_key_file=api_key_file,
                 )

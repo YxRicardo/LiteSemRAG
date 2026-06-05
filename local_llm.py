@@ -19,6 +19,12 @@ DEFAULT_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
 DEFAULT_API_KEY = "dummy"
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_OPENAI_API_KEY_FILE = "API_KEY"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+
+_OPENAI_KEY_NAMES = frozenset({"OPENAI_API_KEY", "API_KEY", "chatgpt_api"})
+_DEEPSEEK_KEY_NAMES = frozenset({"DEEPSEEK_API_KEY", "deepseek_api"})
+_SUPPORTED_PROVIDERS = frozenset({"local", "openai", "deepseek"})
 
 ALLOWED_CHAT_PARAMS = {
     "temperature",
@@ -59,16 +65,18 @@ class LocalLLMConfig:
     ) -> "LocalLLMConfig":
         provider_name = (provider or os.getenv("LLM_PROVIDER") or DEFAULT_PROVIDER)
         provider_name = provider_name.strip().lower()
-        if provider_name not in {"local", "openai"}:
+        if provider_name not in _SUPPORTED_PROVIDERS:
+            supported = ", ".join(sorted(_SUPPORTED_PROVIDERS))
             raise ValueError(
-                f"Unsupported LLM provider {provider_name!r}; use 'local' or 'openai'."
+                f"Unsupported LLM provider {provider_name!r}; use one of: {supported}."
             )
 
-        timeout_raw = (
-            os.getenv("OPENAI_TIMEOUT")
-            if provider_name == "openai"
-            else os.getenv("LOCAL_LLM_TIMEOUT")
-        )
+        if provider_name == "openai":
+            timeout_raw = os.getenv("OPENAI_TIMEOUT")
+        elif provider_name == "deepseek":
+            timeout_raw = os.getenv("DEEPSEEK_TIMEOUT") or os.getenv("OPENAI_TIMEOUT")
+        else:
+            timeout_raw = os.getenv("LOCAL_LLM_TIMEOUT")
         timeout = float(timeout_raw) if timeout_raw else 120.0
 
         if provider_name == "openai":
@@ -77,11 +85,33 @@ class LocalLLMConfig:
                 or os.getenv("OPENAI_API_KEY_FILE")
                 or DEFAULT_OPENAI_API_KEY_FILE
             )
-            api_key = os.getenv("OPENAI_API_KEY") or _read_api_key_file(key_file)
+            api_key = os.getenv("OPENAI_API_KEY") or _read_api_key_file(
+                key_file,
+                key_names=_OPENAI_KEY_NAMES,
+            )
             return cls(
                 provider=provider_name,
                 base_url=os.getenv("OPENAI_BASE_URL", ""),
                 model=model or os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+                api_key=api_key,
+                api_key_file=key_file,
+                timeout=timeout,
+            )
+
+        if provider_name == "deepseek":
+            key_file = (
+                api_key_file
+                or os.getenv("DEEPSEEK_API_KEY_FILE")
+                or DEFAULT_OPENAI_API_KEY_FILE
+            )
+            api_key = os.getenv("DEEPSEEK_API_KEY") or _read_api_key_file(
+                key_file,
+                key_names=_DEEPSEEK_KEY_NAMES,
+            )
+            return cls(
+                provider=provider_name,
+                base_url=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL),
+                model=DEFAULT_DEEPSEEK_MODEL,
                 api_key=api_key,
                 api_key_file=key_file,
                 timeout=timeout,
@@ -96,7 +126,32 @@ class LocalLLMConfig:
         )
 
 
-def _read_api_key_file(path: str | os.PathLike[str]) -> str:
+def _normalize_key_file_line(line: str) -> str:
+    return line.strip().strip('"').strip(",").strip().strip('"')
+
+
+def _parse_key_assignment(line: str) -> tuple[str, str] | None:
+    line = _normalize_key_file_line(line)
+    if not line or line.startswith("#"):
+        return None
+    for separator in ("=", ":"):
+        if separator not in line:
+            continue
+        name, value = line.split(separator, 1)
+        name = name.strip().strip("'\"")
+        value = value.strip().strip(",").strip().strip("'\"")
+        if name or value.startswith("sk-"):
+            return name, value
+    if line.startswith("sk-"):
+        return "", line
+    return None
+
+
+def _read_api_key_file(
+    path: str | os.PathLike[str],
+    *,
+    key_names: Iterable[str] | None = None,
+) -> str:
     key_path = Path(path).expanduser()
     if not key_path.is_absolute():
         key_path = Path.cwd() / key_path
@@ -104,34 +159,29 @@ def _read_api_key_file(path: str | os.PathLike[str]) -> str:
     if not text:
         raise ValueError(f"API key file is empty: {key_path}")
 
-    key_match = re.search(r"sk-[A-Za-z0-9_-]+", text)
-    if key_match:
-        return key_match.group(0)
+    preferred_names = {
+        name.strip().lower()
+        for name in (key_names or _OPENAI_KEY_NAMES)
+    }
+    fallback_keys: list[str] = []
 
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    for raw_line in text.splitlines():
+        parsed = _parse_key_assignment(raw_line)
+        if parsed is None:
             continue
-        if "=" in line:
-            name, value = line.split("=", 1)
-            name = name.strip().strip("'\"")
-            value = value.strip().strip(",").strip().strip("'\"")
-            if name in {"OPENAI_API_KEY", "API_KEY", "chatgpt_api"}:
-                return value
-            if value.startswith("sk-"):
-                return value
+        name, value = parsed
+        if not value:
             continue
-        if ":" in line:
-            name, value = line.split(":", 1)
-            name = name.strip().strip("'\"")
-            value = value.strip().strip(",").strip().strip("'\"")
-            if name in {"OPENAI_API_KEY", "API_KEY", "chatgpt_api"}:
-                return value
-            if value.startswith("sk-"):
-                return value
-        return line.strip().strip("'\"")
+        if name.lower() in preferred_names:
+            return value
+        if value.startswith("sk-"):
+            fallback_keys.append(value)
 
-    raise ValueError(f"No API key found in {key_path}")
+    if len(fallback_keys) == 1:
+        return fallback_keys[0]
+
+    expected = ", ".join(sorted(preferred_names))
+    raise ValueError(f"No API key found in {key_path} (expected one of: {expected})")
 
 
 def _load_openai_class():
@@ -180,7 +230,13 @@ def _filter_chat_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in ALLOWED_CHAT_PARAMS}
 
 
-def _chat_kwargs_for_model(model: str, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+def _chat_kwargs_for_model(
+    model: str,
+    kwargs: Mapping[str, Any],
+    *,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    extra_body = kwargs.get("extra_body")
     filtered = _filter_chat_kwargs(kwargs)
     model_name = model.lower()
     if model_name.startswith(("gpt-5", "o1", "o3", "o4")):
@@ -189,6 +245,14 @@ def _chat_kwargs_for_model(model: str, kwargs: Mapping[str, Any]) -> dict[str, A
             filtered["max_completion_tokens"] = max_tokens
         filtered.pop("temperature", None)
         filtered.pop("top_p", None)
+    if provider == "deepseek" or model_name.startswith("deepseek-"):
+        merged_extra_body = dict(extra_body or {})
+        thinking = merged_extra_body.get("thinking")
+        if not isinstance(thinking, dict):
+            merged_extra_body["thinking"] = {"type": "disabled"}
+        filtered["extra_body"] = merged_extra_body
+    elif extra_body:
+        filtered["extra_body"] = extra_body
     return filtered
 
 
@@ -234,7 +298,7 @@ class LocalLLMSyncClient:
             "api_key": self.config.api_key,
             "timeout": self.config.timeout,
         }
-        if self.config.provider == "local":
+        if self.config.provider in {"local", "deepseek"}:
             client_kwargs["base_url"] = self.config.base_url
         elif self.config.base_url:
             client_kwargs["base_url"] = self.config.base_url
@@ -253,7 +317,11 @@ class LocalLLMSyncClient:
             response = self.client.chat.completions.create(
                 model=self.config.model,
                 messages=messages,
-                **_chat_kwargs_for_model(self.config.model, kwargs),
+                **_chat_kwargs_for_model(
+                    self.config.model,
+                    kwargs,
+                    provider=self.config.provider,
+                ),
             )
         finally:
             self.last_api_wait_wall_time = time.perf_counter() - request_start

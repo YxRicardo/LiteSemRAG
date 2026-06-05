@@ -594,9 +594,20 @@ def load_wikidata_definition_candidates(
                 write_cache=llm_filter_write_cache,
             )
         if not result.definitions:
-            raise ValueError(
+            # Classify *why* the LLM filter produced no definitions so callers can
+            # log a specific reason instead of the catch-all no_candidate_definitions.
+            metadata = getattr(result, "metadata", None) or {}
+            if metadata.get("note") == "no_wikidata_candidates":
+                empty_reason = "no_wikidata_candidates"
+            elif metadata.get("parse_error"):
+                empty_reason = "llm_parse_error"
+            else:
+                empty_reason = "llm_empty_merge"
+            error = ValueError(
                 f"WikidataDefinitionFilter returned no definitions for span={query_text!r}."
             )
+            error.empty_reason = empty_reason
+            raise error
 
         rows = []
         for rank, defn in enumerate(result.definitions, start=1):

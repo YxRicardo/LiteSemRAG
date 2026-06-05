@@ -184,6 +184,15 @@ Indexing builds no semantic nodes and runs no clustering: after chunks are
 consumed the pipeline only logs timing. All semantic-node construction is
 deferred to `finalize()`.
 
+These stages run as a strict single-producer -> single-encoder -> single-consumer
+thread pipeline with **no locks around graph mutation**. Mutable graph state is
+partitioned by exclusive owner: the CPU preprocessing thread is the sole writer
+of `doc_nodes` / `chunk_nodes` and the sole caller of `self.nlp`; the main
+consumer thread is the sole writer of token nodes (via `process_embeds()`); the
+GPU thread touches no graph state. Only the progress counters are shared, guarded
+by a lock. Adding a second worker to any stage requires adding locks around node
+creation and id allocation first.
+
 ### 3.3 Embedding Ingestion
 
 `process_embeds(new_chunk_node, phrase_embs, token_embs)` handles every
@@ -429,13 +438,21 @@ Other query helpers:
   inspection or storage.
 
 Backward compatibility is handled by `_ensure_backward_compatible_attrs()` and
-node-specific helpers. `CURRENT_SCHEMA_VERSION = 5`; older pickles are upgraded
-for renamed `proto_*` fields, missing occurrence metadata, retained embeddings,
-compositional phrase metadata, and modifier postings, and have the removed
-`anomaly_section` / `anomaly_threshold` attributes stripped (schema 5).
+node-specific helpers. `CURRENT_SCHEMA_VERSION = 8`; older pickles are upgraded
+in place for renamed `proto_*` fields, missing occurrence metadata, retained
+embeddings, compositional phrase metadata, and modifier postings, with the
+removed `anomaly_section` / `anomaly_threshold` attributes stripped (schema 5).
+Later revisions add: `TokenNode.s_mean`, the finalize-time embedding
+concentration, defaulted to `None` on pre-6 pickles (schema 6); sentence indexing
+— `ChunkNode.sentence_boundaries` (spaCy `sent.end_char` offsets) and
+per-occurrence `sentence_id`, both `None` on pre-7 pickles, which triggers the
+query-time char-offset fallback in `_nodes_share_sentence` (schema 7); and
+`TokenNode.llm_anchor_sample_assignments`, the LLM-decided anchor samples used by
+anchor propagation, defaulted to `[]` on pre-8 pickles (schema 8).
 
 `save_doc_to_json()` writes only indexed document names to
-`index_documents.json`.
+`index_documents.json`. It runs at index / finalize time only — `load_data()` /
+`load_data_split()` restore runtime handles but do **not** write to disk.
 
 ---
 
