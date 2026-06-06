@@ -130,6 +130,20 @@ def _normalize_key_file_line(line: str) -> str:
     return line.strip().strip('"').strip(",").strip().strip('"')
 
 
+def _clean_key_value(value: str) -> str:
+    """Strip surrounding quotes/commas/whitespace and trailing literal escape
+    sequences (``\\n``/``\\r``/``\\t``) that sneak in when a key is pasted from a
+    quoted Python string literal, e.g. ``'sk-...A'\\n``."""
+    previous = None
+    while previous != value:
+        previous = value
+        value = value.strip().strip(",").strip().strip("'\"")
+        for escape in ("\\n", "\\r", "\\t"):
+            if value.endswith(escape):
+                value = value[: -len(escape)]
+    return value
+
+
 def _parse_key_assignment(line: str) -> tuple[str, str] | None:
     line = _normalize_key_file_line(line)
     if not line or line.startswith("#"):
@@ -139,11 +153,11 @@ def _parse_key_assignment(line: str) -> tuple[str, str] | None:
             continue
         name, value = line.split(separator, 1)
         name = name.strip().strip("'\"")
-        value = value.strip().strip(",").strip().strip("'\"")
+        value = _clean_key_value(value)
         if name or value.startswith("sk-"):
             return name, value
     if line.startswith("sk-"):
-        return "", line
+        return "", _clean_key_value(line)
     return None
 
 
