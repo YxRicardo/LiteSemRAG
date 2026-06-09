@@ -26,6 +26,8 @@ from spacy.util import compile_infix_regex
 from transformers import AutoModel, AutoTokenizer
 
 from text_processing import (
+    _is_valid_token,
+    _normalize_token_text,
     bm25_tf_saturation,
     clean_text,
     count_words,
@@ -2256,6 +2258,56 @@ class LiteSemRAG:
             "query_role_weight": query_role_weight,
         }
 
+    # True when a query phrase/entity cannot be matched as a whole: neither an exact
+    # phrase/token node nor a conjunctive word-intersection (fuzzy) candidate exists.
+    # In that case its discriminative sub-tokens were swallowed by the entity span and
+    # are missing from extract_important_tokens(), so the whole-phrase channel is empty.
+    def _phrase_whole_match_misses(self, search_key):
+        if self.query_token_node(search_key) is not None:
+            return False
+        return not self.phrase_word_intersection_query(search_key)
+
+    # Sub-token fallback for a whole-phrase miss: strip leading articles, then emit one
+    # single-token query unit per span token that (a) passes the index-time token filter
+    # and (b) has an exact token node in the index. This recovers discriminative tokens
+    # (e.g. "discovery" inside "star trek: discovery", "DJ"/"single" inside "a DJ fresh
+    # single") that NER greedily folded into an unindexed entity span. Spans already
+    # emitted are tracked in emitted_token_spans to dedup against the standalone-token loop.
+    def _build_subtoken_fallback_units(self, query_text, doc, start_char, end_char, emitted_token_spans):
+        span_tokens = [
+            token for token in doc
+            if token.idx >= start_char and token.idx + len(token.text) <= end_char
+        ]
+        while span_tokens and span_tokens[0].lower_ in {"a", "an", "the"}:
+            span_tokens = span_tokens[1:]
+
+        units = []
+        for token in span_tokens:
+            if not _is_valid_token(token):
+                continue
+            search_key = _normalize_token_text(token)
+            if not search_key or self.query_token_node(search_key) is None:
+                continue
+            t_start = token.idx
+            t_end = token.idx + len(token.text)
+            if (t_start, t_end) in emitted_token_spans:
+                continue
+            emitted_token_spans.add((t_start, t_end))
+            units.append(
+                self._make_query_unit(
+                    token_type="token",
+                    search_key=search_key,
+                    embedding_span_text=search_key,
+                    embedding_start=t_start,
+                    embedding_end=t_end,
+                    query_surface=query_text[t_start:t_end],
+                    surface_start=t_start,
+                    surface_end=t_end,
+                    phrase_type=PHRASE_TYPE_SINGLE_TOKEN,
+                )
+            )
+        return units
+
     # Clean a query and extract token, phrase, and entity embeddings for matching.
     def _prepare_query_tokens(self, query_text, print_important_tokens=False, expand_compositional=False):
         query_text = clean_text(query_text)
@@ -2264,6 +2316,9 @@ class LiteSemRAG:
         important_tokens = extract_important_tokens(query_text, self.nlp)
         tokens_for_processing = []
         covered_compositional_spans = []
+        # Char spans emitted by the sub-token fallback below; consulted by the
+        # standalone-token loop so a recovered sub-token is not also emitted twice.
+        emitted_token_spans = set()
         analyzer = self._get_phrase_analyzer()
         doc = self.nlp(query_text)
 
@@ -2396,6 +2451,14 @@ class LiteSemRAG:
                     phrase_type=phrase_type,
                 )
             )
+            # Sub-token fallback: if this atomic phrase/entity has no whole-phrase match
+            # in the index, recover its discriminative sub-tokens as standalone units.
+            if self._phrase_whole_match_misses(phrase):
+                tokens_for_processing.extend(
+                    self._build_subtoken_fallback_units(
+                        query_text, doc, start_char, end_char, emitted_token_spans
+                    )
+                )
 
         # Order contract: phrase/entity units (built above) MUST be appended before these
         # single-token units. _resolve_query_matches() dedups a phrase's sub-tokens by scanning
@@ -2403,6 +2466,8 @@ class LiteSemRAG:
         # sub-tokens for the dedup to fire. Do not reorder these two loops.
         for token, start_char, end_char in important_tokens:
             if self._query_span_is_covered(start_char, end_char, covered_compositional_spans):
+                continue
+            if (start_char, end_char) in emitted_token_spans:
                 continue
             tokens_for_processing.append(
                 self._make_query_unit(

@@ -371,7 +371,20 @@ expand_compositional=False)`:
   `extract_important_tokens()`;
 - analyzes phrase type through `PhraseAnalyzer`;
 - optionally expands compositional phrases into grouped phrase/head/modifier
-  query units.
+  query units;
+- **sub-token fallback for whole-phrase misses:** for an atomic phrase/entity
+  unit whose whole-phrase channel is empty in the index —
+  `_phrase_whole_match_misses()` is true when there is neither an exact token
+  node (`query_token_node()`) nor a conjunctive word-intersection candidate
+  (`phrase_word_intersection_query()`) — `_build_subtoken_fallback_units()`
+  strips leading articles (`a`/`an`/`the`) and emits one standalone-token unit
+  per span token that passes the index-time token filter (`_is_valid_token`)
+  and has an exact token node. This recovers discriminative tokens that greedy
+  NER folded into an unindexed entity span (e.g. `discovery` inside
+  `star trek: discovery`, `DJ`/`single` inside `a DJ fresh single`), which would
+  otherwise be lost because `extract_important_tokens()` skips tokens inside a
+  protected entity. Recovered spans are tracked in `emitted_token_spans` so the
+  standalone-token loop does not emit them twice.
 
 `_resolve_query_matches()` then produces, for each query unit:
 

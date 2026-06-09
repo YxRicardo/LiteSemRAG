@@ -1,15 +1,34 @@
 import fitz
+import os
 import torch
 import torch.nn.functional as F
 import re
 
 
+# 方案A 开关：保留原始大小写，让 spaCy 在真实大小写文本上做 NER/POS/依存分析。
+# 默认 False = 方案B（旧行为：整体小写、仅保留缩写与多词专名的大小写）。
+# token/phrase 的匹配键仍由下游 normalize_text 统一小写（缩写除外），所以大小写仅影响
+# 语言学分析质量，不改变匹配口径。可用环境变量 LITESEM_PRESERVE_CASE=1 在重建/查询时开启，
+# 或调用 set_preserve_case() 在进程内切换。索引端与查询端必须使用同一设置。
+PRESERVE_CASE = os.environ.get("LITESEM_PRESERVE_CASE", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def set_preserve_case(value: bool) -> None:
+    global PRESERVE_CASE
+    PRESERVE_CASE = bool(value)
+
+
 # Normalize raw text by standardizing whitespace, quotes, and casing while preserving selected proper-case spans.
 def clean_text(text):
-                
+
     text = re.sub(r'-\n', '', text)
     text = re.sub(r'\n+', ' ', text)
     text = re.sub(r'\s+', ' ', text)
+
+    if PRESERVE_CASE:
+        # 方案A：不做整体小写，只规整空白并去掉引号，保留原始大小写交给 spaCy。
+        text = re.sub(r"[\"']", "", text)
+        return text.strip()
 
     placeholders = {}
     counter = 0
@@ -133,6 +152,18 @@ PROTECTED_ENTITY_LABELS = {
 
 DISCARDED_PHRASE_ENTITY_LABELS = {
     "DATE",
+}
+
+# Dependency labels that mark a clausal subject. clean_text lowercases the whole
+# sentence before spaCy runs, which destroys the casing NER/POS rely on: a title-case
+# subject like "Frozen" gets re-tagged ADJ/VERB and dropped by the POS gate below, even
+# though it is the most discriminative term in the query. The dependency parse survives
+# lowercasing far better, so we keep subject tokens even when their POS is not NOUN/PROPN.
+SUBJECT_DEPS = {
+    "nsubj",
+    "nsubjpass",
+    "csubj",
+    "csubjpass",
 }
 
 ROMAN_NUMERAL_RE = re.compile(r"(?i)M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})")
@@ -589,12 +620,16 @@ def _is_valid_token(token, debug_mode=False, debug_stage=None):
         return False
 
     is_model = any(c.isdigit() for c in token.text)
-    if token.pos_ not in ["NOUN", "PROPN"] and not is_model:
+    # Clausal subjects are kept even with a non-NOUN/PROPN POS: lowercasing in clean_text
+    # frequently mis-tags a title-case subject (e.g. "Frozen") as ADJ/VERB, but the parse
+    # still labels it nsubj, and the subject is usually the query's key discriminator.
+    is_subject = token.dep_ in SUBJECT_DEPS
+    if token.pos_ not in ["NOUN", "PROPN"] and not is_model and not is_subject:
         if debug_mode:
             _debug_skip(
                 "token",
                 token,
-                f"POS={token.pos_} is not in {{NOUN, PROPN}} and the token does not look like a model/code token",
+                f"POS={token.pos_} is not in {{NOUN, PROPN}}, not a model/code token, and not a clausal subject",
                 stage=debug_stage,
             )
         return False
