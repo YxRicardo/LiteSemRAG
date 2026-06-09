@@ -262,6 +262,16 @@ routes it by occurrence count: tokens reaching `min_occurrences_for_description`
 go to `build_sem_node()`, the rest to `create_basic_sem_node()` (one
 description-less node). After a node is built the buffer is cleared.
 
+**Fast index mode** (`LiteSemRAG(fast_index=True)`): every token/phrase is forced
+through `create_basic_sem_node()` regardless of occurrence count, entity status,
+or `force_single_semantic`. The entire `build_sem_node()` path — `s_mean` gate,
+FFT sampling, and per-sample description prediction — is skipped, so all spans are
+single-sense and no polysemy analysis runs. Index-time phrase head/modifier
+routing and all downstream finalize structures (modifier postings, IDF, BM25,
+`query_database`, `phrase_index`, chunk→sem edges) are unchanged, so retrieval
+still works. The flag persists through pickling (defaults to `False` on old
+pickles).
+
 `build_sem_node(token_node)` decides whether the token collapses to a single
 basic node or runs the description-driven sense split:
 

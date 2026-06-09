@@ -808,6 +808,7 @@ class LiteSemRAG:
                  anchor_max_count=ANCHOR_PROP_DEFAULTS["anchor_max_count"],
                  prop_knn_k=ANCHOR_PROP_DEFAULTS["prop_knn_k"],
                  tau_conc=0.90,
+                 fast_index=False,
                  phrase_audit_enabled=False,
                  phrase_audit_cache_path="cache/phrase_protection_audit.jsonl"):
         self.doc_nodes = []
@@ -825,6 +826,12 @@ class LiteSemRAG:
         # 预测 / 多义切分,低于该阈值的走 create_basic_sem_node(单节点、无描述)。
         # 设为 None 则所有 token 都只建单节点、无描述;设为 1 则所有 token 都做描述。
         self.min_occurrences_for_description = min_occurrences_for_description
+        # fast index 模式:finalize 时所有 token/phrase 一律建单义 basic 节点,
+        # 完全跳过 build_sem_node 的 s_mean 闸门 / FFT 采样 / 描述预测 / 多义切分。
+        # 出现次数阈值、entity、force_single 都不再影响分流。索引期短语 head/modifier
+        # 路由与 finalize 下游(modifier postings / IDF / BM25 / query_database /
+        # phrase_index / chunk->sem 边)照常,检索可正常工作。
+        self.fast_index = bool(fast_index)
         self.token_node_query = {}
         # s_mean 闸门:某 token 各次出现 embedding 的平均相似度高于该阈值 →
         # 语义集中,判为单义不切分(_is_token_polysemous_by_s_mean)。值越大越倾向多义切分。
@@ -1768,6 +1775,8 @@ class LiteSemRAG:
             del self.index_session_record_count
         if hasattr(self, "index_session_sample_count"):
             del self.index_session_sample_count
+        if not hasattr(self, "fast_index"):
+            self.fast_index = False
         if not hasattr(self, "llm_semantic_labeler_batch_size"):
             self.llm_semantic_labeler_batch_size = 10
         if not hasattr(self, "llm_anchor_sample_assignment_count"):
@@ -3363,26 +3372,34 @@ class LiteSemRAG:
         self._reset_llm_anchor_sample_assignments()
 
         min_occ = getattr(self, "min_occurrences_for_description", None)
+        fast_index = getattr(self, "fast_index", False)
 
         # Pass 0: split nodes into the expensive multi-sense candidates and the
         # cheap description-less remainder. A node is a multi-sense candidate when
         # its accumulated occurrence count reaches min_occurrences_for_description.
+        # fast index 模式下永远不产生多义候选:所有 token/phrase 一律建单义 basic 节点。
         multi_sense_candidates = []
         basic_only = []
         for token_node in self.token_nodes:
             if token_node.has_semantic:
                 continue
             occurrence_count = len(token_node.embeds_buffer)
-            if min_occ is not None and occurrence_count >= min_occ:
+            if not fast_index and min_occ is not None and occurrence_count >= min_occ:
                 multi_sense_candidates.append(token_node)
             else:
                 basic_only.append(token_node)
 
-        print(
-            f"finalize_token_nodes: {len(multi_sense_candidates)} potential "
-            f"multi-sense node(s) (occurrences >= min_occurrences_for_description="
-            f"{min_occ}), {len(basic_only)} basic node(s)."
-        )
+        if fast_index:
+            print(
+                f"finalize_token_nodes [fast_index]: all {len(basic_only)} node(s) "
+                "built as single-sense basic node(s); polysemy analysis skipped."
+            )
+        else:
+            print(
+                f"finalize_token_nodes: {len(multi_sense_candidates)} potential "
+                f"multi-sense node(s) (occurrences >= min_occurrences_for_description="
+                f"{min_occ}), {len(basic_only)} basic node(s)."
+            )
 
         # Pass 1: build the potential multi-sense nodes first. This is the
         # expensive stage (s_mean gate -> FFT sampling -> per-sample description
