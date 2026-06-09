@@ -1,15 +1,17 @@
 """LLM-based semantic label selection with SQLite caching.
 
 This module is designed as a notebook-friendly helper for validating span
-semantics against Wikidata candidates. The cache key intentionally focuses on
-the target span and its nearby context words so the same semantic choice can be
-reused across notebooks without repeating LLM calls.
+semantics against Wikidata candidates. Cache entries are scoped to the target
+span, nearby context words, model identity, and the exact candidate bank, so
+changing candidate semantics automatically invalidates old judgments.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,26 @@ Instructions:
 {{"selected_index": <integer>, "reason": "<short explanation>"}}
 """
 
+BATCH_SYSTEM_PROMPT = """You are a precise semantic disambiguation assistant.
+Choose exactly one Wikidata candidate that best matches the target span in each given context.
+Return valid JSON only.
+"""
+
+BATCH_USER_PROMPT_TEMPLATE = """Candidate meanings:
+{candidate_block}
+
+Records to judge:
+{record_block}
+
+Instructions:
+1. For each record, pick the single best candidate for matched_text in that context.
+2. Prefer semantic fit to the local context over surface similarity.
+3. Return JSON only in this shape:
+{{"judgments": [{{"record_id": <integer>, "selected_index": <integer>, "reason": "<short explanation>"}}]}}
+4. Include exactly one judgment for every input record_id and do not add extra record_id values.
+5. Keep each reason under 12 words.
+"""
+
 
 @dataclass(frozen=True)
 class SemanticCacheKey:
@@ -49,6 +71,7 @@ class SemanticCacheKey:
     context_signature: str
     provider: str
     model: str
+    candidate_bank_hash: str
 
 
 def _normalize_space(text: str) -> str:
@@ -134,10 +157,51 @@ def _candidate_block(candidate_bank: Iterable[Mapping[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _record_block(records: Iterable[Mapping[str, Any]]) -> str:
+    blocks = []
+    for record in records:
+        blocks.append(
+            "\n".join(
+                [
+                    f"record_id: {record['record_id']}",
+                    f"span_text: {_normalize_space(record.get('span_text') or '')}",
+                    f"matched_text: {_normalize_space(record.get('matched_text') or record.get('span_text') or '')}",
+                    f"context: {_normalize_space(record.get('context_text') or '')}",
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def candidate_bank_hash(candidate_bank: Iterable[Mapping[str, Any]]) -> str:
+    """Return a stable hash for the ordered candidate semantics shown to LLM."""
+    canonical_candidates = []
+    for candidate in candidate_bank:
+        canonical_candidates.append(
+            {
+                "entity_id": str(candidate.get("entity_id") or ""),
+                "label": str(candidate.get("label") or ""),
+                "description": _normalize_space(candidate.get("description") or ""),
+                "definition": _normalize_space(candidate.get("definition") or ""),
+                "hypothesis": _normalize_space(candidate.get("hypothesis") or ""),
+            }
+        )
+    payload = json.dumps(
+        canonical_candidates,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     text = str(text).strip()
     if not text:
         raise ValueError("LLM returned empty text.")
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text).strip()
 
     try:
         parsed = json.loads(text)
@@ -146,13 +210,19 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        raise ValueError(f"LLM output did not contain a JSON object: {text!r}")
-    parsed = json.loads(match.group(0))
-    if not isinstance(parsed, dict):
-        raise ValueError(f"LLM JSON was not an object: {text!r}")
-    return parsed
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            parsed, _end = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    excerpt = text[:1000]
+    if len(text) > 1000:
+        excerpt += "...<truncated>"
+    raise ValueError(f"LLM output did not contain a valid JSON object: {excerpt!r}")
 
 
 def _parse_selected_index(payload: Mapping[str, Any], candidate_bank: list[Mapping[str, Any]]) -> int:
@@ -173,15 +243,59 @@ def _parse_selected_index(payload: Mapping[str, Any], candidate_bank: list[Mappi
     )
 
 
+def _parse_batched_judgments(
+    payload: Mapping[str, Any],
+    batch_records: list[Mapping[str, Any]],
+    candidate_bank: list[Mapping[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    judgments = payload.get("judgments")
+    if not isinstance(judgments, list):
+        raise ValueError(f"LLM response missing judgments list. payload={payload!r}")
+
+    by_record_id = {}
+    for item in judgments:
+        if not isinstance(item, Mapping):
+            continue
+        # Skip malformed entries (missing / non-numeric record_id or
+        # selected_index) instead of letting int(None) raise TypeError; the
+        # affected record then falls through to the `missing` check below, which
+        # raises a clear, record-scoped error instead of an opaque one.
+        try:
+            record_id = int(item.get("record_id"))
+            selected_index = int(item.get("selected_index"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= selected_index < len(candidate_bank):
+            raise ValueError(
+                f"LLM selected invalid candidate index {selected_index}. payload={payload!r}"
+            )
+        reason = item.get("reason")
+        by_record_id[record_id] = {
+            "selected_index": selected_index,
+            "selected_candidate": dict(candidate_bank[selected_index]),
+            "reason": str(reason).strip() if reason is not None else None,
+        }
+
+    missing = [
+        int(record["record_id"])
+        for record in batch_records
+        if int(record["record_id"]) not in by_record_id
+    ]
+    if missing:
+        raise ValueError(f"LLM response missing judgments for record_id={missing}.")
+    return by_record_id
+
+
 def _ensure_cache_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
-        CREATE TABLE IF NOT EXISTS llm_semantic_label_cache (
+        CREATE TABLE IF NOT EXISTS llm_semantic_label_cache_v2 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             normalized_span TEXT NOT NULL,
             context_signature TEXT NOT NULL,
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
+            candidate_bank_hash TEXT NOT NULL,
             span_text TEXT NOT NULL,
             context_text TEXT NOT NULL,
             matched_text TEXT,
@@ -192,7 +306,7 @@ def _ensure_cache_schema(connection: sqlite3.Connection) -> None:
             raw_response TEXT NOT NULL,
             reason TEXT,
             created_at_utc TEXT NOT NULL,
-            UNIQUE(normalized_span, context_signature, provider, model)
+            UNIQUE(normalized_span, context_signature, provider, model, candidate_bank_hash)
         )
         """
     )
@@ -215,17 +329,19 @@ def _lookup_cache_row(
     row = connection.execute(
         """
         SELECT *
-        FROM llm_semantic_label_cache
+        FROM llm_semantic_label_cache_v2
         WHERE normalized_span = ?
           AND context_signature = ?
           AND provider = ?
           AND model = ?
+          AND candidate_bank_hash = ?
         """,
         (
             cache_key.normalized_span,
             cache_key.context_signature,
             cache_key.provider,
             cache_key.model,
+            cache_key.candidate_bank_hash,
         ),
     ).fetchone()
     return row
@@ -247,11 +363,12 @@ def _save_cache_row(
 ) -> None:
     connection.execute(
         """
-        INSERT INTO llm_semantic_label_cache (
+        INSERT INTO llm_semantic_label_cache_v2 (
             normalized_span,
             context_signature,
             provider,
             model,
+            candidate_bank_hash,
             span_text,
             context_text,
             matched_text,
@@ -263,8 +380,8 @@ def _save_cache_row(
             reason,
             created_at_utc
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(normalized_span, context_signature, provider, model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(normalized_span, context_signature, provider, model, candidate_bank_hash)
         DO UPDATE SET
             span_text = excluded.span_text,
             context_text = excluded.context_text,
@@ -282,6 +399,7 @@ def _save_cache_row(
             cache_key.context_signature,
             cache_key.provider,
             cache_key.model,
+            cache_key.candidate_bank_hash,
             span_text,
             context_text,
             matched_text,
@@ -336,6 +454,7 @@ def choose_wikidata_candidate_with_llm(
 
     llm_client = client or LocalLLMClient(config)
     active_config = llm_client.config
+    bank_hash = candidate_bank_hash(candidate_bank_list)
     normalized_span = _normalize_text(span_text)
     context_signature = build_context_signature(
         span_text,
@@ -348,9 +467,10 @@ def choose_wikidata_candidate_with_llm(
         context_signature=context_signature,
         provider=active_config.provider,
         model=active_config.model,
+        candidate_bank_hash=bank_hash,
     )
 
-    with _open_cache(cache_path) as connection:
+    with closing(_open_cache(cache_path)) as connection:
         cache_row = _lookup_cache_row(connection, cache_key)
         if cache_row is not None:
             cached_resolution = _resolve_cached_candidate(cache_row, candidate_bank_list)
@@ -366,6 +486,7 @@ def choose_wikidata_candidate_with_llm(
                     "raw_response": cache_row["raw_response"],
                     "cache_hit": True,
                     "context_signature": context_signature,
+                    "candidate_bank_hash": bank_hash,
                     "provider": active_config.provider,
                     "model": active_config.model,
                 }
@@ -413,6 +534,145 @@ def choose_wikidata_candidate_with_llm(
         "raw_response": raw_response,
         "cache_hit": False,
         "context_signature": context_signature,
+        "candidate_bank_hash": bank_hash,
         "provider": active_config.provider,
         "model": active_config.model,
     }
+
+
+def choose_wikidata_candidates_with_llm_batch(
+    *,
+    records: Iterable[Mapping[str, Any]],
+    candidate_bank: Iterable[Mapping[str, Any]],
+    cache_path: Path | str = DEFAULT_CACHE_PATH,
+    context_word_window: int = DEFAULT_CONTEXT_WORD_WINDOW,
+    config: LocalLLMConfig | None = None,
+    client: LocalLLMClient | None = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    max_batch_size: int = 10,
+) -> list[dict[str, Any]]:
+    record_list = [dict(record) for record in records]
+    candidate_bank_list = [dict(candidate) for candidate in candidate_bank]
+    if not record_list:
+        return []
+    if not candidate_bank_list:
+        raise ValueError("candidate_bank must be non-empty.")
+
+    llm_client = client or LocalLLMClient(config)
+    active_config = llm_client.config
+    bank_hash = candidate_bank_hash(candidate_bank_list)
+    batch_size = max(1, int(max_batch_size or 1))
+
+    prepared_records = []
+    for record_id, record in enumerate(record_list):
+        span_text = _normalize_space(record.get("span_text") or "")
+        context_text = _normalize_space(record.get("context_text") or "")
+        matched_text = _normalize_space(record.get("matched_text") or span_text)
+        local_span = record.get("local_span")
+        if local_span is not None:
+            local_span = tuple(local_span)
+        context_signature = build_context_signature(
+            span_text,
+            context_text,
+            local_span=local_span,
+            context_word_window=context_word_window,
+        )
+        cache_key = SemanticCacheKey(
+            normalized_span=_normalize_text(span_text),
+            context_signature=context_signature,
+            provider=active_config.provider,
+            model=active_config.model,
+            candidate_bank_hash=bank_hash,
+        )
+        prepared_records.append(
+            {
+                "record_id": record_id,
+                "span_text": span_text,
+                "context_text": context_text,
+                "matched_text": matched_text,
+                "local_span": local_span,
+                "context_signature": context_signature,
+                "cache_key": cache_key,
+            }
+        )
+
+    results_by_id: dict[int, dict[str, Any]] = {}
+    uncached_records = []
+    with closing(_open_cache(cache_path)) as connection:
+        for prepared in prepared_records:
+            cache_row = _lookup_cache_row(connection, prepared["cache_key"])
+            if cache_row is not None:
+                cached_resolution = _resolve_cached_candidate(cache_row, candidate_bank_list)
+                if cached_resolution is not None:
+                    cached_index, cached_candidate = cached_resolution
+                    results_by_id[prepared["record_id"]] = {
+                        "selected_index": cached_index,
+                        "selected_candidate": dict(cached_candidate),
+                        "selected_entity_id": cached_candidate.get("entity_id"),
+                        "selected_label": cached_candidate.get("label"),
+                        "selected_description": cached_candidate.get("description"),
+                        "reason": cache_row["reason"],
+                        "raw_response": cache_row["raw_response"],
+                        "cache_hit": True,
+                        "context_signature": prepared["context_signature"],
+                        "candidate_bank_hash": bank_hash,
+                        "provider": active_config.provider,
+                        "model": active_config.model,
+                    }
+                    continue
+            uncached_records.append(prepared)
+
+        candidate_block = _candidate_block(candidate_bank_list)
+        for batch_start in range(0, len(uncached_records), batch_size):
+            batch_records = uncached_records[batch_start:batch_start + batch_size]
+            prompt = BATCH_USER_PROMPT_TEMPLATE.format(
+                candidate_block=candidate_block,
+                record_block=_record_block(batch_records),
+            )
+            raw_response = llm_client.complete(
+                prompt,
+                system_prompt=BATCH_SYSTEM_PROMPT,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            payload = _extract_json_object(raw_response)
+            batch_judgments = _parse_batched_judgments(
+                payload,
+                batch_records,
+                candidate_bank_list,
+            )
+            for prepared in batch_records:
+                judgment = batch_judgments[prepared["record_id"]]
+                selected_index = judgment["selected_index"]
+                selected_candidate = dict(judgment["selected_candidate"])
+                reason = judgment.get("reason")
+                _save_cache_row(
+                    connection,
+                    prepared["cache_key"],
+                    span_text=prepared["span_text"],
+                    context_text=prepared["context_text"],
+                    matched_text=prepared["matched_text"],
+                    selected_index=selected_index,
+                    selected_entity_id=str(selected_candidate.get("entity_id") or ""),
+                    selected_label=str(selected_candidate.get("label") or ""),
+                    selected_description=str(selected_candidate.get("description") or ""),
+                    raw_response=raw_response,
+                    reason=reason,
+                )
+                results_by_id[prepared["record_id"]] = {
+                    "selected_index": selected_index,
+                    "selected_candidate": selected_candidate,
+                    "selected_entity_id": selected_candidate.get("entity_id"),
+                    "selected_label": selected_candidate.get("label"),
+                    "selected_description": selected_candidate.get("description"),
+                    "reason": reason,
+                    "raw_response": raw_response,
+                    "cache_hit": False,
+                    "context_signature": prepared["context_signature"],
+                    "candidate_bank_hash": bank_hash,
+                    "provider": active_config.provider,
+                    "model": active_config.model,
+                }
+
+    return [results_by_id[record_id] for record_id in range(len(prepared_records))]

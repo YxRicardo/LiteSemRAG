@@ -352,6 +352,46 @@ def filter_entity_ids_with_wikipedia_sitelinks(entity_ids, language="en", header
     return valid_entity_ids
 
 
+# Deduplicate and normalize a list of Wikidata entity IDs.
+def _clean_entity_ids(entity_ids):
+    cleaned_ids = []
+    for entity_id in entity_ids:
+        if not isinstance(entity_id, str):
+            continue
+        normalized = entity_id.strip()
+        if normalized and normalized not in cleaned_ids:
+            cleaned_ids.append(normalized)
+    return cleaned_ids
+
+
+# Fetch a batch of Wikidata entities keyed by entity ID.
+def fetch_entities(entity_ids, language="en", props="sitelinks", headers=None, timeout=30):
+    cleaned_ids = _clean_entity_ids(entity_ids)
+    if not cleaned_ids:
+        return {}
+
+    params = {
+        "action": "wbgetentities",
+        "format": "json",
+        "ids": "|".join(cleaned_ids),
+        "languages": language,
+        "props": props,
+    }
+    data = _safe_get_json(WIKIDATA_API_URL, params=params, headers=headers, timeout=timeout)
+    entities = data.get("entities", {}) if isinstance(data, dict) else {}
+    if not isinstance(entities, dict):
+        return {}
+
+    results = {}
+    for entity_id, entity in entities.items():
+        if not isinstance(entity, dict):
+            continue
+        if entity.get("missing") == "":
+            continue
+        results[entity_id] = entity
+    return results
+
+
 # Search Wikidata and return normalized candidate rows with descriptions.
 def search_wikidata(
     term,
@@ -488,7 +528,7 @@ def _select_wikidata_candidates_by_span_rules(
         lambda value: _alias_exact_match(value, query_text)
     )
     label_word_count_mask = candidates_df["label"].map(
-        lambda value: _word_count(value) <= query_word_count + 1
+        lambda value: _word_count(value) <= query_word_count + 2
     )
     selected = candidates_df[
         definition_mask
@@ -521,33 +561,69 @@ def load_wikidata_definition_candidates(
     require_detailed_description: bool = False,
     label_contains_text: bool = True,
     target_candidate_count: int | None = None,
+    use_span_rules: bool = True,
     use_llm_filter: bool = False,
     llm_filter=None,
     llm_filter_use_api: bool = False,
     llm_filter_use_cache: bool = True,
+    llm_filter_write_cache: bool = True,
+    fft_samples=None,
 ):
-    # When use_llm_filter is enabled, defer entirely to WikidataDefinitionFilter:
-    # no rule-based filtering or reranking, no exact-match logic — the LLM's
-    # returned definitions are used as-is.
+    # When use_llm_filter is enabled, WikidataDefinitionFilter first applies
+    # the same span-aware candidate rules, then lets the LLM merge/rerank the
+    # remaining definitions. When fft_samples are supplied, the merge and the
+    # per-sample sense judgment happen in a single LLM call (mirroring
+    # wikidata_llm_candidate_merge_experiment.ipynb); sample_order ->
+    # merged-description assignments are surfaced via the row metadata.
     if use_llm_filter:
         from wikidata_definition_filter import WikidataDefinitionFilter
 
         _, pd = _import_wikidata_deps()
         filter_instance = llm_filter or WikidataDefinitionFilter(use_api=llm_filter_use_api)
-        result = filter_instance.filter_definitions(
-            query_text,
-            num_candidates=int(target_candidate_count or limit),
-            use_cache=llm_filter_use_cache,
-        )
+        if fft_samples is not None:
+            result = filter_instance.filter_definitions_with_samples(
+                query_text,
+                fft_samples=fft_samples,
+                num_candidates=int(target_candidate_count or limit),
+            )
+        else:
+            result = filter_instance.filter_definitions(
+                query_text,
+                num_candidates=int(target_candidate_count or limit),
+                use_cache=llm_filter_use_cache,
+                write_cache=llm_filter_write_cache,
+            )
         if not result.definitions:
-            raise ValueError(
+            # Classify *why* the LLM filter produced no definitions so callers can
+            # log a specific reason instead of the catch-all no_candidate_definitions.
+            metadata = getattr(result, "metadata", None) or {}
+            if metadata.get("note") == "no_wikidata_candidates":
+                empty_reason = "no_wikidata_candidates"
+            elif metadata.get("parse_error"):
+                empty_reason = "llm_parse_error"
+            else:
+                empty_reason = "llm_empty_merge"
+            error = ValueError(
                 f"WikidataDefinitionFilter returned no definitions for span={query_text!r}."
             )
+            error.empty_reason = empty_reason
+            raise error
 
         rows = []
-        for defn in result.definitions:
-            primary_id = defn.source_entity_ids[0] if defn.source_entity_ids else ""
-            primary_label = defn.source_labels[0] if defn.source_labels else query_text
+        for rank, defn in enumerate(result.definitions, start=1):
+            primary_id = (
+                defn.source_entity_ids[0]
+                if defn.source_entity_ids
+                else f"llm:{query_text}:{rank}"
+            )
+            primary_label = (
+                defn.canonical_label
+                or (
+                    defn.source_labels[0]
+                    if defn.source_labels
+                    else f"{query_text} sense {rank}"
+                )
+            )
             text = defn.definition.strip()
             rows.append(
                 {
@@ -560,8 +636,12 @@ def load_wikidata_definition_candidates(
                     "concepturi": "",
                     "source_entity_ids": tuple(defn.source_entity_ids),
                     "source_labels": tuple(defn.source_labels),
+                    "source_candidate_ids": tuple(defn.source_candidate_ids),
+                    "canonical_label": defn.canonical_label,
+                    "merge_rationale": defn.merge_rationale,
                     "is_merged": defn.is_merged,
                     "is_rewritten": defn.is_rewritten,
+                    "llm_filter_metadata": result.metadata,
                 }
             )
         return pd.DataFrame(rows), "description"
@@ -591,12 +671,16 @@ def load_wikidata_definition_candidates(
         )
 
     definition_column = "detailed_description" if use_detailed_description else "description"
-    candidates_df = _select_wikidata_candidates_by_span_rules(
-        candidates_df,
-        query_text=query_text,
-        definition_column=definition_column,
-        max_candidate_count=max_candidate_count,
-    )
+    if use_span_rules:
+        candidates_df = _select_wikidata_candidates_by_span_rules(
+            candidates_df,
+            query_text=query_text,
+            definition_column=definition_column,
+            max_candidate_count=max_candidate_count,
+        )
+    else:
+        definition_mask = _series_non_empty_mask(candidates_df[definition_column])
+        candidates_df = candidates_df[definition_mask].head(max_candidate_count).reset_index(drop=True)
     if candidates_df.empty:
         raise ValueError(
             f"No usable {definition_column} candidates remained for span={query_text!r}."
@@ -854,11 +938,6 @@ def hdbscan_cluster(
         cluster_centers[label] = center
 
     return n_clusters, clusters, cluster_centers
-
-# Compute a similarity threshold from edge weights using a percentile.
-def get_anomaly_threshold(values, percentile):
-    q = 1 - percentile
-    return float(np.percentile(values, q * 100))
 
                                                              
                                        

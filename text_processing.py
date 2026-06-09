@@ -1,33 +1,55 @@
 import fitz
+import os
 import torch
 import torch.nn.functional as F
 import re
 
 
+# 方案A 开关：保留原始大小写，让 spaCy 在真实大小写文本上做 NER/POS/依存分析。
+# 默认 True = 方案A（保留大小写，NER/POS/依存质量更好，PROPN 不做复数还原）。
+# 设 LITESEM_PRESERVE_CASE=0 可退回方案B（旧行为：整体小写、仅保留缩写与多词专名的大小写）。
+# token/phrase 的匹配键仍由下游 normalize_text 统一小写（缩写除外），所以大小写仅影响
+# 语言学分析质量，不改变匹配口径。可调用 set_preserve_case() 在进程内切换。
+# 索引端与查询端必须使用同一设置——切换后需用相同设置重建索引。
+PRESERVE_CASE = os.environ.get("LITESEM_PRESERVE_CASE", "1").strip().lower() in {"1", "true", "yes"}
+
+
+def set_preserve_case(value: bool) -> None:
+    global PRESERVE_CASE
+    PRESERVE_CASE = bool(value)
+
+
 # Normalize raw text by standardizing whitespace, quotes, and casing while preserving selected proper-case spans.
 def clean_text(text):
-                
+
     text = re.sub(r'-\n', '', text)
     text = re.sub(r'\n+', ' ', text)
     text = re.sub(r'\s+', ' ', text)
+
+    if PRESERVE_CASE:
+        # 方案A：不做整体小写，只规整空白并去掉引号，保留原始大小写交给 spaCy。
+        text = re.sub(r"[\"']", "", text)
+        return text.strip()
 
     placeholders = {}
     counter = 0
 
                            
-    for match in re.findall(r'\b[A-Z]{2,}\b', text):
+    # Stash matched spans behind unique placeholders so the later lower-casing
+    # skips them. Use re.sub (a single positional pass) instead of str.replace,
+    # which is an unbounded substring swap and would corrupt overlapping
+    # matches, e.g. "US USB" -> "US USb".
+    def _stash(match):
+        nonlocal counter
         placeholder = f"__PH_{counter}__"
-        placeholders[placeholder] = match
-        text = text.replace(match, placeholder)
+        placeholders[placeholder] = match.group(0)
         counter += 1
+        return placeholder
+
+    text = re.sub(r'\b[A-Z]{2,}\b', _stash, text)
 
                                 
-    pattern = r'\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'
-    for match in re.findall(pattern, text):
-        placeholder = f"__PH_{counter}__"
-        placeholders[placeholder] = match
-        text = text.replace(match, placeholder)
-        counter += 1
+    text = re.sub(r'\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', _stash, text)
 
                
     text = re.sub(r"[\"']", "", text)
@@ -115,6 +137,39 @@ def _debug_dump_spans(name, spans):
         print(f"  {index}. '{text}' [{start_char}, {end_char})")
 
 
+PROTECTED_ENTITY_LABELS = {
+    "PERSON",
+    "ORG",
+    "GPE",
+    "LOC",
+    "FAC",
+    "PRODUCT",
+    "EVENT",
+    "WORK_OF_ART",
+    "LAW",
+    "LANGUAGE",
+    "NORP",
+}
+
+DISCARDED_PHRASE_ENTITY_LABELS = {
+    "DATE",
+}
+
+# Dependency labels that mark a clausal subject. clean_text lowercases the whole
+# sentence before spaCy runs, which destroys the casing NER/POS rely on: a title-case
+# subject like "Frozen" gets re-tagged ADJ/VERB and dropped by the POS gate below, even
+# though it is the most discriminative term in the query. The dependency parse survives
+# lowercasing far better, so we keep subject tokens even when their POS is not NOUN/PROPN.
+SUBJECT_DEPS = {
+    "nsubj",
+    "nsubjpass",
+    "csubj",
+    "csubjpass",
+}
+
+ROMAN_NUMERAL_RE = re.compile(r"(?i)M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})")
+
+
 # Collect valid named entities and spans that should influence phrase filtering.
 def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_stage=None):
     entity_spans = []
@@ -122,6 +177,16 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_
     char_intervals = []
 
     for ent in doc.ents:
+        if ent.label_.upper() in DISCARDED_PHRASE_ENTITY_LABELS:
+            if debug_mode:
+                _debug_skip(
+                    "entity",
+                    ent,
+                    f"{ent.label_} entities are discarded as phrase candidates",
+                    stage=debug_stage,
+                )
+            continue
+
         if all_words_are_digits(ent.text):
             if debug_mode:
                 _debug_skip("entity", ent, "every word in the entity is numeric", stage=debug_stage)
@@ -150,11 +215,185 @@ def _collect_valid_entities(doc, discard_no_word=False, debug_mode=False, debug_
         if debug_mode:
             _debug_keep("entity", ent, stage=debug_stage)
 
-        entity_spans.append((normalize_text(ent.text), ent.start_char, ent.end_char))
+        preserve_leading_article = ent.label_.upper() == "WORK_OF_ART"
+        entity_spans.append(
+            (
+                normalize_text(
+                    ent.text,
+                    preserve_leading_article=preserve_leading_article,
+                ),
+                ent.start_char,
+                ent.end_char,
+            )
+        )
         token_intervals.append((ent.start, ent.end))
         char_intervals.append((ent.start_char, ent.end_char))
 
     return entity_spans, token_intervals, char_intervals
+
+
+def _is_protected_entity(ent):
+    return ent.label_.upper() in PROTECTED_ENTITY_LABELS
+
+
+def _collect_protected_entity_records(doc, discard_no_word=False):
+    records = []
+    for ent in doc.ents:
+        if not _is_protected_entity(ent):
+            continue
+        if all_words_are_digits(ent.text):
+            continue
+        if discard_no_word and re.search(r"[a-zA-Z]", ent.text) is None:
+            continue
+        records.append(
+            {
+                "start": ent.start,
+                "end": ent.end,
+                "start_char": ent.start_char,
+                "end_char": ent.end_char,
+                "text": ent.text,
+                "label": ent.label_,
+            }
+        )
+    return records
+
+
+def _append_protected_span_record(records, span, label):
+    span_key = (span.start, span.end, span.start_char, span.end_char)
+    for record in records:
+        record_key = (
+            record["start"],
+            record["end"],
+            record["start_char"],
+            record["end_char"],
+        )
+        if record_key == span_key:
+            return
+
+    records.append(
+        {
+            "start": span.start,
+            "end": span.end,
+            "start_char": span.start_char,
+            "end_char": span.end_char,
+            "text": span.text,
+            "label": label,
+        }
+    )
+
+
+def _trim_residual_span(span):
+    start = span.start
+    end = span.end
+    while start < end and (span.doc[start].is_stop or span.doc[start].is_punct):
+        start += 1
+    while start < end and (span.doc[end - 1].is_stop or span.doc[end - 1].is_punct):
+        end -= 1
+    return span.doc[start:end]
+
+
+def _trim_leading_poss(span):
+    start = span.start
+    end = span.end
+    doc = span.doc
+    while start < end and doc[start].dep_ == "poss":
+        start += 1
+    if start >= end:
+        return span
+    return doc[start:end]
+
+
+def _normalize_phrase_from_span(span, *, preserve_leading_article=False):
+    trimmed = _trim_leading_poss(span)
+    phrase_text = trimmed.text.strip()
+    return (
+        normalize_text(phrase_text, preserve_leading_article=preserve_leading_article),
+        trimmed.start_char,
+        trimmed.end_char,
+        trimmed.start,
+        trimmed.end,
+    )
+
+
+def _protected_entities_inside_span(span, protected_entity_records):
+    return [
+        record for record in protected_entity_records
+        if span.start <= record["start"] and record["end"] <= span.end
+    ]
+
+
+def _split_span_by_protected_entities(span, protected_entity_records):
+    contained_entities = _protected_entities_inside_span(span, protected_entity_records)
+    if not contained_entities:
+        return []
+
+    residual_spans = []
+    cursor = span.start
+    for record in sorted(contained_entities, key=lambda item: (item["start"], item["end"])):
+        if cursor < record["start"]:
+            residual = _trim_residual_span(span.doc[cursor:record["start"]])
+            if len(residual):
+                residual_spans.append(residual)
+        cursor = max(cursor, record["end"])
+
+    if cursor < span.end:
+        residual = _trim_residual_span(span.doc[cursor:span.end])
+        if len(residual):
+            residual_spans.append(residual)
+
+    return residual_spans
+
+
+def _token_inside_protected_entity(token, protected_entity_records):
+    for record in protected_entity_records:
+        if record["start"] <= token.i < record["end"]:
+            return True
+    return False
+
+
+def _find_protected_span_record(protected_entity_records, start_char, end_char):
+    for record in protected_entity_records:
+        if record["start_char"] == start_char and record["end_char"] == end_char:
+            return record
+    return None
+
+
+def _find_entity_for_char_span(doc, start_char, end_char):
+    for ent in doc.ents:
+        if ent.start_char == start_char and ent.end_char == end_char:
+            return ent
+    return None
+
+
+def _build_phrase_audit_record(
+    doc,
+    phrase_text,
+    start_char,
+    end_char,
+    source,
+    protected_entity_records,
+):
+    ent = _find_entity_for_char_span(doc, start_char, end_char)
+    protected_record = _find_protected_span_record(
+        protected_entity_records,
+        start_char,
+        end_char,
+    )
+    protected_reason = None
+    if protected_record is not None:
+        protected_reason = protected_record.get("label")
+
+    raw_text = doc.text[start_char:end_char]
+    return {
+        "phrase": phrase_text,
+        "raw_text": raw_text,
+        "start_char": start_char,
+        "end_char": end_char,
+        "source": source,
+        "protected": protected_record is not None,
+        "protected_reason": protected_reason,
+        "entity_label": ent.label_ if ent is not None else None,
+    }
 
 
 # Remove phrase candidates that are contained by stronger entity or phrase spans.
@@ -233,6 +472,50 @@ def _is_single_word_quantifier_span(span):
 
     token = meaningful_tokens[0]
     return _is_quantifier_like(token) or re.fullmatch(r"\d+(\.\d+)?", token.text)
+
+
+def _is_roman_numeral_text(text):
+    return bool(text and ROMAN_NUMERAL_RE.fullmatch(text))
+
+
+def _is_title_case_token_text(text):
+    if not text or not text[0].isupper():
+        return False
+    return any(char.islower() for char in text[1:])
+
+
+def _is_title_like_token(token):
+    token_text = token.text.strip()
+    if not token_text:
+        return False
+    return (
+        token.pos_ == "PROPN"
+        or token_text.isupper()
+        or _is_roman_numeral_text(token_text)
+        or _is_title_case_token_text(token_text)
+    )
+
+
+# Detect multi-token noun chunks that look like titles or proper-name spans.
+def _is_title_like_noun_chunk(noun_chunk):
+    content_tokens = [
+        token for token in noun_chunk
+        if not token.is_stop and not token.is_punct and not token.is_space
+    ]
+    if len(content_tokens) < 2:
+        return False
+
+    title_like_count = sum(1 for token in content_tokens if _is_title_like_token(token))
+    if title_like_count * 2 <= len(content_tokens):
+        return False
+
+    # Avoid protecting ordinary sentence-initial phrases where only the first
+    # content token has capitalization as its signal.
+    first_content = content_tokens[0]
+    if title_like_count == 1 and _is_title_case_token_text(first_content.text):
+        return False
+
+    return True
 
 
 # Decide whether a spaCy noun chunk is useful enough to index.
@@ -338,12 +621,16 @@ def _is_valid_token(token, debug_mode=False, debug_stage=None):
         return False
 
     is_model = any(c.isdigit() for c in token.text)
-    if token.pos_ not in ["NOUN", "PROPN", "ADJ"] and not is_model:
+    # Clausal subjects are kept even with a non-NOUN/PROPN POS: lowercasing in clean_text
+    # frequently mis-tags a title-case subject (e.g. "Frozen") as ADJ/VERB, but the parse
+    # still labels it nsubj, and the subject is usually the query's key discriminator.
+    is_subject = token.dep_ in SUBJECT_DEPS
+    if token.pos_ not in ["NOUN", "PROPN"] and not is_model and not is_subject:
         if debug_mode:
             _debug_skip(
                 "token",
                 token,
-                f"POS={token.pos_} is not in {{NOUN, PROPN, ADJ}} and the token does not look like a model/code token",
+                f"POS={token.pos_} is not in {{NOUN, PROPN}}, not a model/code token, and not a clausal subject",
                 stage=debug_stage,
             )
         return False
@@ -383,8 +670,22 @@ def _is_valid_token(token, debug_mode=False, debug_stage=None):
     return True
 
 # Extract important phrase and token spans from text using spaCy filtering rules.
-def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,discard_no_word=False,debug_mode=False):
-    doc = nlp(chunk)
+def extract_important_spans(
+    chunk,
+    nlp,
+    min_tokens=2,
+    discard_no_word=False,
+    debug_mode=False,
+    return_phrase_audit=False,
+    doc=None,
+):
+    if doc is None:
+        doc = nlp(chunk)
+    protected_entity_records = _collect_protected_entity_records(
+        doc,
+        discard_no_word=discard_no_word,
+    )
+    phrase_audit_records = []
 
     if debug_mode:
         _debug_stage("entity_filter")
@@ -395,6 +696,18 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         debug_mode=debug_mode,
         debug_stage="entity_filter",
     )
+    if return_phrase_audit:
+        for phrase, start_char, end_char in important_phrases:
+            phrase_audit_records.append(
+                _build_phrase_audit_record(
+                    doc,
+                    phrase,
+                    start_char,
+                    end_char,
+                    "entity",
+                    protected_entity_records,
+                )
+            )
 
     if debug_mode:
         _debug_stage("noun_chunk_filter")
@@ -415,6 +728,44 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
                 )
             continue
 
+        residual_spans = _split_span_by_protected_entities(
+            noun_chunk,
+            protected_entity_records,
+        )
+        if residual_spans:
+            for residual in residual_spans:
+                if not _is_valid_noun_chunk(
+                    residual,
+                    min_tokens=min_tokens,
+                    debug_mode=debug_mode,
+                    debug_stage="noun_chunk_filter",
+                ):
+                    continue
+                phrase_norm, start_char, end_char, start_token, end_token = _normalize_phrase_from_span(
+                    residual,
+                    preserve_leading_article=_is_title_like_noun_chunk(residual),
+                )
+                important_phrases.append((phrase_norm, start_char, end_char))
+                phrase_token_spans.append((start_token, end_token))
+                if _is_title_like_noun_chunk(residual):
+                    _append_protected_span_record(
+                        protected_entity_records,
+                        residual,
+                        "TITLE_LIKE_NOUN_CHUNK",
+                    )
+                if return_phrase_audit:
+                    phrase_audit_records.append(
+                        _build_phrase_audit_record(
+                            doc,
+                            phrase_norm,
+                            start_char,
+                            end_char,
+                            "noun_chunk_residual",
+                            protected_entity_records,
+                        )
+                    )
+            continue
+
         if not _is_valid_noun_chunk(
             noun_chunk,
             min_tokens=min_tokens,
@@ -423,8 +774,29 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         ):
             continue
 
-        important_phrases.append((normalize_text(noun_chunk.text.strip()), start_char, end_char))
+        phrase_norm, start_char, end_char, start_token, end_token = _normalize_phrase_from_span(
+            noun_chunk,
+            preserve_leading_article=_is_title_like_noun_chunk(noun_chunk),
+        )
+        important_phrases.append((phrase_norm, start_char, end_char))
         phrase_token_spans.append((start_token, end_token))
+        if _is_title_like_noun_chunk(noun_chunk):
+            _append_protected_span_record(
+                protected_entity_records,
+                noun_chunk,
+                "TITLE_LIKE_NOUN_CHUNK",
+            )
+        if return_phrase_audit:
+            phrase_audit_records.append(
+                _build_phrase_audit_record(
+                    doc,
+                    phrase_norm,
+                    start_char,
+                    end_char,
+                    "noun_chunk",
+                    protected_entity_records,
+                )
+            )
 
     if debug_mode:
         _debug_stage("phrase_dedup")
@@ -434,6 +806,19 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         debug_mode=debug_mode,
         debug_stage="phrase_dedup" if debug_mode else None,
     )
+    if return_phrase_audit:
+        kept_phrase_keys = {
+            (phrase, start_char, end_char)
+            for phrase, start_char, end_char in important_phrases
+        }
+        phrase_audit_records = [
+            record for record in phrase_audit_records
+            if (
+                record["phrase"],
+                record["start_char"],
+                record["end_char"],
+            ) in kept_phrase_keys
+        ]
 
     important_tokens = []
 
@@ -444,27 +829,21 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         if not _is_valid_token(token, debug_mode=debug_mode, debug_stage="token_filter"):
             continue
 
-        if remove_duplicate:
-            inside_phrase = any(
-                token.i >= start and token.i < end
-                for start, end in phrase_token_spans
-            )
-
-            if inside_phrase:
-                if debug_mode:
-                    _debug_skip(
-                        "token",
-                        token,
-                        "token is inside an accepted entity or noun chunk span",
-                        stage="token_dedup",
-                    )
-                continue
+        if _token_inside_protected_entity(token, protected_entity_records):
+            if debug_mode:
+                _debug_skip(
+                    "token",
+                    token,
+                    "token is inside a protected entity",
+                    stage="token_filter",
+                )
+            continue
 
         if debug_mode:
             _debug_keep(
                 "token",
                 token,
-                "passed token filters and is not covered by a larger accepted span",
+                "passed token filters",
                 stage="token_output",
             )
 
@@ -478,11 +857,13 @@ def extract_important_spans(chunk, nlp, min_tokens=2, remove_duplicate=True,disc
         _debug_dump_spans("important_phrases", important_phrases)
         _debug_dump_spans("important_tokens", important_tokens)
 
+    if return_phrase_audit:
+        return important_phrases, important_tokens, phrase_audit_records
     return important_phrases, important_tokens
 
 
 # Normalize text for matching by lowercasing words and removing leading articles.
-def normalize_text(text: str) -> str:
+def normalize_text(text: str, *, preserve_leading_article: bool = False) -> str:
     # Normalize one word while preserving meaningful acronyms.
     def process_word(word: str) -> str:
         if re.search(r'[A-Z]{2,}', word):
@@ -493,8 +874,10 @@ def normalize_text(text: str) -> str:
     if not words:
         return ""
 
-                          
-    if words[0].lower() in {"the", "a", "an"}:
+    if (
+        not preserve_leading_article
+        and words[0].lower() in {"the", "a", "an"}
+    ):
         words = words[1:]
 
     return ' '.join(process_word(word) for word in words)
@@ -514,6 +897,7 @@ def _normalize_token_text(token) -> str:
 def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
     doc = nlp(chunk)
     important_phrases, _, phrase_token_spans = _collect_valid_entities(doc, debug_mode=debug_mode)
+    protected_entity_records = _collect_protected_entity_records(doc)
     num_ents = len(important_phrases)
 
     for noun_chunk in doc.noun_chunks:
@@ -529,26 +913,79 @@ def extract_important_phrases(chunk, nlp, min_tokens=2,debug_mode=False):
                 )
             continue
 
+        residual_spans = _split_span_by_protected_entities(
+            noun_chunk,
+            protected_entity_records,
+        )
+        if residual_spans:
+            for residual in residual_spans:
+                if not _is_valid_noun_chunk(
+                    residual,
+                    min_tokens=min_tokens,
+                    debug_mode=debug_mode,
+                ):
+                    continue
+                phrase_norm, start_char, end_char, _, _ = _normalize_phrase_from_span(
+                    residual,
+                    preserve_leading_article=_is_title_like_noun_chunk(residual),
+                )
+                important_phrases.append((phrase_norm, start_char, end_char))
+            continue
+
         if not _is_valid_noun_chunk(
             noun_chunk,
             min_tokens=min_tokens,
             debug_mode=debug_mode,
         ):
             continue
-        important_phrases.append(
-            (normalize_text(noun_chunk.text.strip()), noun_chunk.start_char, noun_chunk.end_char)
+        phrase_norm, start_char, end_char, _, _ = _normalize_phrase_from_span(
+            noun_chunk,
+            preserve_leading_article=_is_title_like_noun_chunk(noun_chunk),
         )
+        important_phrases.append((phrase_norm, start_char, end_char))
 
     return important_phrases, num_ents
 
 # Extract important standalone token spans for indexing or querying.
 def extract_important_tokens(chunk,nlp,debug_mode=False):
     doc = nlp(chunk)
+    protected_entity_records = _collect_protected_entity_records(doc)
+    protected_token_spans = [
+        (record["start"], record["end"])
+        for record in protected_entity_records
+    ]
+    for noun_chunk in doc.noun_chunks:
+        if phrase_is_contained(protected_token_spans, (noun_chunk.start, noun_chunk.end)):
+            continue
+
+        residual_spans = _split_span_by_protected_entities(
+            noun_chunk,
+            protected_entity_records,
+        )
+        candidate_spans = residual_spans if residual_spans else [noun_chunk]
+        for span in candidate_spans:
+            if not _is_valid_noun_chunk(span, min_tokens=2):
+                continue
+            if _is_title_like_noun_chunk(span):
+                _append_protected_span_record(
+                    protected_entity_records,
+                    span,
+                    "TITLE_LIKE_NOUN_CHUNK",
+                )
+
     spans = []
     for token in doc:
         if not _is_valid_token(token, debug_mode=debug_mode):
             continue
 
+        if _token_inside_protected_entity(token, protected_entity_records):
+            if debug_mode:
+                _debug_skip(
+                    "token",
+                    token,
+                    "token is inside a protected entity",
+                )
+            continue
 
         start_char = token.idx
         end_char = token.idx + len(token.text)
@@ -638,31 +1075,35 @@ def get_token_embeds(token_embeddings, offsets, phrase_list, token_list):
                                                                                                          
                                                                                   
 
-    for phrase, start_char, end_char in phrase_list:
+    for phrase_item in phrase_list:
+        phrase, start_char, end_char, *extra_metadata = phrase_item
         token_idxs = get_token_indices_for_phrase(start_char, end_char, offsets)
         if not token_idxs:
             continue
-        phrase_embs.append(
-            (
-                phrase,
-                token_embeddings[token_idxs].mean(dim=0),
-                start_char,
-                end_char,
-            )
+        phrase_record = (
+            phrase,
+            token_embeddings[token_idxs].mean(dim=0),
+            start_char,
+            end_char,
         )
+        if extra_metadata:
+            phrase_record = phrase_record + (extra_metadata[0],)
+        phrase_embs.append(phrase_record)
 
-    for token, start_char, end_char in token_list:
+    for token_item in token_list:
+        token, start_char, end_char, *extra_metadata = token_item
         token_idxs = get_token_indices_for_phrase(start_char, end_char, offsets)
         if not token_idxs:
             continue
-        token_embs.append(
-            (
-                token,
-                token_embeddings[token_idxs].mean(dim=0),
-                start_char,
-                end_char,
-            )
+        token_record = (
+            token,
+            token_embeddings[token_idxs].mean(dim=0),
+            start_char,
+            end_char,
         )
+        if extra_metadata:
+            token_record = token_record + (extra_metadata[0],)
+        token_embs.append(token_record)
 
     return phrase_embs, token_embs
 
