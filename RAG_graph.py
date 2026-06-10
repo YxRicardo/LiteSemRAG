@@ -2941,6 +2941,84 @@ class LiteSemRAG:
 
         return low_level_sems, high_level_sems
 
+    # Query-time IDF-based generic-word pruning (borrows NoLLMRAG's IS threshold idea).
+    #
+    # NoLLMRAG keeps only query tokens whose importance score exceeds `tau * max_score`
+    # (relative, per-query) so that generic predicates (person/drink/state) are dropped from
+    # keyword matching entirely instead of merely down-weighted. We reuse the already-persisted
+    # `token_node.idf` as the discriminativeness signal and apply the same relative cut, with two
+    # safety rails tuned for a system that has no strong full-sentence dense fallback:
+    #   * gate: only prune when max_idf >= `min_max_idf` (there is a genuinely discriminative token
+    #     -- a real peak); an all-generic query has no peak and is left untouched.
+    #   * keep-top: always retain the `keep_top` highest-idf sems regardless of the threshold, so
+    #     the relative cut can never starve the pair-boost mechanism (which needs >=2 discriminative
+    #     tokens in the same chunk to fire).
+    # Compositional query-group members (tuple len > 3) are never pruned: a phrase head/modifier is
+    # inherently discriminative and removing one would distort grouped-chunk scoring.
+    #
+    # `idf_prune_tau is None` disables pruning entirely (identical to the pre-change behavior).
+    # Returns (low_level_sems, high_level_sems, dropped_tokens) where dropped_tokens is for debug.
+    def _idf_prune_query_sems(
+        self,
+        low_level_sems,
+        high_level_sems,
+        idf_prune_tau,
+        min_max_idf=None,
+        keep_top=2,
+        print_important_tokens=False,
+    ):
+        if idf_prune_tau is None:
+            return low_level_sems, high_level_sems, []
+
+        def is_groupable(sem_info):
+            # tuple len > 3 carries query_group_id et al. -> compositional member, never prune.
+            return len(sem_info) <= 3
+
+        prunable = [
+            s for s in (low_level_sems + high_level_sems) if is_groupable(s)
+        ]
+        if not prunable:
+            return low_level_sems, high_level_sems, []
+
+        def sem_idf(sem_info):
+            return float(getattr(sem_info[0].token_node, "idf", 0.0) or 0.0)
+
+        max_idf = max(sem_idf(s) for s in prunable)
+        # Gate: no clearly discriminative token -> leave the query untouched.
+        if min_max_idf is not None and max_idf < min_max_idf:
+            return low_level_sems, high_level_sems, []
+
+        threshold = idf_prune_tau * max_idf
+        # Force-keep the top-`keep_top` prunable sems by idf (identity set), then keep anything
+        # above threshold. Rank by idf desc; ties broken by token text for determinism.
+        ranked = sorted(
+            prunable,
+            key=lambda s: (-sem_idf(s), s[0].token_node.token_text),
+        )
+        keep_ids = {id(s) for s in ranked[: max(keep_top, 1)]}
+
+        def keep(sem_info):
+            if not is_groupable(sem_info):
+                return True
+            if id(sem_info) in keep_ids:
+                return True
+            return sem_idf(sem_info) > threshold
+
+        dropped_tokens = [
+            s[0].token_node.token_text
+            for s in prunable
+            if id(s) not in keep_ids and sem_idf(s) <= threshold
+        ]
+        new_low = [s for s in low_level_sems if keep(s)]
+        new_high = [s for s in high_level_sems if keep(s)]
+
+        if print_important_tokens and dropped_tokens:
+            print(
+                f"[idf_prune] tau={idf_prune_tau} max_idf={max_idf:.3f} "
+                f"thr={threshold:.3f} dropped={dropped_tokens}"
+            )
+        return new_low, new_high, dropped_tokens
+
     # Chunk-level bounded co-occurrence boosting query.
     #
     # ChunkScore(c) = BaseEvidence(c) * (1 + λ * PairBoost(c)), where PairBoost(c) averages the
@@ -2959,6 +3037,9 @@ class LiteSemRAG:
         candidate_pool_size=COOCCUR_CANDIDATE_POOL_SIZE,
         print_important_tokens=True,
         search_mode='broad',
+        idf_prune_tau=None,
+        idf_prune_min_max_idf=None,
+        idf_prune_keep_top=2,
     ):
         # ---- Parameter validation (fail loud instead of silently degrading) ----
         # bool is a subclass of int, so reject it explicitly to avoid True being read as 1.
@@ -2995,6 +3076,14 @@ class LiteSemRAG:
         )
         low_level_sems, high_level_sems = self._collect_query_cooccurrence_sems(
             resolved_matches, print_important_tokens
+        )
+        low_level_sems, high_level_sems, _ = self._idf_prune_query_sems(
+            low_level_sems,
+            high_level_sems,
+            idf_prune_tau=idf_prune_tau,
+            min_max_idf=idf_prune_min_max_idf,
+            keep_top=idf_prune_keep_top,
+            print_important_tokens=print_important_tokens,
         )
 
         graph = CoOccurrenceGraph(low_level_sems + high_level_sems)
