@@ -2620,6 +2620,15 @@ class LiteSemRAG:
                     query_unit["embedding_end"],
                 ),
             )
+            if token_embed is None:
+                # 该 span 没有对齐到任何 tokenizer token(通常是查询超过编码器
+                # max_length 被截断)。继续算下去会得到 NaN embedding 并污染所有
+                # 相似度比较,直接跳过这个查询单元。
+                print(
+                    f"[query] span '{query_unit['embedding_span_text']}' has no "
+                    "encoder token alignment (truncated?); skipping this query unit."
+                )
+                continue
             token_node = self.query_token_node(token)
             exact_sem_node = None
             fuzzy_sem_nodes = []
@@ -3417,6 +3426,23 @@ class LiteSemRAG:
         self.log_time("Finalize started.")
         if not self.chunk_nodes:
             raise ValueError("Cannot finalize an empty graph: no chunk nodes have been indexed.")
+        # 守卫:不支持 "finalize 后增量索引再 finalize"。finalize_token_nodes() 会跳过
+        # has_semantic 的 token,第二轮索引在这些 token 上积累的 embeds_buffer 永远不会
+        # 被处理(新 chunk 不会挂到 sem node 上,检索静默丢证据)。与其静默出错,不如
+        # 在这里显式失败;需要增量请删除旧文档后重建,或在新实例上重新索引全量语料。
+        stale_buffer_tokens = [
+            token_node.token_text
+            for token_node in self.token_nodes
+            if token_node.has_semantic and token_node.embeds_buffer
+        ]
+        if stale_buffer_tokens:
+            preview = ", ".join(stale_buffer_tokens[:5])
+            raise ValueError(
+                "finalize() does not support incremental indexing: "
+                f"{len(stale_buffer_tokens)} already-finalized token(s) have new buffered "
+                f"embeddings that would be silently dropped (e.g. {preview}). "
+                "Re-index the full corpus on a fresh instance instead."
+            )
         self._recompute_chunk_avg_len()
         self.log_time("Computed average chunk length.")
         removed_placeholder_count = self._cleanup_empty_placeholder_token_nodes()
@@ -6345,6 +6371,10 @@ class LiteSemRAG:
 
     # Build an inverted index from words to phrase token nodes.
     def build_phrase_query(self):
+        # 必须先重置:postings 存的是 phrase_token_nodes 的列表下标,而 finalize 前置的
+        # placeholder 清理会过滤/重排该列表;不重置的话,重复 finalize 会留下指向错误
+        # 短语的陈旧下标(rebuild_metadata_after_deletion 此前就显式重置过)。
+        self.phrase_index = defaultdict(set)
         for i, token_node in enumerate(self.phrase_token_nodes):
             words = token_node.token_text.split()
             for w in words:
@@ -6396,7 +6426,9 @@ class LiteSemRAG:
                 sem_node_map.append(sem_node)
 
         if len(all_embeds) == 0:
-            return [], torch.tensor([])
+            # 必须与正常路径同型(list):调用方用真值/len 判断 fuzzy 命中,
+            # 返回二元组会被误判为"有命中"并在下游解包时崩溃。
+            return []
 
         matrix = torch.stack(all_embeds).to(self.device)
 

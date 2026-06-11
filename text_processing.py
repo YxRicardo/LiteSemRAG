@@ -1130,9 +1130,14 @@ def encode_text(query_text, text_encoder, tokenizer, device):
     return token_embeddings, offsets
 
 # Return the pooled embedding for a query span based on character offsets.
+# Returns None when no tokenizer token overlaps the span (e.g. the span falls
+# beyond the tokenizer's max_length truncation): an empty index list would
+# otherwise produce an all-NaN mean that silently corrupts similarity search.
 def get_embed_by_offest(token_embeddings,offsets, token_metadata):
     phrase, start_char, end_char = token_metadata
     token_idxs = get_token_indices_for_phrase(start_char, end_char, offsets)
+    if not token_idxs:
+        return None
     return token_embeddings[token_idxs].mean(dim=0)
 
 # Encode a query and return one pooled query embedding.
