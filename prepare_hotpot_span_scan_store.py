@@ -15,7 +15,7 @@ from text_processing import clean_text, extract_important_spans
 
 
 DEFAULT_HOTPOT_PATH = Path("jupyter_notebooks/hotpot_dev_distractor_v1.json")
-DEFAULT_CACHE_DIR = Path("hotpot_QA_qwen_scan_cache")
+DEFAULT_CACHE_DIR = Path("data/hotpot_QA_qwen_scan_cache")
 DEFAULT_CACHE_TAG = "current_rules_v1"
 DEFAULT_SPACY_MODEL = "en_core_web_lg"
 

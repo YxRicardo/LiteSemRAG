@@ -1275,7 +1275,7 @@ def build_hotpot_retrieval_dataset(file_path, num_samples=None):
               
                                    
 
-    cache_dir = Path("./hotpot_QA")
+    cache_dir = Path("./data/hotpot_QA")
     cache_dir.mkdir(exist_ok=True)
 
     tag = "all" if num_samples is None else str(num_samples)

@@ -3204,6 +3204,17 @@ class LiteSemRAG:
 
         return self.chunk_id2text(retrieved_chunk_ids), retrieved_chunk_ids, debug_info
 
+    # Two-stage bridge retrieval for multi-hop (bridge) questions — Implementation Plan One.
+    #
+    # Thin wrapper that delegates to multihop_reasoning.multihop_bridge_query so RAG_graph.py
+    # does not keep growing. Reuses chunk_cooccur_query() for first-hop recall, then extracts
+    # bridge semantic nodes from the first-hop chunks and runs a bridge-driven second hop.
+    # Returns (chains, retrieved_chunk_ids, debug_info); does NOT touch index/finalize/schema
+    # or the existing chunk_cooccur_query() path (single-hop eval scripts are unaffected).
+    def multihop_bridge_query(self, query_text, *args, **kwargs):
+        from multihop_reasoning import multihop_bridge_query
+        return multihop_bridge_query(self, query_text, *args, **kwargs)
+
     # Chunk-level bounded boosting: local evidence level for a co-occurring node pair.
     #
     # Two tiers (chunk-side verified, highest applicable wins):
