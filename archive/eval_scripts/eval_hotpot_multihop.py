@@ -1,11 +1,13 @@
-"""HotpotQA(distractor 500) 计划一 multihop_bridge_query 评测。
+"""Evaluate Plan-1 multihop_bridge_query on HotpotQA (distractor 500).
 
-加载已有 fastidx 缓存(不重建索引),对比两种 query 端方法:
-  baseline : chunk_cooccur_query()        —— 单跳基线
-  multihop : multihop_bridge_query()      —— 两阶段桥接检索(计划一)
+Load an existing fastidx cache without rebuilding the index, and compare two
+query-time methods:
+  baseline : chunk_cooccur_query()   - single-hop baseline
+  multihop : multihop_bridge_query() - two-stage bridge retrieval (Plan 1)
 
-按 all / bridge / comparison 分层,指标 full_hit / recall@10_pq / recall@10_micro / mrr@10
-(口径与 eval_hotpot_litesem_inproc.py 一致)。结果写 JSON,供报告引用。
+Report full_hit / recall@10_pq / recall@10_micro / mrr@10 for all / bridge /
+comparison slices, using the same evaluation protocol as
+eval_hotpot_litesem_inproc.py. Results are written to JSON for reporting.
 """
 from __future__ import annotations
 

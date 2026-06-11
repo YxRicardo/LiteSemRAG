@@ -1,9 +1,9 @@
-"""计划一 multihop_bridge_query 的 4 个 smoke case 验证(计划 §11.1)。
+"""Validate four smoke-test cases for Plan-1 multihop_bridge_query (plan §11.1).
 
-加载已有 fastidx 缓存,检查:
-  - bridge 是否被抽出
-  - 两个 gold title 是否进入 returned chunks/docs
-  - comparison 行为
+Load an existing fastidx cache and check:
+  - whether the bridge is extracted
+  - whether both gold titles appear in the returned chunks/docs
+  - comparison-case behavior
 """
 import os
 os.environ.setdefault("LITESEM_PRESERVE_CASE", "1")

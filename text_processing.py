@@ -5,12 +5,18 @@ import torch.nn.functional as F
 import re
 
 
-# 方案A 开关：保留原始大小写，让 spaCy 在真实大小写文本上做 NER/POS/依存分析。
-# 默认 True = 方案A（保留大小写，NER/POS/依存质量更好，PROPN 不做复数还原）。
-# 设 LITESEM_PRESERVE_CASE=0 可退回方案B（旧行为：整体小写、仅保留缩写与多词专名的大小写）。
-# token/phrase 的匹配键仍由下游 normalize_text 统一小写（缩写除外），所以大小写仅影响
-# 语言学分析质量，不改变匹配口径。可调用 set_preserve_case() 在进程内切换。
-# 索引端与查询端必须使用同一设置——切换后需用相同设置重建索引。
+# Option A toggle: preserve the original casing so spaCy runs NER/POS/dependency
+# analysis on realistically cased text.
+# Default True = Option A (preserve case, better NER/POS/dependency quality, and
+# PROPN tokens are not singularized).
+# Set LITESEM_PRESERVE_CASE=0 to fall back to Option B (legacy behavior: lowercase
+# everything except acronyms and multi-word proper names).
+# The token/phrase matching key is still lowercased downstream by normalize_text
+# (except for acronyms), so casing only affects linguistic analysis quality and
+# does not change matching semantics. set_preserve_case() can switch this at
+# runtime.
+# Indexing and querying must use the same setting; after switching, rebuild the
+# index with the same configuration.
 PRESERVE_CASE = os.environ.get("LITESEM_PRESERVE_CASE", "1").strip().lower() in {"1", "true", "yes"}
 
 
@@ -27,7 +33,8 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text)
 
     if PRESERVE_CASE:
-        # 方案A：不做整体小写，只规整空白并去掉引号，保留原始大小写交给 spaCy。
+        # Option A: do not lowercase the full text; only normalize whitespace
+        # and strip quotes, then keep the original casing for spaCy.
         text = re.sub(r"[\"']", "", text)
         return text.strip()
 

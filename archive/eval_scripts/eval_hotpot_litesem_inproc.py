@@ -1,13 +1,19 @@
-"""HotpotQA(distractor 500) query 端方法改进 A/B 评测 —— 建索引+评测同进程。
+"""A/B evaluation of query-side method improvements on HotpotQA (distractor 500),
+with indexing and evaluation in the same process.
 
-fast_index 索引在内存里构建后直接评测，不落盘(避免大对象 pickle 的栈崩溃)。
-只切换 query 端方法对比：
-  A0 baseline_off : 关闭子 token 回退 + IDF 剪枝关  (≈ 报告里"改进前")
-  A1 subtoken     : 子 token 回退开(当前默认)  + IDF 剪枝关
-  A2 subtoken_idf : 子 token 回退开 + IDF 泛词剪枝 tau/floor/keep_top (FEVER 推荐点)
+The fast_index graph is built in memory and evaluated directly without writing a
+pickle to disk, which avoids stack overflows when pickling large objects.
+Only the query-side method is changed:
+  A0 baseline_off : subtoken fallback off + IDF pruning off (roughly the
+                    "before improvement" setup in the report)
+  A1 subtoken     : subtoken fallback on (current default) + IDF pruning off
+  A2 subtoken_idf : subtoken fallback on + generic-term IDF pruning
+                    tau/floor/keep_top (recommended FEVER setting)
 
-PRESERVE_CASE 默认开(方案A)。指标 Recall@10(pq/micro)/MRR@10/full_hit，
-并按题型(comparison / bridge)分层，检查单跳优化是否牺牲多跳能力。
+PRESERVE_CASE is enabled by default (Option A). Metrics are
+Recall@10(pq/micro)/MRR@10/full_hit, with separate slices for comparison and
+bridge questions to check whether single-hop improvements hurt multi-hop
+behavior.
 """
 from __future__ import annotations
 
@@ -120,7 +126,7 @@ def main():
         gold_sets.append({t.strip().lower() for t in titles if t and t.strip()})
         type_list.append(type_map.get(s["sample_id"], "unknown"))
 
-    # 建索引(内存)
+    # Build the index in memory.
     db = RAG_graph.LiteSemRAG(chunk_size=CHUNK_SIZE, device="cuda", fast_index=True)
     db.json_path = "/tmp/hotpot_fastidx_documents.json"
     t0 = time.time()

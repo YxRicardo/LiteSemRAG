@@ -64,26 +64,29 @@ from utils import (
 
 CURRENT_SCHEMA_VERSION = 8
 
-# Anchor 传播分配法的默认数值超参(对齐
-# jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb)。只有少数核心项
-# 通过 __init__ 暴露;其余写死成这里的 notebook 默认值,需要时可在实例上覆盖。
+# Default numeric hyperparameters for the Anchor propagation assignment method
+# (aligned with
+# jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb). Only a few core
+# items are exposed through __init__; the rest are fixed here to the notebook
+# defaults and can be overridden on the instance if needed.
 ANCHOR_PROP_DEFAULTS = {
-    "anchor_fraction": 0.15,        # anchor 占全部 occurrence 的比例
-    "anchor_fft_ratio": 0.70,       # anchor 中由 FFT 选出的比例(其余 random)
-    "anchor_min_count": 2,          # anchor 最少个数
-    "anchor_max_count": 20,         # anchor 个数上限(防止高频词把过多样本塞进单次 LLM 判定)
-    "anchor_random_state": 42,      # anchor 随机采样种子
-    "prop_knn_k": 8,                # 构图近邻数 k
-    "prop_vote_ratio": 0.60,        # 普通类采纳所需近邻多数比例
-    "prop_weak_vote_ratio": 0.50,   # 弱投票(需 anchor center)比例
-    "prop_rare_vote_ratio": 0.80,   # 稀有类采纳所需更高比例
-    "prop_high_margin": 1.5,        # CE margin 高于此视为"自信"(用于反对票)
-    "prop_ce_oppose_gap": 0.5,      # CE 对多数类分数比 top1 低多少算强烈反对
-    "prop_rare_anchor_threshold": 2,  # anchor 中样本数 <= 此值的类视为稀有类
-    "prop_max_rounds": 50,          # 标签传播最大轮数
+    "anchor_fraction": 0.15,        # fraction of all occurrences used as anchors
+    "anchor_fft_ratio": 0.70,       # fraction of anchors chosen by FFT (the rest are random)
+    "anchor_min_count": 2,          # minimum number of anchors
+    "anchor_max_count": 20,         # maximum anchors to avoid overloading one LLM decision pass on high-frequency terms
+    "anchor_random_state": 42,      # random seed for anchor sampling
+    "prop_knn_k": 8,                # number of neighbors k for graph construction
+    "prop_vote_ratio": 0.60,        # majority ratio needed to accept a normal class
+    "prop_weak_vote_ratio": 0.50,   # weak-vote ratio (requires anchor center)
+    "prop_rare_vote_ratio": 0.80,   # higher ratio needed to accept a rare class
+    "prop_high_margin": 1.5,        # CE margin above this is treated as confident (for opposition votes)
+    "prop_ce_oppose_gap": 0.5,      # CE score gap below top1 needed to count as strong opposition
+    "prop_rare_anchor_threshold": 2,  # classes with <= this many anchor samples are treated as rare
+    "prop_max_rounds": 50,          # maximum label-propagation rounds
 }
 
-# 各版本消融开关。kNN 类型对 C/D 固定(C=plain、D=mutual),E/F 由方法名带出。
+# Ablation flags for each version. The kNN type is fixed for C/D
+# (C=plain, D=mutual), while E/F encode it in the method name.
 ANCHOR_PROP_VERSION_FLAGS = {
     "C": {"use_margin": False, "use_center": False, "rare_conservative": False},
     "D": {"use_margin": False, "use_center": False, "rare_conservative": False},
@@ -96,18 +99,20 @@ DEFAULT_SEM_ASSIGNMENT_METHOD = "Anchor-F-mutual [ce_fallback]"
 
 
 def _anchor_method_name(version, knn_type, uncertain_mode):
-    """与 notebook 的 anchor_method_name() 一致的规范方法名。"""
+    """Canonical method name matching the notebook's anchor_method_name()."""
     if version in {"E", "F"}:
         return f"Anchor-{version}-{knn_type} [{uncertain_mode}]"
     return f"Anchor-{version} [{uncertain_mode}]"
 
 
 def _parse_anchor_method(method_name):
-    """解析 Anchor 方法名 -> spec dict;非 Anchor 名(FFT-CE/FFT-LLM/None)返回 None。
+    """Parse an Anchor method name into a spec dict.
 
-    支持:
+    Returns None for non-Anchor names (FFT-CE/FFT-LLM/None).
+
+    Supports:
       Anchor-C [ce_fallback] / Anchor-D [re_llm]
-      Anchor-E-plain [ce_fallback] / Anchor-F-mutual [re_llm] 等全部变体。
+      Anchor-E-plain [ce_fallback] / Anchor-F-mutual [re_llm] and all variants.
     """
     if not method_name or not isinstance(method_name, str):
         return None
@@ -119,14 +124,18 @@ def _parse_anchor_method(method_name):
         text,
     )
     if match is None:
-        raise ValueError(f"无法解析的 Anchor 分配方法名: {method_name!r}")
+        raise ValueError(f"Could not parse Anchor assignment method name: {method_name!r}")
     version, knn_type, uncertain_mode = match.group(1), match.group(2), match.group(3)
     if version in {"E", "F"}:
         if knn_type is None:
-            raise ValueError(f"方法 {version} 必须在名字里指定 plain/mutual: {method_name!r}")
+            raise ValueError(
+                f"Method {version} must specify plain/mutual in its name: {method_name!r}"
+            )
     else:
         if knn_type is not None:
-            raise ValueError(f"方法 {version} 不接受 plain/mutual 后缀: {method_name!r}")
+            raise ValueError(
+                f"Method {version} does not accept a plain/mutual suffix: {method_name!r}"
+            )
         knn_type = ANCHOR_PROP_DEFAULT_KNN_TYPE[version]
     flags = dict(ANCHOR_PROP_VERSION_FLAGS[version])
     return {
@@ -163,7 +172,8 @@ COMPOSITIONAL_QUERY_ROLE_WEIGHT = {
 }
 
 # Chunk-level bounded co-occurrence boosting (chunk_cooccur_query) defaults.
-# 每个 chunk 只取 top-k pair boost 求平均;ChunkScore = BaseEvidence * (1 + λ * PairBoost)。
+# For each chunk, only the top-k pair boosts are averaged;
+# ChunkScore = BaseEvidence * (1 + lambda * PairBoost).
 COOCCUR_TOP_K_PAIR_BOOSTS = 3
 COOCCUR_LAMBDA = 0.3
 # Candidate-pool cutoff: only the top-N chunks by BaseEvidence get the (expensive) pair-boost
@@ -171,9 +181,12 @@ COOCCUR_LAMBDA = 0.3
 # bounded (<= λ ≈ 30%), a chunk far down the base ranking cannot realistically overtake the pool,
 # so this caps the pair-combination cost without changing the top results. Set to None to disable.
 COOCCUR_CANDIDATE_POOL_SIZE = 200
-# local_evidence_level:两档。same sentence=0.7(两端点 occurrence 落在同一句),否则 same chunk=0.4。
-# 不再有 phrase 档:"真成短语"由 base_evidence 里满格命中的完整 phrase node 表达(且 base 层已对
-# 同 group 做 phrase 优先去重),pair boost 无需也不应再用 query_group_id 顶格加成(会重复计分/虚高)。
+# local_evidence_level now has two tiers: same sentence=0.7 (both endpoint
+# occurrences fall in the same sentence), otherwise same chunk=0.4.
+# There is no longer a separate phrase tier: a "true phrase" is already
+# represented by a fully matched phrase node in base_evidence (and the base
+# layer already deduplicates with phrase priority within the same group), so
+# pair boost neither needs nor should use a full query_group_id bonus again.
 COOCCUR_LOCAL_EVIDENCE = {
     "sentence": 0.7,
     "chunk": 0.4,
@@ -359,7 +372,7 @@ class CoOccurrenceGraph:
                             consumed_member_keys.add(member_key)
 
     # Aggregate semantic node weights into chunk-level retrieval scores.
-    def assign_chunk_weight(self, avg_chunk_len, debug_mode=False):
+    def assign_chunk_weight(self, debug_mode=False):
         weight_map = {}
         token_record_map = defaultdict(set)
         token_weight_map = {}
@@ -572,10 +585,11 @@ class TokenNode:
     compositional_modifier_texts: list = field(default_factory=list)
     compositional_modifier_texts_norm: list = field(default_factory=list)
     headed_phrase_records: dict = field(default_factory=dict)
-    # finalize 时 semantic_type_cls 算出的 embedding 集中度;None 表示从未走过
-    # s_mean 闸门(entity/原子短语单义,或出现次数未达阈值的 basic 节点)。
+    # Embedding concentration computed by semantic_type_cls during finalize.
+    # None means the s_mean gate was never applied (entity / atomic-phrase
+    # single-sense nodes, or basic nodes below the occurrence threshold).
     s_mean: float | None = None
-    # schema 8: Anchor 传播中由 LLM 直接判定的 anchor 样本记录。
+    # Schema 8: Anchor samples labeled directly by the LLM during propagation.
     llm_anchor_sample_assignments: list = field(default_factory=list)
 
     # Initialize optional token metadata after dataclass construction.
@@ -820,21 +834,30 @@ class LiteSemRAG:
         self.next_chunk_node_id = 0
         self.next_token_node_id = 0
         self.next_sem_node_id = 0
-        # 索引期不再增量建语义节点:每个 token/phrase 的所有出现都先累积在
-        # token_node.embeds_buffer 里,直到所有文档扫描完毕,finalize 时才统一跑
-        # 多义判定(build_sem_node)。一个 token/phrase 至少出现这么多次才会跑描述
-        # 预测 / 多义切分,低于该阈值的走 create_basic_sem_node(单节点、无描述)。
-        # 设为 None 则所有 token 都只建单节点、无描述;设为 1 则所有 token 都做描述。
+        # Semantic nodes are no longer built incrementally during indexing: all
+        # occurrences of each token/phrase accumulate in token_node.embeds_buffer
+        # until every document has been scanned, and finalize then runs
+        # polysemy detection via build_sem_node in one pass. A token/phrase must
+        # occur at least this many times before description prediction /
+        # multi-sense splitting runs; below that threshold it goes through
+        # create_basic_sem_node (single node, no description). None means every
+        # token gets only a single basic node with no description; 1 means every
+        # token gets description assignment.
         self.min_occurrences_for_description = min_occurrences_for_description
-        # fast index 模式:finalize 时所有 token/phrase 一律建单义 basic 节点,
-        # 完全跳过 build_sem_node 的 s_mean 闸门 / FFT 采样 / 描述预测 / 多义切分。
-        # 出现次数阈值、entity、force_single 都不再影响分流。索引期短语 head/modifier
-        # 路由与 finalize 下游(modifier postings / IDF / BM25 / query_database /
-        # phrase_index / chunk->sem 边)照常,检索可正常工作。
+        # Fast-index mode: during finalize, every token/phrase always becomes a
+        # single-sense basic node, fully skipping build_sem_node's s_mean gate /
+        # FFT sampling / description prediction / multi-sense splitting.
+        # Occurrence thresholds, entity handling, and force_single no longer
+        # affect routing. Phrase head/modifier routing during indexing and the
+        # downstream finalize structures (modifier postings / IDF / BM25 /
+        # query_database / phrase_index / chunk->sem edges) still run normally.
         self.fast_index = bool(fast_index)
         self.token_node_query = {}
-        # s_mean 闸门:某 token 各次出现 embedding 的平均相似度高于该阈值 →
-        # 语义集中,判为单义不切分(_is_token_polysemous_by_s_mean)。值越大越倾向多义切分。
+        # s_mean gate: if the average similarity among a token's occurrence
+        # embeddings exceeds this threshold, the semantics are considered
+        # concentrated and the token is treated as single-sense without
+        # splitting (_is_token_polysemous_by_s_mean). Higher values make
+        # multi-sense splitting more likely.
         self.tau_conc = float(tau_conc)
         self.tau_disp = 0.78
         self.device = device
@@ -868,9 +891,12 @@ class LiteSemRAG:
         self.llm_candidate_filter_provider = llm_candidate_filter_provider
         self.llm_candidate_filter_api_model = llm_candidate_filter_api_model
         self.llm_candidate_filter_cache_path = llm_candidate_filter_cache_path
-        # gpt-5* 是 reasoning 模型,max_completion_tokens 预算由隐藏推理 token 与可见
-        # 输出共享;合并多义项 + 判 FFT 样本的 JSON 输出较长,1024 容易被截断导致
-        # 解析失败 / 空 definitions(被记成 no_candidate_definitions),故默认放大。
+        # GPT-5* models are reasoning models whose max_completion_tokens budget
+        # is shared by hidden reasoning tokens and visible output. The JSON
+        # output for merging candidate senses plus labeling FFT samples is often
+        # long, and 1024 tokens can easily truncate it, causing parse failures
+        # or empty definitions (recorded as no_candidate_definitions), so the
+        # default is intentionally larger.
         self.llm_candidate_filter_max_tokens = max(1, int(llm_candidate_filter_max_tokens))
         self.llm_candidate_filter = None
         self.llm_candidate_filter_total_tokens = 0
@@ -879,9 +905,11 @@ class LiteSemRAG:
         self.llm_candidate_filter_total_wall_time = 0.0
         self.llm_candidate_filter_api_wait_wall_time = 0.0
         self.use_llm_semantic_labeler = bool(use_llm_semantic_labeler)
-        # 查询期多义消歧:当一个 span 命中的 token 在索引期生成了多个带描述的 sem
-        # node(多义)时,复用索引期的语义判断(cross-encoder / LLM)来选择对应的
-        # sem node,而不是单纯比 embedding 相似度。只有一个 sem node 时直接取用。
+        # Query-time polysemy disambiguation: when a span hits a token that
+        # produced multiple described sem nodes during indexing, reuse the
+        # indexing-time semantic judgment (cross-encoder / LLM) to select the
+        # correct sem node instead of relying only on embedding similarity.
+        # If there is only one sem node, use it directly.
         self.disambiguate_query_sense = bool(disambiguate_query_sense)
         self.llm_semantic_labeler_provider = llm_semantic_labeler_provider
         self.llm_semantic_labeler_model = llm_semantic_labeler_model
@@ -899,10 +927,12 @@ class LiteSemRAG:
         self.fft_d1_d2_ratio_threshold = float(fft_d1_d2_ratio_threshold)
         self.fft_knn_check_k = max(0, int(fft_knn_check_k))
         self.fft_danger_neighbor_m = max(0, int(fft_danger_neighbor_m))
-        # 语义分配方法选择:Anchor-{C,D,E,F}[-plain/mutual] [ce_fallback|re_llm]
-        # 走 anchor 传播路径;其它(FFT-CE / FFT-LLM / None)沿用既有
-        # _assign_sem_description_on_build。其余 anchor 数值超参取 notebook 默认值,
-        # 存为实例属性、可按需覆盖。
+        # Semantic assignment method selection:
+        # Anchor-{C,D,E,F}[-plain/mutual] [ce_fallback|re_llm] uses the anchor
+        # propagation path; other methods (FFT-CE / FFT-LLM / None) reuse the
+        # existing _assign_sem_description_on_build path. The remaining anchor
+        # numeric hyperparameters start from notebook defaults, are stored on
+        # the instance, and can be overridden as needed.
         self.anchor_prop_params = dict(ANCHOR_PROP_DEFAULTS)
         self.anchor_prop_params["anchor_fraction"] = float(anchor_fraction)
         self.anchor_prop_params["anchor_fft_ratio"] = float(anchor_fft_ratio)
@@ -946,11 +976,14 @@ class LiteSemRAG:
         self.phrase_audit_enabled = bool(phrase_audit_enabled)
         self.phrase_audit_cache_path = phrase_audit_cache_path
         self._phrase_audit_session_id = None
+        # finalize() 是否已成功跑过:防止重复 finalize 损坏索引(见 finalize() 守卫)。
+        self._finalized = False
         self.schema_version = CURRENT_SCHEMA_VERSION
 
     # Select the semantic-assignment method and cache the parsed anchor spec.
-    # Anchor 方法名 -> 走传播路径(spec 非 None);其它名(FFT-CE/FFT-LLM/None)
-    # 沿用既有 cross-encoder/LLM 的 consensus+d1/d2 路径。
+    # Anchor method names use the propagation path (spec is not None); other
+    # names (FFT-CE/FFT-LLM/None) reuse the existing cross-encoder/LLM
+    # consensus+d1/d2 path.
     def _set_sem_assignment_method(self, method_name):
         self.sem_assignment_method = method_name
         self._anchor_method_spec = _parse_anchor_method(method_name)
@@ -1562,33 +1595,42 @@ class LiteSemRAG:
 
     # Reset the per-session counters that track who reaches the full sem-build path.
     def _reset_sem_build_stats(self):
-        # 已构建的语义节点总数(build_sem_node 每产出一个节点 +1)。
+        # Total semantic nodes built so far (+1 for each node produced by build_sem_node).
         self.sem_build_count = 0
-        # 进入 build_sem_node 的 token/span 数(= finalize 时出现次数达到
-        # min_occurrences_for_description、足够走完整建节点路径的 token/phrase)。
+        # Number of tokens/spans that enter build_sem_node, i.e. token/phrase
+        # items whose occurrence count reaches min_occurrences_for_description
+        # during finalize and therefore take the full semantic-node build path.
         self.sem_stats_passed_occurrence = 0
-        # 其中被判为 entity / 原子短语(force_single_semantic)而直接单义的,不计入 S_mean 统计。
+        # Among those, items judged as entity / atomic phrase
+        # (force_single_semantic) and kept single-sense directly, excluded from
+        # S_mean statistics.
         self.sem_stats_entity_single = 0
-        # 通过出现次数闸门、且非 entity 的 token 中,因 s_mean 过高(语义集中)被判单义而筛掉的数量。
+        # Among non-entity tokens that pass the occurrence gate, the number
+        # filtered into single-sense because s_mean is too high
+        # (semantically concentrated).
         self.sem_stats_smean_filtered = 0
-        # 通过 s_mean 检测、进入聚类/描述消歧路径的数量(多义切分的候选)。
+        # Number that pass the s_mean check and enter the clustering /
+        # description-disambiguation path (candidates for multi-sense splitting).
         self.sem_stats_smean_passed = 0
-        # 上述候选里最终真正切出多个语义节点的数量。
+        # Number of those candidates that actually split into multiple semantic nodes.
         self.sem_stats_multi_sense = 0
 
     # Build semantic nodes from buffered token embeddings.
     def build_sem_node(self, token_node):
         self.sem_stats_passed_occurrence += 1
         if getattr(token_node, "force_single_semantic", False):
-            # 被判为 entity / 原子短语:默认单义,不参与 S_mean / 多义统计。
+            # Entity / atomic phrase: single-sense by default and excluded from
+            # S_mean / polysemy statistics.
             self.sem_stats_entity_single += 1
             self.create_basic_sem_node(token_node)
         elif token_node.node_type == "token" and not self.semantic_type_cls(token_node):
-            # s_mean 过高 → 各次出现语义一致 → 被筛成单义。
+            # s_mean is too high -> occurrences are semantically consistent ->
+            # filter into a single-sense node.
             self.sem_stats_smean_filtered += 1
             self.create_basic_sem_node(token_node)
         else:
-            # 通过 s_mean(或非 token 的短语),进入描述驱动的多义切分路径。
+            # Passed s_mean (or is a non-token phrase), so enter the
+            # description-driven multi-sense split path.
             self.sem_stats_smean_passed += 1
             sem_count_before = len(token_node.sem_node_list)
             self._build_sem_node_from_cluster(token_node, list(token_node.embeds_buffer))
@@ -1603,22 +1645,23 @@ class LiteSemRAG:
         smean_filtered = getattr(self, "sem_stats_smean_filtered", 0)
         smean_passed = getattr(self, "sem_stats_smean_passed", 0)
         multi_sense = getattr(self, "sem_stats_multi_sense", 0)
-        # 参与 S_mean 判定的总数(已剔除 entity / 原子短语)。
+        # Total count participating in S_mean judgment, after excluding
+        # entities / atomic phrases.
         smean_candidates = smean_filtered + smean_passed
         min_occ = getattr(self, "min_occurrences_for_description", None)
         print("=" * 60)
         print(f"sem-build funnel (min_occurrences_for_description={min_occ}):")
         print(
-            f"  1. 通过出现次数闸门进入完整建节点路径: {passed} "
-            f"(其中 entity/原子短语默认单义: {entity})"
+            f"  1. Passed the occurrence gate into the full node-building path: {passed} "
+            f"(of which entity/atomic phrase items defaulted to single-sense: {entity})"
         )
         print(
-            f"  2. 参与 S_mean 判定(非 entity): {smean_candidates} "
-            f"-> 因 S_mean 过高被筛为单义: {smean_filtered}"
+            f"  2. Participated in S_mean judgment (non-entity): {smean_candidates} "
+            f"-> filtered to single-sense due to high S_mean: {smean_filtered}"
         )
         print(
-            f"  3. 通过 S_mean 进入消歧路径: {smean_passed} "
-            f"-> 最终切出多个语义: {multi_sense}"
+            f"  3. Entered the disambiguation path after S_mean: {smean_passed} "
+            f"-> ultimately split into multiple senses: {multi_sense}"
         )
         print("=" * 60)
 
@@ -1739,15 +1782,22 @@ class LiteSemRAG:
 
     # Decide whether a token node should be split into multiple semantic clusters.
     def semantic_type_cls(self, token_node):
-        # 是否对该 token 做多义切分,仅由 embedding 的集中度决定:
-        # s_mean 高 → 各次出现语义一致 → 单义节点(返回 False);
-        # s_mean 低 → 语义分散 → 走切分路径(返回 True)。
-        # 注:此前还有一个基于 df 的"太常见就不切分"闸门,但 df 在索引期
-        # 恒为 0(只在 finalize 的 assign_idf 里赋值),该分支从未生效;且即便
-        # 生效,它会把"高频多义词"(如 bank)误判为单义,与目标相悖,故已移除。
+        # Whether this token should be split into multiple senses is determined
+        # only by embedding concentration:
+        # high s_mean -> semantically consistent occurrences -> single-sense node
+        # (return False);
+        # low s_mean -> semantically dispersed -> enter the split path
+        # (return True).
+        # Note: there used to be a DF-based "too common to split" gate, but DF
+        # is always 0 during indexing (it is only assigned in finalize's
+        # assign_idf), so that branch never actually ran. Even if it had, it
+        # would misclassify frequent polysemous words like "bank" as
+        # single-sense, which conflicts with the goal, so it was removed.
         s_mean = get_s_mean([i.embed for i in token_node.embeds_buffer])
-        # 持久化到 token_node,供 finalize 之后的统计/检视使用(embeds_buffer 随后被清空,
-        # 原始全量出现序列不再保留,只能在此刻把这个值存下来)。
+        # Persist to token_node for post-finalize statistics/inspection. The
+        # embeds_buffer is cleared immediately afterward, and the original full
+        # occurrence sequence is no longer retained, so this value has to be
+        # stored at this moment.
         token_node.s_mean = float(s_mean)
         return not (s_mean > self.tau_conc)
 
@@ -1777,6 +1827,10 @@ class LiteSemRAG:
             del self.index_session_sample_count
         if not hasattr(self, "fast_index"):
             self.fast_index = False
+        # 旧 pickle 没有 _finalized 字段:按约定能被保存的实例都已 finalize 过
+        # (见 LiteSemRAG.md §12),故默认 True,避免加载后误触发重复 finalize 重建。
+        if not hasattr(self, "_finalized"):
+            self._finalized = True
         if not hasattr(self, "llm_semantic_labeler_batch_size"):
             self.llm_semantic_labeler_batch_size = 10
         if not hasattr(self, "llm_anchor_sample_assignment_count"):
@@ -1911,7 +1965,8 @@ class LiteSemRAG:
             for key, value in ANCHOR_PROP_DEFAULTS.items():
                 self.anchor_prop_params.setdefault(key, value)
         if not hasattr(self, "sem_assignment_method"):
-            # 旧 pickle 没有该字段:保持其历史行为(FFT 路径),不强行切到 anchor。
+            # Older pickles do not have this field; keep the historical FFT
+            # behavior instead of forcing a switch to anchor propagation.
             self._set_sem_assignment_method("FFT-CE")
         elif not hasattr(self, "_anchor_method_spec"):
             self._set_sem_assignment_method(self.sem_assignment_method)
@@ -2051,13 +2106,16 @@ class LiteSemRAG:
             token_node.compositional_modifier_texts_norm = []
         if not hasattr(token_node, "headed_phrase_records"):
             token_node.headed_phrase_records = {}
-        # schema 6:finalize 时持久化的 embedding 集中度;旧 pickle 没有,记为 None。
+        # Schema 6: embedding concentration persisted during finalize; older
+        # pickles do not have it, so default to None.
         if not hasattr(token_node, "s_mean"):
             token_node.s_mean = None
-        # schema 8:Anchor LLM 样本语义分配记录;旧 pickle 没有,记为空列表。
+        # Schema 8: semantic assignment records for Anchor LLM samples; older
+        # pickles do not have it, so default to an empty list.
         if not hasattr(token_node, "llm_anchor_sample_assignments"):
             token_node.llm_anchor_sample_assignments = []
-        # 索引期 anomaly 机制已移除:丢弃旧 pickle 残留的 anomaly_section 属性。
+        # The indexing-time anomaly mechanism was removed; drop any residual
+        # anomaly_section attribute from older pickles.
         if hasattr(token_node, "anomaly_section"):
             del token_node.anomaly_section
 
@@ -2065,7 +2123,8 @@ class LiteSemRAG:
     def _ensure_sem_node_backward_compatible_attrs(self, sem_node):
         if not hasattr(sem_node, "sem_node_id") and hasattr(sem_node, "proto_node_id"):
             sem_node.sem_node_id = sem_node.proto_node_id
-        # anomaly 阈值路由已移除:丢弃旧 pickle 残留的 anomaly_threshold 属性。
+        # Anomaly-threshold routing was removed; drop any residual
+        # anomaly_threshold attribute from older pickles.
         if hasattr(sem_node, "anomaly_threshold"):
             del sem_node.anomaly_threshold
         if not hasattr(sem_node, "span_occurrences"):
@@ -2621,9 +2680,10 @@ class LiteSemRAG:
                 ),
             )
             if token_embed is None:
-                # 该 span 没有对齐到任何 tokenizer token(通常是查询超过编码器
-                # max_length 被截断)。继续算下去会得到 NaN embedding 并污染所有
-                # 相似度比较,直接跳过这个查询单元。
+                # This span did not align to any tokenizer token, usually
+                # because the query was truncated by the encoder's max_length.
+                # Continuing would produce a NaN embedding and contaminate all
+                # similarity comparisons, so skip this query unit directly.
                 print(
                     f"[query] span '{query_unit['embedding_span_text']}' has no "
                     "encoder token alignment (truncated?); skipping this query unit."
@@ -3044,7 +3104,7 @@ class LiteSemRAG:
         top_k_pair_boosts=COOCCUR_TOP_K_PAIR_BOOSTS,
         lambda_boost=COOCCUR_LAMBDA,
         candidate_pool_size=COOCCUR_CANDIDATE_POOL_SIZE,
-        print_important_tokens=True,
+        print_important_tokens=False,
         search_mode='broad',
         idf_prune_tau=None,
         idf_prune_min_max_idf=None,
@@ -3321,7 +3381,7 @@ class LiteSemRAG:
         return bool(sentences_a & sentences_b)
 
     # Retrieve chunks using exact, fuzzy, and semantic matches organized by match level.
-    def multi_level_query(self, query_text, top_k_chunk=10, top_k_each_isolated_chunk=2, isolate_chunk_ratio=0.2, isolate_retrieve_mode='sequential',print_important_tokens=True, search_mode='broad'):
+    def multi_level_query(self, query_text, top_k_chunk=10, top_k_each_isolated_chunk=2, isolate_chunk_ratio=0.2, isolate_retrieve_mode='sequential',print_important_tokens=False, search_mode='broad'):
         query_text, query_tokens, resolved_matches = self._resolve_query_matches(
             query_text,
             search_mode=search_mode,
@@ -3334,7 +3394,9 @@ class LiteSemRAG:
 
         co_occurrence_graph = CoOccurrenceGraph(low_level_sems + high_level_sems)
         co_occurrence_graph.build_edges()
-        co_occurrence_graph.assign_chunk_weight(self.chunk_avg_len,print_important_tokens)
+        # 与 print_important_tokens 解耦:assign_chunk_weight 的 debug 输出是
+        # weight_map / token_weight_map 全字典,过于冗长,不应被默认查询触发。
+        co_occurrence_graph.assign_chunk_weight()
         co_occurrence_graph.rank_sem_node()
         co_occurrence_graph.rank_chunk_by_BM25()
 
@@ -3422,27 +3484,22 @@ class LiteSemRAG:
         nodes by description, assign IDF, compute BM25, then rebuild query and chunk
         indexes from the final semantic-node set.
         """
+        # 重复 finalize 守卫:finalize() 每个索引会话只能跑一次。再次调用(无论中途
+        # 是否又索引了新文档)都会重跑 finalize_token_nodes(),而它会跳过已 has_semantic
+        # 的 token —— 这些 token 上第二轮新积累的 embeds_buffer 永远不会被处理,新 chunk
+        # 不会挂到 sem node 上,检索静默丢证据、索引损坏却不报错。与其静默出错,不如在此
+        # 显式失败。需要增量更新请用 delete_by_document();需要重建请在全新实例上重新
+        # 索引全量语料。该标志在成功跑完 finalize 后才置位,故中途异常仍可重试。
+        if getattr(self, "_finalized", False):
+            raise RuntimeError(
+                "finalize() has already been called on this instance and must run "
+                "exactly once. Re-index the full corpus on a fresh LiteSemRAG instance "
+                "(or use delete_by_document() to update) instead of finalizing twice."
+            )
         self._reset_sem_description_logs()
         self.log_time("Finalize started.")
         if not self.chunk_nodes:
             raise ValueError("Cannot finalize an empty graph: no chunk nodes have been indexed.")
-        # 守卫:不支持 "finalize 后增量索引再 finalize"。finalize_token_nodes() 会跳过
-        # has_semantic 的 token,第二轮索引在这些 token 上积累的 embeds_buffer 永远不会
-        # 被处理(新 chunk 不会挂到 sem node 上,检索静默丢证据)。与其静默出错,不如
-        # 在这里显式失败;需要增量请删除旧文档后重建,或在新实例上重新索引全量语料。
-        stale_buffer_tokens = [
-            token_node.token_text
-            for token_node in self.token_nodes
-            if token_node.has_semantic and token_node.embeds_buffer
-        ]
-        if stale_buffer_tokens:
-            preview = ", ".join(stale_buffer_tokens[:5])
-            raise ValueError(
-                "finalize() does not support incremental indexing: "
-                f"{len(stale_buffer_tokens)} already-finalized token(s) have new buffered "
-                f"embeddings that would be silently dropped (e.g. {preview}). "
-                "Re-index the full corpus on a fresh instance instead."
-            )
         self._recompute_chunk_avg_len()
         self.log_time("Computed average chunk length.")
         removed_placeholder_count = self._cleanup_empty_placeholder_token_nodes()
@@ -3471,6 +3528,8 @@ class LiteSemRAG:
         log_path = self._save_sem_description_logs_to_timestamped_file()
         self.log_time(f"Saved sem description logs to {log_path}.")
         self.log_time("Finalizing completed.")
+        # 全部步骤成功完成后才置位:此后再调 finalize() 会被开头的守卫拦截。
+        self._finalized = True
         self._print_index_session_timing()
 
     # Persist sem description logs to a timestamped file under <project_root>/logs/.
@@ -3484,10 +3543,13 @@ class LiteSemRAG:
 
     # Build semantic nodes for every token node from its fully accumulated embeddings.
     #
-    # 索引期只累积 embedding,从不建语义节点;此处每个 token 的 buffer 里就是它的
-    # 全部出现次数。分两趟处理:先建潜在多义节点(出现次数 >= 阈值,走完整的
-    # build_sem_node:描述预测 / 多义切分,通常是最耗时的一段),再建剩余的廉价
-    # 基础节点(create_basic_sem_node:单节点、无描述)。
+    # Indexing only accumulates embeddings and never builds semantic nodes; at
+    # this stage, each token's buffer therefore contains all of its
+    # occurrences. Processing happens in two passes: first build the potential
+    # polysemous nodes (occurrence count >= threshold, taking the full
+    # build_sem_node path with description prediction / multi-sense splitting,
+    # usually the most expensive stage), then build the remaining cheap basic
+    # nodes (create_basic_sem_node: single node, no description).
     def finalize_token_nodes(self):
         if not self.token_nodes:
             return
@@ -3503,7 +3565,8 @@ class LiteSemRAG:
         # Pass 0: split nodes into the expensive multi-sense candidates and the
         # cheap description-less remainder. A node is a multi-sense candidate when
         # its accumulated occurrence count reaches min_occurrences_for_description.
-        # fast index 模式下永远不产生多义候选:所有 token/phrase 一律建单义 basic 节点。
+        # Fast-index mode never creates polysemy candidates: every token/phrase
+        # becomes a single-sense basic node.
         multi_sense_candidates = []
         basic_only = []
         for token_node in self.token_nodes:
@@ -4993,21 +5056,25 @@ class LiteSemRAG:
         return new_sem_nodes
 
     # ------------------------------------------------------------------
-    # Anchor-传播 语义分配(C/D/E/F 及其 plain/mutual + ce_fallback/re_llm 变体)
-    # 移植自 jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb 的
-    # run_anchor_propagation:少量 anchor 经 LLM 候选合并标注,在 (mutual-)kNN 图上
-    # 传播,CE 作"反对票"。anchor 标签复用现有 use_llm_candidate_filter 的合并路径;
-    # 无 LLM 时退化为 cross-encoder top-1。
+    # Anchor-propagation semantic assignment (C/D/E/F and their
+    # plain/mutual + ce_fallback/re_llm variants), ported from
+    # jupyter_notebooks/hotpotqa_anchor_propagation_compare.ipynb.
+    # A small anchor subset is labeled through LLM candidate merging and then
+    # propagated over a (mutual-)kNN graph, with the CE model acting as an
+    # "opposition vote". Anchor labels reuse the existing
+    # use_llm_candidate_filter merge path; without LLM support this degrades to
+    # cross-encoder top-1.
     # ------------------------------------------------------------------
 
-    # 把一个 text-embedding 的向量转成 1-D float32 numpy。
+    # Convert one text-embedding vector into a 1-D float32 numpy array.
     def _te_embed_to_numpy(self, text_embedding):
         embed = text_embedding.embed
         if isinstance(embed, torch.Tensor):
             return embed.detach().to(torch.float32).cpu().numpy()
         return np.asarray(embed, dtype=np.float32)
 
-    # 采样 anchor 位置:fft_ratio 用 FFT 覆盖边界/稀有点,其余 random。
+    # Sample anchor positions: fft_ratio uses FFT to cover boundary / rare
+    # points, and the rest are random.
     def _sample_anchor_positions(self, embeddings):
         n_records = len(embeddings)
         if n_records == 0:
@@ -5019,8 +5086,10 @@ class LiteSemRAG:
         random_state = int(self._anchor_param("anchor_random_state"))
 
         n_anchor = max(min_count, int(round(fraction * n_records)))
-        # 封顶:高频词的 occurrence 很多,fraction 会让 anchor 线性膨胀,导致一次性塞给
-        # LLM 判定的样本过多(准确率下降 + 成本上升)。用 anchor_max_count 截断。
+        # Cap the anchor count: high-frequency terms can have many occurrences,
+        # and using fraction alone would make anchors grow linearly, sending too
+        # many samples to a single LLM judgment pass and hurting both accuracy
+        # and cost. anchor_max_count truncates that growth.
         n_anchor = min(n_anchor, n_records, max_count)
         n_fft = min(n_anchor, int(round(fft_ratio * n_anchor)))
         n_rand = n_anchor - n_fft
@@ -5044,7 +5113,8 @@ class LiteSemRAG:
             ]
         return sorted(fft_set | set(rand_positions))
 
-    # 为给定 occurrence 构造描述 prompt(主 prompt 失败时退化 fallback)。
+    # Build a description prompt for a given occurrence; fall back if the main
+    # prompt builder fails.
     def _build_occurrence_prompt_info(self, token_text, span_occurrence):
         chunk_node = span_occurrence.chunk_node
         prompt_info = self._build_sem_node_description_prompt(
@@ -5158,7 +5228,8 @@ class LiteSemRAG:
         )
         return record
 
-    # 标注 anchor 子集 + 取候选库。返回 (candidate_bank, {pos: description})。
+    # Label the anchor subset and retrieve the candidate bank.
+    # Returns (candidate_bank, {pos: description}).
     def _label_anchor_positions(self, sem_node, records, anchor_positions):
         token_text = sem_node.token_node.token_text
         prepared = []
@@ -5173,8 +5244,10 @@ class LiteSemRAG:
 
         anchor_labels = {}
         if getattr(self, "use_llm_candidate_filter", False):
-            # anchor 即送入"候选合并 + 逐样本判定"的单次 LLM 调用(与
-            # wikidata_llm_candidate_merge_experiment 对齐),返回每个 anchor 的描述。
+            # Send anchors into a single LLM call that performs "candidate merge
+            # + per-sample judgment" (aligned with
+            # wikidata_llm_candidate_merge_experiment), and return one
+            # description per anchor.
             fft_samples = []
             for sample_index, pos, span_occurrence, prompt_info in prepared:
                 chunk_node = span_occurrence.chunk_node
@@ -5261,8 +5334,9 @@ class LiteSemRAG:
                     anchor_labels[pos] = top_candidate["description"]
         return candidate_bank, anchor_labels
 
-    # 用 cross-encoder 对所有 occurrence 全量打分,返回按 pos 索引的
-    # (ce_top1, ce_scores, ce_margin)。CE 模型缺失时返回空 dict。
+    # Run the cross-encoder over all occurrences and return
+    # (ce_top1, ce_scores, ce_margin) indexed by position.
+    # If the CE model is unavailable, return empty dicts.
     def _full_cross_encoder_over_records(self, token_text, records, candidate_bank):
         model = self.sem_description_model
         if model is None or not candidate_bank:
@@ -5302,7 +5376,7 @@ class LiteSemRAG:
             )
         return ce_top1, ce_scores, ce_margin
 
-    # 构造 (mutual-)kNN 邻接表(list[set])。
+    # Build a (mutual-)kNN adjacency list (list[set]).
     def _build_anchor_knn_adjacency(self, embeddings, knn_k, knn_type):
         n = len(embeddings)
         normalized = _l2_normalize_rows(embeddings.astype(np.float32))
@@ -5326,7 +5400,8 @@ class LiteSemRAG:
                     adjacency[j].add(i)
         return adjacency
 
-    # 在 (mutual-)kNN 图上从 anchor 逐圈外扩传播。返回 labels/provenance/uncertain。
+    # Propagate outward from anchors layer by layer on the (mutual-)kNN graph.
+    # Returns labels/provenance/uncertain.
     def _run_anchor_propagation_core(
         self, records, embeddings, anchor_labels, ce_top1, ce_scores, ce_margin, spec
     ):
@@ -5446,7 +5521,8 @@ class LiteSemRAG:
             "rare_classes": rare_classes,
         }
 
-    # re_llm 收尾:对仍 uncertain 的 occurrence 真实再调一次 LLM 逐条判定。
+    # re_llm cleanup: for still-uncertain occurrences, make another real LLM
+    # call and judge them one by one.
     def _relabel_uncertain_with_llm(self, token_text, pos_te_pairs, candidate_bank):
         prepared = []
         for pos, text_embedding in pos_te_pairs:
@@ -5468,7 +5544,8 @@ class LiteSemRAG:
                 relabeled[pos] = top_candidate["description"]
         return relabeled
 
-    # Anchor 传播主入口:替换 _assign_sem_description_on_build 的 consensus/d1d2 路径。
+    # Main entry point for Anchor propagation; replaces the
+    # _assign_sem_description_on_build consensus/d1d2 path.
     def _assign_sem_description_anchor_propagation(self, sem_node, cluster_text_embeddings):
         token_node = sem_node.token_node
         token_text = token_node.token_text
@@ -5476,7 +5553,8 @@ class LiteSemRAG:
         records = list(cluster_text_embeddings)
         n = len(records)
 
-        # 没有任何描述模型/标注器:回退单义节点(与既有 no_model 路径一致)。
+        # No description model / labeler is available: fall back to a
+        # single-sense node, matching the existing no_model path.
         if (
             self.sem_description_model is None
             and not getattr(self, "use_llm_semantic_labeler", False)
@@ -5495,7 +5573,7 @@ class LiteSemRAG:
             sem_node, records, anchor_positions
         )
         if not candidate_bank or not anchor_labels:
-            # 无法消歧:保留为单义节点。
+            # Could not disambiguate, so keep a single-sense node.
             sem_node.chunk_node_embed.clear()
             return [sem_node]
 
@@ -5514,7 +5592,7 @@ class LiteSemRAG:
         provenance = prop["provenance"]
         uncertain_positions = prop["uncertain_positions"]
 
-        # uncertain 收尾。
+        # Cleanup for uncertain items.
         if spec["uncertain_mode"] == "ce_fallback":
             for pos in uncertain_positions:
                 fallback = ce_top1.get(pos)
@@ -5531,7 +5609,9 @@ class LiteSemRAG:
                 labels[pos] = description
                 provenance[pos] = "uncertain_re_llm"
 
-        # 仍未标记(LLM/CE 兜底失败)的 occurrence -> 取已标记里的全局多数,确保可分组。
+        # For occurrences still unlabeled after LLM/CE fallback failure, take
+        # the global majority label among already-labeled items so grouping can
+        # always proceed.
         if len(labels) < n:
             if not labels:
                 sem_node.chunk_node_embed.clear()
@@ -5561,13 +5641,14 @@ class LiteSemRAG:
             provenance_counts=dict(Counter(provenance.values())),
         )
 
-        # 单义:直接给原节点写描述。
+        # Single-sense: write the description directly onto the original node.
         if len(final_groups) <= 1:
             sem_node.description = next(iter(final_groups))
             sem_node.chunk_node_embed.clear()
             return [sem_node]
 
-        # 多义:用各 description 子集替换原节点(与 split 路径一致)。
+        # Multi-sense: replace the original node with one node per description
+        # subset, matching the existing split path.
         self.deleted_merged_sem_logs.append(
             {
                 "deleted_sem_node_id": sem_node.sem_node_id,
@@ -6371,9 +6452,11 @@ class LiteSemRAG:
 
     # Build an inverted index from words to phrase token nodes.
     def build_phrase_query(self):
-        # 必须先重置:postings 存的是 phrase_token_nodes 的列表下标,而 finalize 前置的
-        # placeholder 清理会过滤/重排该列表;不重置的话,重复 finalize 会留下指向错误
-        # 短语的陈旧下标(rebuild_metadata_after_deletion 此前就显式重置过)。
+        # Must reset first: postings store list indices into phrase_token_nodes,
+        # and the placeholder cleanup that runs before finalize can filter /
+        # reorder that list. Without resetting, repeated finalize calls would
+        # leave stale indices pointing at the wrong phrases
+        # (rebuild_metadata_after_deletion already reset this explicitly).
         self.phrase_index = defaultdict(set)
         for i, token_node in enumerate(self.phrase_token_nodes):
             words = token_node.token_text.split()
@@ -6426,8 +6509,10 @@ class LiteSemRAG:
                 sem_node_map.append(sem_node)
 
         if len(all_embeds) == 0:
-            # 必须与正常路径同型(list):调用方用真值/len 判断 fuzzy 命中,
-            # 返回二元组会被误判为"有命中"并在下游解包时崩溃。
+            # Must match the normal-path return type (list): callers use
+            # truthiness/len to judge fuzzy hits, and returning a tuple here
+            # would be misread as "has hit" and then crash during unpacking
+            # downstream.
             return []
 
         matrix = torch.stack(all_embeds).to(self.device)
@@ -6587,6 +6672,10 @@ class LiteSemRAG:
 
         total_chunks = len(chunk_records)
         doc_node_map = {}
+        # 统计被编码器 max_length 截断而丢弃的 span 数:get_token_embeds() 对没有
+        # tokenizer 对齐(token_idxs 为空)的 span 静默跳过,这里按输入/输出 span 数差
+        # 累计,索引结束时汇报,避免长 chunk 末尾的 span 无声丢失而无从察觉。
+        dropped_span_count = 0
 
         preprocess_queue = queue.Queue(maxsize=queue_size)
         result_queue = queue.Queue(maxsize=queue_size)
@@ -6844,6 +6933,11 @@ class LiteSemRAG:
                         phrases,
                         tokens
                     )
+                    # 输入 span 数(routed phrases + tokens)与产出 embedding 数之差,
+                    # 就是被截断丢弃的 span 数(get_token_embeds 仅在无 token 对齐时跳过)。
+                    dropped_span_count += (len(phrases) + len(tokens)) - (
+                        len(phrase_embs) + len(token_embs)
+                    )
 
                     self.process_embeds(node, phrase_embs, token_embs)
                     inc_cpu_done(1)
@@ -6861,6 +6955,16 @@ class LiteSemRAG:
             stage_name, error_text = worker_errors[0]
             raise RuntimeError(
                 f"Error in {stage_name}:\n{error_text}"
+            )
+
+        # 截断丢弃汇报:span 因落在编码器 max_length 截断之外而被静默丢弃时给出可见提示。
+        # chunk_size 是 spaCy token 数,而编码按 subword 截断(通常 1.5~2x),长 chunk 末尾
+        # 的 span 可能取不到 embedding。非零即提示调小 chunk_size 或检查超长 chunk。
+        if dropped_span_count > 0:
+            print(
+                f"[index] {dropped_span_count} span(s) had no encoder token alignment "
+                "and were dropped (likely beyond the encoder max_length truncation); "
+                "consider lowering chunk_size if this is high."
             )
 
         # Indexing only accumulates embeddings on token nodes now; semantic
@@ -6985,10 +7089,14 @@ class LiteSemRAG:
 
     # Aggregate the persisted s_mean over all token nodes with >= min_sem_count sem nodes.
     def compute_multi_sem_smean_stats(self, min_sem_count=2):
-        # 统计口径:全图中拥有 >= min_sem_count 个 sem 节点的 token,不受显示截断影响。
-        # s_mean 在 finalize 的 semantic_type_cls 里持久化;走多义切分的 token 必然有值,
-        # 但 entity/原子短语(force_single)若因后续合并恰好有多个 sem,则 s_mean 为 None,
-        # 这类样本计入 token 总数但不计入平均,用 missing 计数单独反映。
+        # Statistics are computed over the full graph for tokens with
+        # >= min_sem_count sem nodes, independent of any display truncation.
+        # s_mean is persisted by semantic_type_cls during finalize, so tokens
+        # that went through multi-sense splitting must have a value. However, an
+        # entity / atomic phrase (force_single) can end up with multiple sem
+        # nodes after later merging while still having s_mean=None. Those cases
+        # count toward the token total but not the average, and are tracked
+        # separately through the missing count.
         total = 0
         smean_values = []
         for token_node in self.token_nodes:
@@ -7391,8 +7499,10 @@ class LiteSemRAG:
 
         return self._format_llm_anchor_sample_assignments_text(inspect_data)
 
-    # 列顺序:把 token 级元信息放前面,原文(matched_text/context_text/span_text)放后面,
-    # 既能当表格扫一眼,又完整保留上下文文本,避免在 notebook 里渲染海量嵌套 <details>。
+    # Column order: keep token-level metadata first and raw text
+    # (matched_text/context_text/span_text) later, so the table is easy to scan
+    # while still preserving full context text without rendering huge nested
+    # <details> blocks in notebooks.
     _LLM_ANCHOR_CSV_COLUMNS = [
         "token_text", "token_node_id", "sem_count", "s_mean",
         "source_sem_node_id", "sem_assignment_method", "source",
@@ -7405,8 +7515,10 @@ class LiteSemRAG:
         "matched_text", "context_text", "span_text",
     ]
 
-    # 把所有 LLM Anchor 样本分配记录展平成一行一条、含原文的表格写入本地文件(默认 CSV)。
-    # 返回写出的文件路径。token_contains/sort_by 仅用于可选过滤/排序,默认导出全部记录。
+    # Flatten all LLM Anchor sample assignment records into one row per record,
+    # including the raw text, and write them to a local file (CSV by default).
+    # Returns the output file path. token_contains/sort_by are only optional
+    # filtering/sorting helpers; by default all records are exported.
     def save_llm_anchor_sample_assignments_csv(
             self,
             output_path=None,
@@ -7616,8 +7728,9 @@ class LiteSemRAG:
             max_examples_per_token=max_examples_per_token,
         )
 
-        # 在全图(不受 token_contains / max_token_nodes 截断影响)上统计 >= min_sem_count
-        # 的 token 的 s_mean 平均值,作为汇总信息展示。
+        # Compute the average s_mean over the full graph for tokens with
+        # >= min_sem_count, independent of token_contains / max_token_nodes
+        # truncation, and show it as summary information.
         smean_stats = self.compute_multi_sem_smean_stats(min_sem_count=min_sem_count)
 
         if not inspect_data:
@@ -7937,6 +8050,50 @@ class LiteSemRAG:
                 for occurrence, chunk_node in occurrence_refs:
                     occurrence["chunk_node"] = chunk_node
 
+    # 序列化一个 retained TextEmbedding 的非张量元数据(embed 由调用方单独处理)。
+    # save_data_split 的张量包字典、清空时的占位 TextEmbedding、load_data_split 的重建
+    # 三处共用,确保字段一致——新增 TextEmbedding 字段(如 schema 7 的 sentence_id)只需在
+    # 这一对 helper 里登记,不会再像之前那样漏掉某一处导致往返丢字段。
+    @staticmethod
+    def _text_embedding_meta_dict(text_embedding):
+        return {
+            "chunk_node": text_embedding.chunk_node,
+            "span_start": text_embedding.span_start,
+            "span_end": text_embedding.span_end,
+            "span_text": text_embedding.span_text,
+            "surface_text": getattr(text_embedding, "surface_text", None),
+            "surface_start": getattr(text_embedding, "surface_start", None),
+            "surface_end": getattr(text_embedding, "surface_end", None),
+            "phrase_type": getattr(text_embedding, "phrase_type", None),
+            "modifier_text": getattr(text_embedding, "modifier_text", None),
+            "modifier_texts": list(getattr(text_embedding, "modifier_texts", []) or []),
+            "modifier_texts_norm": list(getattr(text_embedding, "modifier_texts_norm", []) or []),
+            "modifier_spans": list(getattr(text_embedding, "modifier_spans", []) or []),
+            "atomic_modifier_spans": list(getattr(text_embedding, "atomic_modifier_spans", []) or []),
+            "sentence_id": getattr(text_embedding, "sentence_id", None),
+        }
+
+    # 从 _text_embedding_meta_dict 的字段重建 TextEmbedding,embed 由调用方传入。
+    @staticmethod
+    def _text_embedding_from_meta_dict(item, embed):
+        return TextEmbedding(
+            embed=embed,
+            chunk_node=item["chunk_node"],
+            span_start=item.get("span_start"),
+            span_end=item.get("span_end"),
+            span_text=item.get("span_text"),
+            surface_text=item.get("surface_text"),
+            surface_start=item.get("surface_start"),
+            surface_end=item.get("surface_end"),
+            phrase_type=item.get("phrase_type"),
+            modifier_text=item.get("modifier_text"),
+            modifier_texts=list(item.get("modifier_texts", []) or []),
+            modifier_texts_norm=list(item.get("modifier_texts_norm", []) or []),
+            modifier_spans=list(item.get("modifier_spans", []) or []),
+            atomic_modifier_spans=list(item.get("atomic_modifier_spans", []) or []),
+            sentence_id=item.get("sentence_id"),
+        )
+
     # Save graph structure and tensors into separate files.
     def save_data_split(self, pkl_path: str):
         pt_path = pkl_path.replace(".pkl", "_tensors.pt")
@@ -7968,19 +8125,7 @@ class LiteSemRAG:
                                 text_embedding.embed.detach().cpu()
                                 if text_embedding.embed is not None else None
                             ),
-                            "chunk_node": text_embedding.chunk_node,
-                            "span_start": text_embedding.span_start,
-                            "span_end": text_embedding.span_end,
-                            "span_text": text_embedding.span_text,
-                            "surface_text": getattr(text_embedding, "surface_text", None),
-                            "surface_start": getattr(text_embedding, "surface_start", None),
-                            "surface_end": getattr(text_embedding, "surface_end", None),
-                            "phrase_type": getattr(text_embedding, "phrase_type", None),
-                            "modifier_text": getattr(text_embedding, "modifier_text", None),
-                            "modifier_texts": list(getattr(text_embedding, "modifier_texts", []) or []),
-                            "modifier_texts_norm": list(getattr(text_embedding, "modifier_texts_norm", []) or []),
-                            "modifier_spans": list(getattr(text_embedding, "modifier_spans", []) or []),
-                            "atomic_modifier_spans": list(getattr(text_embedding, "atomic_modifier_spans", []) or []),
+                            **self._text_embedding_meta_dict(text_embedding),
                         }
                         for text_embedding in getattr(p, "retained_text_embeddings", [])
                     ]
@@ -7997,21 +8142,9 @@ class LiteSemRAG:
             for p in self.sem_nodes:
                 p.embed = None
                 p.retained_text_embeddings = [
-                    TextEmbedding(
-                        embed=None,
-                        chunk_node=text_embedding.chunk_node,
-                        span_start=text_embedding.span_start,
-                        span_end=text_embedding.span_end,
-                        span_text=text_embedding.span_text,
-                        surface_text=getattr(text_embedding, "surface_text", None),
-                        surface_start=getattr(text_embedding, "surface_start", None),
-                        surface_end=getattr(text_embedding, "surface_end", None),
-                        phrase_type=getattr(text_embedding, "phrase_type", None),
-                        modifier_text=getattr(text_embedding, "modifier_text", None),
-                        modifier_texts=list(getattr(text_embedding, "modifier_texts", []) or []),
-                        modifier_texts_norm=list(getattr(text_embedding, "modifier_texts_norm", []) or []),
-                        modifier_spans=list(getattr(text_embedding, "modifier_spans", []) or []),
-                        atomic_modifier_spans=list(getattr(text_embedding, "atomic_modifier_spans", []) or []),
+                    self._text_embedding_from_meta_dict(
+                        self._text_embedding_meta_dict(text_embedding),
+                        None,
                     )
                     for text_embedding in getattr(p, "retained_text_embeddings", [])
                 ]
@@ -8077,24 +8210,9 @@ class LiteSemRAG:
             p.embed = embed.to("cpu") if embed is not None else None
             retained_pack = sem_retained_text_embeddings[i] if i < len(sem_retained_text_embeddings) else []
             p.retained_text_embeddings = [
-                TextEmbedding(
-                    embed=(
-                        item["embed"].to("cpu")
-                        if item.get("embed") is not None else None
-                    ),
-                    chunk_node=item["chunk_node"],
-                    span_start=item.get("span_start"),
-                    span_end=item.get("span_end"),
-                    span_text=item.get("span_text"),
-                    surface_text=item.get("surface_text"),
-                    surface_start=item.get("surface_start"),
-                    surface_end=item.get("surface_end"),
-                    phrase_type=item.get("phrase_type"),
-                    modifier_text=item.get("modifier_text"),
-                    modifier_texts=list(item.get("modifier_texts", []) or []),
-                    modifier_texts_norm=list(item.get("modifier_texts_norm", []) or []),
-                    modifier_spans=list(item.get("modifier_spans", []) or []),
-                    atomic_modifier_spans=list(item.get("atomic_modifier_spans", []) or []),
+                obj._text_embedding_from_meta_dict(
+                    item,
+                    item["embed"].to("cpu") if item.get("embed") is not None else None,
                 )
                 for item in retained_pack
             ]

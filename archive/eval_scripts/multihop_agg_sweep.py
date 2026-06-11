@@ -1,7 +1,9 @@
-"""聚合权重小扫描:在保住 bridge full_hit 的同时尽量收回 MRR。
+"""Small aggregation-weight sweep to recover MRR while preserving bridge
+full_hit as much as possible.
 
-加载 db 一次,跑 baseline + 若干 multihop 聚合配置,打印 all/bridge/comparison 的
-full_hit / recall@10_pq / mrr@10。
+Load the DB once, run the baseline plus several multihop aggregation
+configurations, and print full_hit / recall@10_pq / mrr@10 for all / bridge /
+comparison.
 """
 from __future__ import annotations
 import os
@@ -17,9 +19,9 @@ PKL = "cache/hotpotqa_latest_framework_index/litesemrag_hotpotqa_500_fastidx.pkl
 
 # (name, hop1_w, hop2_w, min_chain_bonus_score)
 CONFIGS = [
-    ("h1=1.0,h2=1.0,min=0.0", 1.0, 1.0, 0.0),   # 原始(全 re-sort)
-    ("h1=0.5,h2=1.0,min=0.0", 0.5, 1.0, 0.0),   # 弱 hop1
-    ("h1=0.5,h2=1.0,min=0.1", 0.5, 1.0, 0.1),   # 弱 hop1 + 门槛
+    ("h1=1.0,h2=1.0,min=0.0", 1.0, 1.0, 0.0),   # original (full re-sort)
+    ("h1=0.5,h2=1.0,min=0.0", 0.5, 1.0, 0.0),   # weaker hop1 weight
+    ("h1=0.5,h2=1.0,min=0.1", 0.5, 1.0, 0.1),   # weaker hop1 + threshold
     ("h1=0.3,h2=1.0,min=0.1", 0.3, 1.0, 0.1),
     ("h1=0.5,h2=1.0,min=0.2", 0.5, 1.0, 0.2),
 ]

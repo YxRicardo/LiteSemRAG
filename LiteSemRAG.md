@@ -364,7 +364,9 @@ Current finalize order:
     under `logs/`.
 
 `finalize()` raises a `ValueError` for empty graphs or missing semantic-node
-embeddings.
+embeddings, and a `RuntimeError` if it has already been called on the instance
+(it must run exactly once; re-index the full corpus on a fresh instance instead
+of finalizing twice).
 
 ---
 
@@ -421,7 +423,7 @@ expand_compositional=False)`:
 
 `multi_level_query(query_text, top_k_chunk=10, top_k_each_isolated_chunk=2,
 isolate_chunk_ratio=0.2, isolate_retrieve_mode="sequential",
-print_important_tokens=True, search_mode="broad")` is the main graph retrieval
+print_important_tokens=False, search_mode="broad")` is the main graph retrieval
 method:
 
 1. Resolves exact, fuzzy, and similarity matches with compositional expansion.

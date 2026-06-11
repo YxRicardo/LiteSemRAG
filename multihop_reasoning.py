@@ -1,28 +1,35 @@
-"""多跳推理 —— 实现计划一:最小侵入的两阶段桥接检索。
+"""Multi-hop reasoning: Implementation Plan 1, a minimally invasive two-stage
+bridge retrieval pipeline.
 
-对应 multihop_reasoning_implementation_plan.md 的 "实现计划一 / Milestone 1"。
+This corresponds to "Implementation Plan 1 / Milestone 1" in
+multihop_reasoning_implementation_plan.md.
 
-不改索引结构、不改 pickle schema、不改 finalize / semantic node 构建逻辑,只在
-查询端复用现有能力实现 bridge 类多跳:
+It does not modify the index structure, pickle schema, or finalize / semantic
+node construction logic. It only reuses existing query-time capabilities to
+implement bridge-style multi-hop retrieval:
 
     query
-      -> 第一跳: chunk_cooccur_query() 召回 anchor chunk
-      -> 从第一跳 chunk 的 sem_node_list 抽取 bridge candidates(query 中未显式给出的高质量语义节点)
-      -> 第二跳: 用 bridge sem node 的 BM25 找证据 chunk,并用剩余 query 约束做 soft rerank
-      -> 生成 evidence chain,按 ChainScore 排序,聚合去重后返回 chunk
+      -> first hop: chunk_cooccur_query() recalls anchor chunks
+      -> extract bridge candidates from each first-hop chunk's sem_node_list
+         (high-quality semantic nodes not explicitly mentioned in the query)
+      -> second hop: use bridge sem-node BM25 to find evidence chunks, then do
+         a soft rerank with the remaining query constraints
+      -> generate evidence chains, rank by ChainScore, aggregate, deduplicate,
+         and return chunks
 
-ChainScore (计划 §4.6,全部因子归一到 (0,1],相乘):
+ChainScore (plan §4.6, all factors normalized to (0,1] and multiplied):
 
     ChainScore =
-        FirstHopScore        # 第一跳 chunk 的归一化 final_score
-      * BridgePrior          # bridge idf 归一 * 类型/标题系数
-      * LocalBridgeEvidence  # bridge 与 query 节点同句=1.0 / 同 chunk=0.6
-      * SecondHopScore       # bridge 在第二跳 chunk 的归一化 BM25
-      * ConstraintCoverage   # 第二跳对"剩余 query 约束/answer focus"的 soft 覆盖
-      * DiversityPenalty     # hop1==hop2 同 chunk 时降权,避免伪多跳
+        FirstHopScore        # normalized final_score of the first-hop chunk
+      * BridgePrior          # normalized bridge IDF * type/title coefficient
+      * LocalBridgeEvidence  # bridge appears in same sentence as query node=1.0 / same chunk=0.6
+      * SecondHopScore       # normalized BM25 of the bridge in the second-hop chunk
+      * ConstraintCoverage   # soft coverage of remaining query constraints / answer focus by the second hop
+      * DiversityPenalty     # downweight hop1==hop2 within the same chunk to avoid fake multi-hop
 
-入口在 LiteSemRAG.multihop_bridge_query() 里以薄 wrapper 委托到本模块,
-现有 chunk_cooccur_query() / SciFact / FEVER / HotpotQA 评测口径完全不受影响。
+LiteSemRAG.multihop_bridge_query() delegates here through a thin wrapper, so
+existing chunk_cooccur_query() / SciFact / FEVER / HotpotQA evaluation behavior
+remains unchanged.
 """
 from __future__ import annotations
 
@@ -31,59 +38,68 @@ from dataclasses import dataclass, field
 from text_processing import normalize_text
 
 
-# ----------------------------- 默认超参 -----------------------------
-# 第一跳召回的 anchor chunk 数。
+# ----------------------------- Default hyperparameters -----------------------------
+# Number of anchor chunks recalled in the first hop.
 DEFAULT_FIRST_HOP_K = 20
-# 总共保留的 bridge candidate 数(跨所有第一跳 chunk 的全局 fanout 上限)。
+# Total number of bridge candidates retained (global fanout cap across all
+# first-hop chunks).
 DEFAULT_BRIDGE_TOP_K = 8
-# 每个 bridge 第二跳取的 chunk 数。
+# Number of second-hop chunks taken per bridge.
 DEFAULT_SECOND_HOP_K = 20
-# 返回的 evidence chain 数。
+# Number of evidence chains returned.
 DEFAULT_TOP_K_CHAIN = 10
 
-# bridge candidate 过滤阈值。
-# idf 低于此值视为泛词,不做 bridge。
+# Bridge-candidate filtering thresholds.
+# IDF below this value is treated as overly generic and is not used as a bridge.
 DEFAULT_MIN_BRIDGE_IDF = 3.0
-# df 高于 (语料 chunk 数 * 此比例) 视为 hub,不做 bridge。
+# DF above (corpus chunk count * this ratio) is treated as a hub and is not
+# used as a bridge.
 DEFAULT_DF_HUB_RATIO = 0.10
-# 单 token bridge 的更严 idf 门槛(单字泛词噪声大)。
+# Stricter IDF threshold for single-token bridges, which are noisier.
 DEFAULT_MIN_SINGLE_TOKEN_IDF = 4.0
 
-# 局部证据等级(计划 §4.6)。
+# Local evidence levels (plan §4.6).
 LOCAL_EVIDENCE_SENTENCE = 1.0
 LOCAL_EVIDENCE_CHUNK = 0.6
-# hop1 == hop2 同 chunk 的伪多跳惩罚。
+# Penalty for fake multi-hop when hop1 == hop2 in the same chunk.
 DIVERSITY_PENALTY_SAME_CHUNK = 0.3
 
-# BridgePrior 类型系数。
-BRIDGE_COEF_PHRASE = 1.15          # 多词短语
-BRIDGE_COEF_FORCE_SINGLE = 1.10    # entity / 原子短语 (force_single_semantic)
-BRIDGE_COEF_HAS_DESC = 1.10        # 带 description 的语义节点
-BRIDGE_COEF_CAPITALIZED = 1.10     # 专名形态(首字母大写)
-BRIDGE_COEF_TITLE_MATCH = 1.30     # surface 与某文档标题一致(HotpotQA 第二跳 gold title 强信号)
+# BridgePrior type coefficients.
+BRIDGE_COEF_PHRASE = 1.15          # multi-word phrase
+BRIDGE_COEF_FORCE_SINGLE = 1.10    # entity / atomic phrase (force_single_semantic)
+BRIDGE_COEF_HAS_DESC = 1.10        # semantic node with a description
+BRIDGE_COEF_CAPITALIZED = 1.10     # proper-name surface form (initial capital)
+BRIDGE_COEF_TITLE_MATCH = 1.30     # surface matches a document title (strong HotpotQA second-hop gold-title signal)
 
-# 第二跳目标 = bridge 实体自己的同名页面时的强加权(HotpotQA bridge 的典型结构:
-# 第一跳文档提到桥接实体 B,第二个 gold 文档就是 B 自己的 wiki 页面)。
+# Strong upweighting when the second-hop target is the bridge entity's own
+# title-matching page, a common HotpotQA bridge pattern:
+# the first-hop document mentions bridge entity B, and the second gold document
+# is B's own wiki page.
 HOP2_TITLE_MATCH_BONUS = 1.80
 
-# ConstraintCoverage soft 下限与残余约束权重(避免硬过滤误杀正确二跳)。
+# ConstraintCoverage soft lower bound and residual-constraint span, to avoid
+# hard filtering out correct second hops.
 CONSTRAINT_COVERAGE_FLOOR = 0.30
 CONSTRAINT_COVERAGE_SPAN = 0.70
-# 没有残余约束(问题在第一跳已被完整覆盖)时给的中性覆盖值。
+# Neutral coverage value when no residual constraints remain.
 CONSTRAINT_COVERAGE_NO_RESIDUAL = 0.50
 
-# 最终 chunk 聚合(aggregate_chunk_ranking)默认权重:
-# 第二跳是 bridge 带来的新证据 -> 全权;第一跳已在第一跳列表里 -> 半权,避免打乱内部排序压低 MRR。
+# Default weights for final chunk aggregation (aggregate_chunk_ranking):
+# second-hop evidence is new bridge evidence and gets full weight; first-hop
+# evidence is already present in the first-hop list and only gets half weight,
+# to avoid hurting MRR by disturbing the internal ranking too much.
 AGG_HOP2_BONUS_WEIGHT = 1.0
 AGG_HOP1_BONUS_WEIGHT = 0.5
-# 只有 chain.score 达到此门槛才参与加成(过滤 comparison 等弱噪声 chain)。
-# 默认 0.2:HotpotQA 500 上 bridge full_hit/recall/mrr 三项全涨,comparison full_hit 零回退。
+# Only chains with score above this threshold contribute bonus weight, which
+# filters weak noisy chains such as comparison cases.
+# The default 0.2 improved bridge full_hit/recall/MRR on HotpotQA 500 with no
+# regression on comparison full_hit.
 AGG_MIN_CHAIN_BONUS_SCORE = 0.2
 
 
 @dataclass
 class BridgeCandidate:
-    """从第一跳 chunk 抽出的桥接语义节点候选。"""
+    """Bridge semantic-node candidate extracted from a first-hop chunk."""
 
     sem_node: object
     hop1_chunk_id: int
@@ -101,7 +117,7 @@ class BridgeCandidate:
 
 @dataclass
 class EvidenceChain:
-    """一条 query concept -> bridge -> answer evidence 的证据链。"""
+    """An evidence chain from query concept -> bridge -> answer evidence."""
 
     strategy: str
     score: float
@@ -139,18 +155,20 @@ class EvidenceChain:
         }
 
 
-# ----------------------------- 内部 helper -----------------------------
+# ----------------------------- Internal helpers -----------------------------
 def _doc_name(db, chunk_id):
     return db.chunk_nodes[chunk_id].doc_node.doc_name
 
 
 def _collect_query_context(db, resolved_matches):
-    """从 resolved query 里收集多跳要用的 query 上下文。
+    """Collect the query context needed for multi-hop from resolved matches.
 
-    返回:
-      query_sems        : 去重后的 query sem node 列表
-      query_sem_ids     : query sem node 的 sem_node_id 集合(bridge 排除用)
-      query_token_norms : query token / query sem token 的归一化集合(bridge 排除用)
+    Returns:
+      query_sems        : deduplicated list of query sem nodes
+      query_sem_ids     : set of sem_node_id values for query sem nodes
+                          (used to exclude bridge candidates)
+      query_token_norms : normalized set of query tokens / query-sem tokens
+                          (used to exclude bridge candidates)
     """
     low_level_sems, high_level_sems = db._collect_query_cooccurrence_sems(
         resolved_matches, False
@@ -172,7 +190,8 @@ def _collect_query_context(db, resolved_matches):
             query_token_norms.add(norm)
             query_token_norms.update(norm.split())
 
-    # raw query token 也加入排除集(包含没解析成 sem 的词)。
+    # Also add raw query tokens to the exclusion set, including words that were
+    # not resolved into sem nodes.
     for match in resolved_matches:
         norm = normalize_text(match.get("token", ""))
         if norm:
@@ -187,7 +206,8 @@ def _chunk_sem_id_set(chunk_node):
 
 
 def _surface_is_capitalized(sem_node, chunk_id):
-    """该 sem node 在指定 chunk 内是否以专名形态(首字母大写)出现。"""
+    """Whether this sem node appears in the given chunk as a proper-name form
+    with an initial capital."""
     for occ in getattr(sem_node, "span_occurrences", []) or []:
         cn = getattr(occ, "chunk_node", None)
         if cn is None or cn.chunk_node_id != chunk_id:
@@ -198,7 +218,7 @@ def _surface_is_capitalized(sem_node, chunk_id):
     return False
 
 
-# ----------------------------- bridge 抽取 -----------------------------
+# ----------------------------- Bridge extraction -----------------------------
 def extract_bridge_candidates_from_chunks(
     db,
     first_hop_chunk_ids,
@@ -215,17 +235,18 @@ def extract_bridge_candidates_from_chunks(
     require_same_sentence=False,
     bridge_top_k=DEFAULT_BRIDGE_TOP_K,
 ):
-    """从第一跳 chunk 的 sem_node_list 抽取并打分 bridge candidates(计划 §4.4 / §10.1)。"""
+    """Extract and score bridge candidates from first-hop chunk sem_node_list
+    entries (plan §4.4 / §10.1)."""
     n_chunks = max(len(db.chunk_nodes), 1)
     df_hub_threshold = df_hub_ratio * n_chunks
 
-    # query sems 按 hop1 chunk 分组,用于 LocalBridgeEvidence / 同句判定。
-    candidates = {}  # token_norm -> 最佳 BridgeCandidate(同一 bridge 词只保留最强一条)
+    # Group query sems by hop1 chunk for LocalBridgeEvidence / same-sentence checks.
+    candidates = {}  # token_norm -> best BridgeCandidate (keep only the strongest candidate per bridge term)
 
     for hop1_chunk_id in first_hop_chunk_ids:
         chunk_node = db.chunk_nodes[hop1_chunk_id]
         chunk_sem_ids = _chunk_sem_id_set(chunk_node)
-        # 该 chunk 内出现的 query sems(用于局部证据)。
+        # Query sems present in this chunk, used for local evidence.
         query_sems_in_chunk = [s for s in query_sems if s.sem_node_id in chunk_sem_ids]
 
         for sem_node in getattr(chunk_node, "sem_node_list", []) or []:
@@ -233,7 +254,7 @@ def extract_bridge_candidates_from_chunks(
             token_norm = normalize_text(token_node.token_text)
             if not token_norm:
                 continue
-            # 排除 query 已显式命中的节点 / query 词。
+            # Exclude nodes / tokens explicitly matched by the query.
             if sem_node.sem_node_id in query_sem_ids or token_norm in query_token_norms:
                 continue
 
@@ -245,7 +266,7 @@ def extract_bridge_candidates_from_chunks(
             is_capitalized = _surface_is_capitalized(sem_node, hop1_chunk_id)
             title_match = token_norm in title_norm_set
 
-            # ---- 泛词 / hub 过滤 ----
+            # ---- Generic-term / hub filtering ----
             if idf < min_bridge_idf and not (is_phrase or title_match):
                 continue
             if not is_phrase and idf < min_single_token_idf and not title_match:
@@ -293,7 +314,8 @@ def extract_bridge_candidates_from_chunks(
                 is_capitalized=is_capitalized,
                 title_match=title_match,
             )
-            # 同一 bridge 词跨多个 hop1 chunk 时,保留 prior*local 最强的一条。
+            # If the same bridge term appears across multiple hop1 chunks, keep
+            # the strongest candidate by prior*local.
             prev = candidates.get(token_norm)
             if prev is None or (cand.bridge_prior * cand.local_evidence) > (
                 prev.bridge_prior * prev.local_evidence
@@ -308,11 +330,11 @@ def extract_bridge_candidates_from_chunks(
     return ranked[:bridge_top_k]
 
 
-# ----------------------------- 第二跳检索 -----------------------------
+# ----------------------------- Second-hop retrieval -----------------------------
 def retrieve_second_hop_for_bridge(bridge_sem_node, second_hop_k):
-    """取 bridge sem node BM25 最高的 second_hop_k 个 chunk。
+    """Take the top second_hop_k chunks by bridge sem-node BM25.
 
-    返回 [(chunk_id, normalized_bm25), ...],bm25 归一到 (0,1]。
+    Returns [(chunk_id, normalized_bm25), ...], with BM25 normalized to (0,1].
     """
     bm25 = getattr(bridge_sem_node, "BM25", None) or {}
     if not bm25:
@@ -325,7 +347,8 @@ def retrieve_second_hop_for_bridge(bridge_sem_node, second_hop_k):
 
 
 def _constraint_coverage(db, residual_query_sems, hop2_chunk_id):
-    """第二跳 chunk 对剩余 query 约束的 idf 加权 soft 覆盖(计划 §4.6 ConstraintCoverage)。"""
+    """IDF-weighted soft coverage of residual query constraints by the
+    second-hop chunk (plan §4.6 ConstraintCoverage)."""
     if not residual_query_sems:
         return CONSTRAINT_COVERAGE_NO_RESIDUAL
     hop2_sem_ids = _chunk_sem_id_set(db.chunk_nodes[hop2_chunk_id])
@@ -340,7 +363,7 @@ def _constraint_coverage(db, residual_query_sems, hop2_chunk_id):
     return CONSTRAINT_COVERAGE_FLOOR + CONSTRAINT_COVERAGE_SPAN * coverage
 
 
-# ----------------------------- 链路评分主流程 -----------------------------
+# ----------------------------- Main chain-scoring flow -----------------------------
 def rank_evidence_chains(
     db,
     first_hop_score_map,
@@ -352,21 +375,23 @@ def rank_evidence_chains(
     top_k_chain=DEFAULT_TOP_K_CHAIN,
     allow_same_chunk=False,
 ):
-    """对 (hop1, bridge, hop2) 三元组生成并排序 evidence chain。"""
+    """Generate and rank evidence chains for (hop1, bridge, hop2) triples."""
     chains = []
-    seen_keys = set()  # (hop1_doc, bridge_token_norm, hop2_doc) 去重
+    seen_keys = set()  # deduplicate by (hop1_doc, bridge_token_norm, hop2_doc)
 
     for cand in bridge_candidates:
         hop1_chunk_id = cand.hop1_chunk_id
         hop1_doc = _doc_name(db, hop1_chunk_id)
         first_hop_score = first_hop_score_map.get(hop1_chunk_id, 0.0)
-        # 残余约束 = hop1 chunk 未覆盖的 query sems(自然落到 answer focus 上)。
+        # Residual constraints are the query sems not covered by the hop1
+        # chunk, which naturally become the answer focus.
         hop1_sem_ids = _chunk_sem_id_set(db.chunk_nodes[hop1_chunk_id])
         residual_query_sems = [s for s in query_sems if s.sem_node_id not in hop1_sem_ids]
 
         second_hop = retrieve_second_hop_for_bridge(cand.sem_node, second_hop_k)
-        # 注入 bridge 实体自己的同名页面作为第二跳候选(HotpotQA 第二跳 gold 的典型),
-        # 即使它不在 bridge BM25 的 top-second_hop_k 内也强制纳入。
+        # Inject the bridge entity's own title-matching page as a second-hop
+        # candidate, a common HotpotQA second-hop gold pattern, even if it is
+        # not in the bridge BM25 top-second_hop_k.
         bridge_title_chunk = title_to_chunk.get(cand.token_norm)
         if bridge_title_chunk is not None and bridge_title_chunk != hop1_chunk_id:
             if all(cid != bridge_title_chunk for cid, _ in second_hop):
@@ -383,7 +408,8 @@ def rank_evidence_chains(
 
             diversity = DIVERSITY_PENALTY_SAME_CHUNK if same_chunk else 1.0
             coverage = _constraint_coverage(db, residual_query_sems, hop2_chunk_id)
-            # 第二跳目标正是 bridge 实体的同名页面 -> 强加权。
+            # The second-hop target is exactly the bridge entity's own page ->
+            # strong upweighting.
             hop2_title_match = normalize_text(hop2_doc) == cand.token_norm
             title_bonus = HOP2_TITLE_MATCH_BONUS if hop2_title_match else 1.0
             score = (
@@ -449,21 +475,27 @@ def aggregate_chunk_ranking(
     hop2_bonus_weight=AGG_HOP2_BONUS_WEIGHT,
     min_chain_bonus_score=AGG_MIN_CHAIN_BONUS_SCORE,
 ):
-    """把第一跳证据与 chain 两端证据按组合分数排成最终 chunk 列表。
+    """Rank the final chunk list by combining first-hop evidence with both ends
+    of each chain.
 
-    combined(chunk) = first_hop_score(chunk)               # 单跳 anchor / comparison 两侧
-                    + hop2_bonus_weight * chain.score       # 该 chunk 是某 chain 的第二跳证据
-                    + hop1_bonus_weight * chain.score       # 该 chunk 是某 chain 的第一跳证据
+    combined(chunk) = first_hop_score(chunk)               # single-hop anchor / both comparison sides
+                    + hop2_bonus_weight * chain.score      # this chunk is second-hop evidence for some chain
+                    + hop1_bonus_weight * chain.score      # this chunk is first-hop evidence for some chain
 
-    第二跳加成(新证据,bridge 目标)权重高,第一跳加成(已在第一跳列表里)权重低,
-    避免 comparison 等弱 chain 把第一跳内部排序打乱、压低首个 gold 的 MRR;同时保留
-    "把较低排名的第二个 gold 提进 top-k" 的能力。只有 chain.score >= 门槛才计加成。
+    The second-hop bonus, which is new bridge evidence, gets higher weight.
+    The first-hop bonus, which is already present in the first-hop list, gets
+    lower weight. This avoids weak chains such as comparison noise from
+    disrupting the internal first-hop ranking and hurting the MRR of the first
+    gold document, while still preserving the ability to move a lower-ranked
+    second gold document into the top-k. Only chains with score >= the
+    threshold contribute bonus weight.
     """
     combined = {}
-    # 第一跳基础分。
+    # Base first-hop score.
     for cid in first_hop_chunk_ids:
         combined[cid] = first_hop_score_map.get(cid, 0.0)
-    # chain 加成:hop2 权重高、hop1 权重低,取各 chunk 的最高加成。
+    # Chain bonus: hop2 gets higher weight and hop1 gets lower weight. Keep the
+    # highest bonus per chunk.
     bonus = {}
     for chain in chains:
         if chain.score < min_chain_bonus_score:
@@ -476,7 +508,8 @@ def aggregate_chunk_ranking(
             bonus[chain.hop1_chunk_id] = b1
     for cid, b in bonus.items():
         combined[cid] = combined.get(cid, first_hop_score_map.get(cid, 0.0)) + b
-    # 稳定排序:组合分降序,平分时第一跳分降序、chunk_id 升序。
+    # Stable sort: combined score descending, then first-hop score descending,
+    # then chunk_id ascending.
     ranked = sorted(
         combined.items(),
         key=lambda kv: (-kv[1], -first_hop_score_map.get(kv[0], 0.0), kv[0]),
@@ -484,7 +517,7 @@ def aggregate_chunk_ranking(
     return [cid for cid, _ in ranked]
 
 
-# ----------------------------- 对外入口 -----------------------------
+# ----------------------------- Public entry point -----------------------------
 def multihop_bridge_query(
     db,
     query_text,
@@ -507,15 +540,18 @@ def multihop_bridge_query(
     idf_prune_keep_top=2,
     print_important_tokens=False,
 ):
-    """两阶段桥接检索(计划一)。
+    """Two-stage bridge retrieval (Plan 1).
 
-    返回 (chains, retrieved_chunk_ids, debug_info):
-      chains             : top EvidenceChain 列表
-      retrieved_chunk_ids: 第一跳与 bridge 第二跳证据交错合并、去重后的 chunk id 列表
-                           (供 HotpotQA 等下游做 chunk->title 评测)
-      debug_info         : 解释每条 chain 以及第一跳 / bridge 的结构化调试信息
+    Returns (chains, retrieved_chunk_ids, debug_info):
+      chains             : top EvidenceChain list
+      retrieved_chunk_ids: deduplicated chunk-id list built by interleaving
+                           first-hop and bridge second-hop evidence
+                           (used by downstream tasks such as HotpotQA for
+                           chunk->title evaluation)
+      debug_info         : structured debug information explaining each chain
+                           and the first-hop / bridge decisions
     """
-    # ---- 第一跳: 复用 chunk_cooccur_query ----
+    # ---- First hop: reuse chunk_cooccur_query ----
     _, first_hop_chunk_ids, cooccur_debug = db.chunk_cooccur_query(
         query_text,
         top_k_chunk=first_hop_k,
@@ -527,7 +563,7 @@ def multihop_bridge_query(
     )
     resolved_matches = cooccur_debug["resolved_matches"]
 
-    # 第一跳 chunk 归一化 final_score。
+    # Normalized final_score for first-hop chunks.
     all_scored = cooccur_debug.get("all_scored_chunks", []) or []
     max_final = max((r["final_score"] for r in all_scored), default=0.0)
     if max_final > 0:
@@ -537,12 +573,12 @@ def multihop_bridge_query(
     else:
         first_hop_score_map = {r["chunk_id"]: 0.0 for r in all_scored}
 
-    # ---- query 上下文 ----
+    # ---- Query context ----
     query_sems, query_sem_ids, query_token_norms = _collect_query_context(
         db, resolved_matches
     )
 
-    # 语料级最大 idf + 标题集合(只算一次,可缓存在 db 上)。
+    # Corpus-level max IDF and title set. Compute once and cache on the DB if needed.
     max_corpus_idf = getattr(db, "_multihop_max_idf", None)
     if max_corpus_idf is None:
         max_corpus_idf = max(
@@ -562,14 +598,15 @@ def multihop_bridge_query(
             title_norm_set.add(norm)
             chunk_list = getattr(d, "chunk_node_list", []) or []
             if chunk_list and norm not in title_to_chunk:
-                # 取该文档第一个 chunk 作为标题页代表(本语料多为 1 doc=1 chunk)。
+                # Use the document's first chunk as the representative title
+                # page. In this corpus, most cases are 1 doc = 1 chunk.
                 title_to_chunk[norm] = chunk_list[0].chunk_node_id
         db._multihop_title_norms = title_norm_set
         db._multihop_title_to_chunk = title_to_chunk
 
     share_sentence_cache = {}
 
-    # ---- bridge 抽取 ----
+    # ---- Bridge extraction ----
     bridge_candidates = extract_bridge_candidates_from_chunks(
         db,
         first_hop_chunk_ids,
@@ -586,7 +623,7 @@ def multihop_bridge_query(
         bridge_top_k=bridge_top_k,
     )
 
-    # ---- 链路生成与排序 ----
+    # ---- Chain generation and ranking ----
     chains = rank_evidence_chains(
         db,
         first_hop_score_map,
@@ -598,10 +635,13 @@ def multihop_bridge_query(
         allow_same_chunk=allow_same_chunk,
     )
 
-    # ---- 聚合 chunk: 组合分数排序 ----
-    # base = 第一跳归一化分数(保留单跳 anchor / comparison 两侧证据);
-    # bonus = 该 chunk 作为某条 chain 的 hop1 或 hop2 时的最高 chain 分数(把 bridge
-    # 两端证据顶到前面)。两者相加排序,bridge 两个 gold 与 comparison 两侧都能尽量进 top-k。
+    # ---- Aggregate chunks: sort by combined score ----
+    # base = normalized first-hop score, preserving single-hop anchor evidence
+    #        or both sides of comparison evidence;
+    # bonus = the highest chain score where this chunk serves as hop1 or hop2,
+    #         which lifts both sides of bridge evidence upward.
+    # Ranking by base + bonus helps both bridge gold documents and both sides
+    # of comparison evidence enter the top-k as much as possible.
     retrieved_chunk_ids = aggregate_chunk_ranking(
         first_hop_chunk_ids,
         first_hop_score_map,
