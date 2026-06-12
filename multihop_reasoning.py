@@ -50,8 +50,6 @@ DEFAULT_SECOND_HOP_K = 20
 DEFAULT_TOP_K_CHAIN = 10
 
 # Bridge-candidate filtering thresholds.
-# IDF below this value is treated as overly generic and is not used as a bridge.
-DEFAULT_MIN_BRIDGE_IDF = 3.0
 # DF above (corpus chunk count * this ratio) is treated as a hub and is not
 # used as a bridge.
 DEFAULT_DF_HUB_RATIO = 0.10
@@ -178,7 +176,7 @@ def _collect_query_context(db, resolved_matches):
     query_token_norms = set()
 
     for sem_info in low_level_sems + high_level_sems:
-        sem_node = sem_info[0]
+        sem_node = sem_info.sem_node
         if sem_node is None:
             continue
         sid = sem_node.sem_node_id
@@ -229,7 +227,6 @@ def extract_bridge_candidates_from_chunks(
     max_corpus_idf,
     share_sentence_cache,
     *,
-    min_bridge_idf=DEFAULT_MIN_BRIDGE_IDF,
     df_hub_ratio=DEFAULT_DF_HUB_RATIO,
     min_single_token_idf=DEFAULT_MIN_SINGLE_TOKEN_IDF,
     require_same_sentence=False,
@@ -267,8 +264,10 @@ def extract_bridge_candidates_from_chunks(
             title_match = token_norm in title_norm_set
 
             # ---- Generic-term / hub filtering ----
-            if idf < min_bridge_idf and not (is_phrase or title_match):
-                continue
+            # Single tokens are noisier, so they are gated by an IDF floor
+            # (min_single_token_idf). Phrases are intentionally exempt from any
+            # IDF floor: a compositional/atomic phrase is inherently distinctive
+            # enough to act as a bridge regardless of its head token's IDF.
             if not is_phrase and idf < min_single_token_idf and not title_match:
                 continue
             if df > df_hub_threshold and not title_match:
@@ -529,7 +528,6 @@ def multihop_bridge_query(
     search_mode="broad",
     require_same_sentence=False,
     allow_same_chunk=False,
-    min_bridge_idf=DEFAULT_MIN_BRIDGE_IDF,
     df_hub_ratio=DEFAULT_DF_HUB_RATIO,
     min_single_token_idf=DEFAULT_MIN_SINGLE_TOKEN_IDF,
     hop1_bonus_weight=AGG_HOP1_BONUS_WEIGHT,
@@ -616,7 +614,6 @@ def multihop_bridge_query(
         title_norm_set,
         max_corpus_idf,
         share_sentence_cache,
-        min_bridge_idf=min_bridge_idf,
         df_hub_ratio=df_hub_ratio,
         min_single_token_idf=min_single_token_idf,
         require_same_sentence=require_same_sentence,

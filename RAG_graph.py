@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from typing import NamedTuple
 import queue
 import threading
 
@@ -96,6 +97,80 @@ ANCHOR_PROP_VERSION_FLAGS = {
 ANCHOR_PROP_DEFAULT_KNN_TYPE = {"C": "plain", "D": "mutual"}
 ANCHOR_PROP_UNCERTAIN_MODES = ("ce_fallback", "re_llm")
 DEFAULT_SEM_ASSIGNMENT_METHOD = "Anchor-F-mutual [ce_fallback]"
+
+# Table-driven backward-compatible defaults for LiteSemRAG instance attributes.
+# `_ensure_backward_compatible_attrs()` applies these only when an attribute is
+# missing, so they never clobber values restored from a pickle (including legacy
+# `proto_*` fields that are renamed earlier in that method). Registering a new
+# persisted field here (plus its dataclass/__init__ default) is the single place
+# to update — no extra flat `if not hasattr` branch is needed.
+#
+# Use _SCHEMA_BACKCOMPAT_CONSTANT_DEFAULTS for immutable scalar defaults.
+_SCHEMA_BACKCOMPAT_CONSTANT_DEFAULTS = {
+    "phrase_analyzer": None,
+    "discard_no_word": False,
+    "sem_description_prompt_context_mode": "sentence_neighbors",
+    "sem_description_candidate_limit": 5,
+    "llm_candidate_filter_candidate_limit": 10,
+    "use_llm_candidate_filter": False,
+    "llm_candidate_filter_use_api": True,
+    "llm_candidate_filter_provider": "openai",
+    "llm_candidate_filter_api_model": None,
+    "llm_candidate_filter_cache_path": "cache/wikidata_definition_filter_cache.sqlite3",
+    "llm_candidate_filter_max_tokens": 4096,
+    "llm_candidate_filter": None,
+    "llm_candidate_filter_total_tokens": 0,
+    "llm_candidate_filter_prompt_tokens": 0,
+    "llm_candidate_filter_completion_tokens": 0,
+    "llm_candidate_filter_total_wall_time": 0.0,
+    "llm_candidate_filter_api_wait_wall_time": 0.0,
+    "use_llm_semantic_labeler": False,
+    "llm_semantic_labeler_provider": "openai",
+    "llm_semantic_labeler_model": "gpt-5.4-mini",
+    "llm_semantic_labeler_api_key_file": "API_KEY",
+    "llm_semantic_labeler_cache_path": "cache/llm_semantic_label_cache.sqlite3",
+    "llm_semantic_labeler_context_word_window": 20,
+    "llm_semantic_labeler_max_tokens": 256,
+    "llm_semantic_labeler_batch_size": 10,
+    "llm_semantic_label_client": None,
+    "llm_semantic_label_total_tokens": 0,
+    "llm_semantic_label_cache_hits": 0,
+    "llm_semantic_label_cache_misses": 0,
+    "fft_propagation_wall_time": 0.0,
+    "fft_max_samples": 10,
+    "fft_d1_d2_ratio_threshold": 0.8,
+    "fft_knn_check_k": 5,
+    "fft_danger_neighbor_m": 10,
+    "sem_description_batch_size": 32,
+    "sem_description_use_detailed_description": False,
+    "sem_description_require_detailed_description": True,
+    "sem_description_exact_match_text": False,
+    "sem_description_label_contains_text": True,
+    "sem_description_exact_match_first": False,
+    "sem_description_log_path": "sem_description_logs.txt",
+    "llm_anchor_sample_assignment_count": 0,
+    "phrase_audit_enabled": False,
+    "phrase_audit_cache_path": "cache/phrase_protection_audit.jsonl",
+    "_phrase_audit_session_id": None,
+    "sem_description_model_name": "cross-encoder/nli-deberta-v3-large",
+    "sem_description_model": None,
+    "disambiguate_query_sense": True,
+    "consensus_ratio_threshold": 0.8,
+    "min_occurrences_for_description": 20,
+}
+
+# Use _SCHEMA_BACKCOMPAT_FACTORY_DEFAULTS for mutable defaults that need a fresh
+# object per instance (each value is a zero-arg callable invoked when missing).
+_SCHEMA_BACKCOMPAT_FACTORY_DEFAULTS = {
+    "predicted_sem_description_logs": list,
+    "deleted_merged_sem_logs": list,
+    "sem_description_operation_logs": list,
+    "wikidata_no_result_logs": list,
+    "_wikidata_no_result_keys": set,
+    "_sem_description_candidate_bank_cache": dict,
+    "_combined_merge_sample_sense_descriptions": dict,
+    "llm_candidate_filter_result_cache": dict,
+}
 
 
 def _anchor_method_name(version, knn_type, uncertain_mode):
@@ -505,35 +580,43 @@ class CoOccurrenceGraph:
 
 CoOccurrenceNode_query_weight = CO_OCCURRENCE_NODE_QUERY_WEIGHT
 
-@dataclass
-class CoOccurrenceNode:
+
+# Named carrier for one query-time semantic-node candidate. Replaces the old
+# bare 3-or-8-element tuple: the grouping fields default to "ungrouped" so a
+# plain match constructs as QuerySemInfo(sem_node, node_level, node_query_weight),
+# and a compositional member fills in query_group_*. Detect grouping via
+# `query_group_id is not None` (never via len()).
+class QuerySemInfo(NamedTuple):
     sem_node: object
     node_level: int
     node_query_weight: float
-    neighbor_node_list: list = field(default_factory=list)
-    node_weight: float = 0
-    node_level_weight: float = field(init=False)
+    query_group_id: object = None
+    query_group_role: object = None
+    query_member_key: object = None
+    query_group_member_keys: tuple = ()
+    query_role_weight: float | None = None
 
-    # Store a semantic node candidate with its match level and query weight.
-    def __init__(self, sem_node_info):
-        self.sem_node = sem_node_info[0]
-        self.node_level = sem_node_info[1]
-        self.node_query_weight = sem_node_info[2]
+    @property
+    def is_grouped(self):
+        return self.query_group_id is not None
+
+
+class CoOccurrenceNode:
+    # Store a semantic node candidate (QuerySemInfo) with its match level and
+    # query weight.
+    def __init__(self, sem_info):
+        self.sem_node = sem_info.sem_node
+        self.node_level = sem_info.node_level
+        self.node_query_weight = sem_info.node_query_weight
         if self.node_level < 0 or self.node_level >= len(CO_OCCURRENCE_NODE_QUERY_WEIGHT):
             raise ValueError(f"Unsupported co-occurrence node level: {self.node_level}")
-        self.query_group_id = None
-        self.query_group_role = None
-        self.query_member_key = None
-        self.query_group_member_keys = set()
-        role_weight = None
-        if len(sem_node_info) > 3:
-            self.query_group_id = sem_node_info[3]
-            self.query_group_role = sem_node_info[4]
-            self.query_member_key = sem_node_info[5]
-            self.query_group_member_keys = set(sem_node_info[6] or [])
-            role_weight = sem_node_info[7]
+        self.query_group_id = sem_info.query_group_id
+        self.query_group_role = sem_info.query_group_role
+        self.query_member_key = sem_info.query_member_key
+        self.query_group_member_keys = set(sem_info.query_group_member_keys or ())
         self.neighbor_node_list = []
         self.node_weight = 0
+        role_weight = sem_info.query_role_weight
         if role_weight is None:
             self.node_level_weight = CO_OCCURRENCE_NODE_QUERY_WEIGHT[self.node_level]
         else:
@@ -1845,8 +1928,6 @@ class LiteSemRAG:
             )
         if getattr(self, "schema_version", None) == CURRENT_SCHEMA_VERSION:
             return
-        if not hasattr(self, "phrase_analyzer"):
-            self.phrase_analyzer = None
         if not hasattr(self, "modifier_postings"):
             self.modifier_postings = defaultdict(Counter)
         elif not isinstance(self.modifier_postings, defaultdict):
@@ -1891,74 +1972,17 @@ class LiteSemRAG:
             self.sem_description_model_name = self.proto_description_model_name
         if not hasattr(self, "sem_description_model") and hasattr(self, "proto_description_model"):
             self.sem_description_model = self.proto_description_model
-        if not hasattr(self, "discard_no_word"):
-            self.discard_no_word = False
         if not hasattr(self, "encoder_lock") or self.encoder_lock is None:
             self.encoder_lock = threading.Lock()
-        if not hasattr(self, "sem_description_prompt_context_mode"):
-            self.sem_description_prompt_context_mode = "sentence_neighbors"
-        if not hasattr(self, "sem_description_candidate_limit"):
-            self.sem_description_candidate_limit = 5
-        if not hasattr(self, "llm_candidate_filter_candidate_limit"):
-            self.llm_candidate_filter_candidate_limit = 10
-        if not hasattr(self, "use_llm_candidate_filter"):
-            self.use_llm_candidate_filter = False
-        if not hasattr(self, "llm_candidate_filter_use_api"):
-            self.llm_candidate_filter_use_api = True
-        if not hasattr(self, "llm_candidate_filter_provider"):
-            self.llm_candidate_filter_provider = "openai"
-        if not hasattr(self, "llm_candidate_filter_api_model"):
-            self.llm_candidate_filter_api_model = None
-        if not hasattr(self, "llm_candidate_filter_cache_path"):
-            self.llm_candidate_filter_cache_path = "cache/wikidata_definition_filter_cache.sqlite3"
-        if not hasattr(self, "llm_candidate_filter_max_tokens"):
-            self.llm_candidate_filter_max_tokens = 4096
-        if not hasattr(self, "llm_candidate_filter"):
-            self.llm_candidate_filter = None
-        if not hasattr(self, "llm_candidate_filter_total_tokens"):
-            self.llm_candidate_filter_total_tokens = 0
-        if not hasattr(self, "llm_candidate_filter_prompt_tokens"):
-            self.llm_candidate_filter_prompt_tokens = 0
-        if not hasattr(self, "llm_candidate_filter_completion_tokens"):
-            self.llm_candidate_filter_completion_tokens = 0
-        if not hasattr(self, "llm_candidate_filter_total_wall_time"):
-            self.llm_candidate_filter_total_wall_time = 0.0
-        if not hasattr(self, "llm_candidate_filter_api_wait_wall_time"):
-            self.llm_candidate_filter_api_wait_wall_time = 0.0
-        if not hasattr(self, "use_llm_semantic_labeler"):
-            self.use_llm_semantic_labeler = False
-        if not hasattr(self, "llm_semantic_labeler_provider"):
-            self.llm_semantic_labeler_provider = "openai"
-        if not hasattr(self, "llm_semantic_labeler_model"):
-            self.llm_semantic_labeler_model = "gpt-5.4-mini"
-        if not hasattr(self, "llm_semantic_labeler_api_key_file"):
-            self.llm_semantic_labeler_api_key_file = "API_KEY"
-        if not hasattr(self, "llm_semantic_labeler_cache_path"):
-            self.llm_semantic_labeler_cache_path = "cache/llm_semantic_label_cache.sqlite3"
-        if not hasattr(self, "llm_semantic_labeler_context_word_window"):
-            self.llm_semantic_labeler_context_word_window = 20
-        if not hasattr(self, "llm_semantic_labeler_max_tokens"):
-            self.llm_semantic_labeler_max_tokens = 256
-        if not hasattr(self, "llm_semantic_labeler_batch_size"):
-            self.llm_semantic_labeler_batch_size = 10
-        if not hasattr(self, "llm_semantic_label_client"):
-            self.llm_semantic_label_client = None
-        if not hasattr(self, "llm_semantic_label_total_tokens"):
-            self.llm_semantic_label_total_tokens = 0
-        if not hasattr(self, "llm_semantic_label_cache_hits"):
-            self.llm_semantic_label_cache_hits = 0
-        if not hasattr(self, "llm_semantic_label_cache_misses"):
-            self.llm_semantic_label_cache_misses = 0
-        if not hasattr(self, "fft_propagation_wall_time"):
-            self.fft_propagation_wall_time = 0.0
-        if not hasattr(self, "fft_max_samples"):
-            self.fft_max_samples = 10
-        if not hasattr(self, "fft_d1_d2_ratio_threshold"):
-            self.fft_d1_d2_ratio_threshold = 0.8
-        if not hasattr(self, "fft_knn_check_k"):
-            self.fft_knn_check_k = 5
-        if not hasattr(self, "fft_danger_neighbor_m"):
-            self.fft_danger_neighbor_m = 10
+        # Table-driven simple defaults. Applied AFTER the proto_* rename block
+        # above so renamed legacy values are preserved; only genuinely missing
+        # attributes get the registered default.
+        for attr, default in _SCHEMA_BACKCOMPAT_CONSTANT_DEFAULTS.items():
+            if not hasattr(self, attr):
+                setattr(self, attr, default)
+        for attr, factory in _SCHEMA_BACKCOMPAT_FACTORY_DEFAULTS.items():
+            if not hasattr(self, attr):
+                setattr(self, attr, factory())
         if not hasattr(self, "anchor_prop_params"):
             self.anchor_prop_params = dict(ANCHOR_PROP_DEFAULTS)
         else:
@@ -1970,54 +1994,6 @@ class LiteSemRAG:
             self._set_sem_assignment_method("FFT-CE")
         elif not hasattr(self, "_anchor_method_spec"):
             self._set_sem_assignment_method(self.sem_assignment_method)
-        if not hasattr(self, "sem_description_batch_size"):
-            self.sem_description_batch_size = 32
-        if not hasattr(self, "sem_description_use_detailed_description"):
-            self.sem_description_use_detailed_description = False
-        if not hasattr(self, "sem_description_require_detailed_description"):
-            self.sem_description_require_detailed_description = True
-        if not hasattr(self, "sem_description_exact_match_text"):
-            self.sem_description_exact_match_text = False
-        if not hasattr(self, "sem_description_label_contains_text"):
-            self.sem_description_label_contains_text = True
-        if not hasattr(self, "sem_description_exact_match_first"):
-            self.sem_description_exact_match_first = False
-        if not hasattr(self, "predicted_sem_description_logs"):
-            self.predicted_sem_description_logs = []
-        if not hasattr(self, "deleted_merged_sem_logs"):
-            self.deleted_merged_sem_logs = []
-        if not hasattr(self, "sem_description_operation_logs"):
-            self.sem_description_operation_logs = []
-        if not hasattr(self, "sem_description_log_path"):
-            self.sem_description_log_path = "sem_description_logs.txt"
-        if not hasattr(self, "wikidata_no_result_logs"):
-            self.wikidata_no_result_logs = []
-        if not hasattr(self, "_wikidata_no_result_keys"):
-            self._wikidata_no_result_keys = set()
-        if not hasattr(self, "_sem_description_candidate_bank_cache"):
-            self._sem_description_candidate_bank_cache = {}
-        if not hasattr(self, "_combined_merge_sample_sense_descriptions"):
-            self._combined_merge_sample_sense_descriptions = {}
-        if not hasattr(self, "llm_candidate_filter_result_cache"):
-            self.llm_candidate_filter_result_cache = {}
-        if not hasattr(self, "llm_anchor_sample_assignment_count"):
-            self.llm_anchor_sample_assignment_count = 0
-        if not hasattr(self, "phrase_audit_enabled"):
-            self.phrase_audit_enabled = False
-        if not hasattr(self, "phrase_audit_cache_path"):
-            self.phrase_audit_cache_path = "cache/phrase_protection_audit.jsonl"
-        if not hasattr(self, "_phrase_audit_session_id"):
-            self._phrase_audit_session_id = None
-        if not hasattr(self, "sem_description_model_name"):
-            self.sem_description_model_name = "cross-encoder/nli-deberta-v3-large"
-        if not hasattr(self, "sem_description_model"):
-            self.sem_description_model = None
-        if not hasattr(self, "disambiguate_query_sense"):
-            self.disambiguate_query_sense = True
-        if not hasattr(self, "consensus_ratio_threshold"):
-            self.consensus_ratio_threshold = 0.8
-        if not hasattr(self, "min_occurrences_for_description"):
-            self.min_occurrences_for_description = 20
         if not hasattr(self, "min_description_candidates"):
             legacy_min_candidates = getattr(self, "single_cluster_min_description_candidates", 3)
             self.min_description_candidates = max(1, int(legacy_min_candidates))
@@ -2953,16 +2929,16 @@ class LiteSemRAG:
 
         def make_sem_info(sem_node, node_level, node_query_weight, match):
             if match.get("query_group_id") is None:
-                return (sem_node, node_level, node_query_weight)
-            return (
+                return QuerySemInfo(sem_node, node_level, node_query_weight)
+            return QuerySemInfo(
                 sem_node,
                 node_level,
                 node_query_weight,
-                match.get("query_group_id"),
-                match.get("query_group_role"),
-                match.get("query_member_key"),
-                tuple(match.get("query_group_member_keys") or ()),
-                match.get("query_role_weight"),
+                query_group_id=match.get("query_group_id"),
+                query_group_role=match.get("query_group_role"),
+                query_member_key=match.get("query_member_key"),
+                query_group_member_keys=tuple(match.get("query_group_member_keys") or ()),
+                query_role_weight=match.get("query_role_weight"),
             )
 
         for match in resolved_matches:
@@ -3040,8 +3016,9 @@ class LiteSemRAG:
             return low_level_sems, high_level_sems, []
 
         def is_groupable(sem_info):
-            # tuple len > 3 carries query_group_id et al. -> compositional member, never prune.
-            return len(sem_info) <= 3
+            # A grouped (compositional) member carries query_group_id et al. and
+            # is never pruned; only ungrouped members are prunable.
+            return not sem_info.is_grouped
 
         prunable = [
             s for s in (low_level_sems + high_level_sems) if is_groupable(s)
@@ -3050,7 +3027,7 @@ class LiteSemRAG:
             return low_level_sems, high_level_sems, []
 
         def sem_idf(sem_info):
-            return float(getattr(sem_info[0].token_node, "idf", 0.0) or 0.0)
+            return float(getattr(sem_info.sem_node.token_node, "idf", 0.0) or 0.0)
 
         max_idf = max(sem_idf(s) for s in prunable)
         # Gate: no clearly discriminative token -> leave the query untouched.
@@ -3062,7 +3039,7 @@ class LiteSemRAG:
         # above threshold. Rank by idf desc; ties broken by token text for determinism.
         ranked = sorted(
             prunable,
-            key=lambda s: (-sem_idf(s), s[0].token_node.token_text),
+            key=lambda s: (-sem_idf(s), s.sem_node.token_node.token_text),
         )
         keep_ids = {id(s) for s in ranked[: max(keep_top, 1)]}
 
@@ -3074,7 +3051,7 @@ class LiteSemRAG:
             return sem_idf(sem_info) > threshold
 
         dropped_tokens = [
-            s[0].token_node.token_text
+            s.sem_node.token_node.token_text
             for s in prunable
             if id(s) not in keep_ids and sem_idf(s) <= threshold
         ]
@@ -3528,9 +3505,22 @@ class LiteSemRAG:
         log_path = self._save_sem_description_logs_to_timestamped_file()
         self.log_time(f"Saved sem description logs to {log_path}.")
         self.log_time("Finalizing completed.")
+        # finalize 重建了语料级派生状态,任何 multihop_reasoning 缓存(语料 max IDF、
+        # 标题集合等)都已过期,统一清除避免命中陈旧值。
+        self._invalidate_multihop_caches()
         # 全部步骤成功完成后才置位:此后再调 finalize() 会被开头的守卫拦截。
         self._finalized = True
         self._print_index_session_timing()
+
+    # Drop cross-query caches that multihop_reasoning lazily stashes on this
+    # instance (attributes prefixed `_multihop_`: corpus max IDF, title-norm
+    # set, title->chunk map). They are derived from the whole corpus, so any
+    # corpus mutation (finalize / delete_by_document rebuild) invalidates them;
+    # clearing here forces a lazy rebuild on the next multihop query and keeps
+    # them from being pickled stale into an archive.
+    def _invalidate_multihop_caches(self):
+        for attr in [name for name in vars(self) if name.startswith("_multihop_")]:
+            delattr(self, attr)
 
     # Persist sem description logs to a timestamped file under <project_root>/logs/.
     def _save_sem_description_logs_to_timestamped_file(self):
@@ -6637,6 +6627,9 @@ class LiteSemRAG:
             self.build_query_database()
         else:
             self.query_database = None
+
+        # 删除文档后语料级派生量(max IDF、标题集合等)都变了,失效 multihop 缓存。
+        self._invalidate_multihop_caches()
 
     # Return the index of the semantic node most similar to an embedding.
     def get_max_sim_sem(self, token_node, embeds):
