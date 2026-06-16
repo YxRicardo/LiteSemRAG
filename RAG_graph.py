@@ -928,6 +928,15 @@ class LiteSemRAG(_InspectionReportMixin):
         self.next_chunk_node_id = 0
         self.next_token_node_id = 0
         self.next_sem_node_id = 0
+        # Milestone 2 multi-hop global co-occurrence index + lazy multi-hop
+        # caches. Runtime-only derived structures: built on demand, stripped on
+        # pickling (see __getstate__) and rebuilt after load.
+        self.sem_cooccur_index = None
+        # Milestone 4 sentence-level evidence structures. Same runtime-only
+        # lifecycle: built on demand by build_sentence_evidence_index(),
+        # stripped on pickling, rebuilt after load.
+        self.sentence_evidence_index = None
+        self.sem_to_sentences = None
         # Semantic nodes are no longer built incrementally during indexing: all
         # occurrences of each token/phrase accumulate in token_node.embeds_buffer
         # until every document has been scanned, and finalize then runs
@@ -1980,6 +1989,16 @@ class LiteSemRAG(_InspectionReportMixin):
 
     # Populate missing attributes when loading graphs saved by older code versions.
     def _ensure_backward_compatible_attrs(self):
+        # Milestone 2 runtime-only co-occurrence index: defaults to None on old
+        # pickles and is rebuilt on demand by build_sem_cooccur_index().
+        if not hasattr(self, "sem_cooccur_index"):
+            self.sem_cooccur_index = None
+        # Milestone 4 runtime-only sentence-level evidence: defaults to None on
+        # old pickles, rebuilt on demand by build_sentence_evidence_index().
+        if not hasattr(self, "sentence_evidence_index"):
+            self.sentence_evidence_index = None
+        if not hasattr(self, "sem_to_sentences"):
+            self.sem_to_sentences = None
         if not hasattr(self, "index_session_start_time"):
             self.index_session_start_time = None
         if not hasattr(self, "index_session_document_count"):
@@ -3185,6 +3204,7 @@ class LiteSemRAG(_InspectionReportMixin):
         idf_prune_tau=None,
         idf_prune_min_max_idf=None,
         idf_prune_keep_top=2,
+        resolved_matches=None,
     ):
         # ---- Parameter validation (fail loud instead of silently degrading) ----
         # bool is a subclass of int, so reject it explicitly to avoid True being read as 1.
@@ -3213,12 +3233,18 @@ class LiteSemRAG(_InspectionReportMixin):
         if search_mode not in {"broad", "precise"}:
             raise ValueError(f"search_mode must be 'broad' or 'precise', got {search_mode!r}")
 
-        query_text, _, resolved_matches = self._resolve_query_matches(
-            query_text,
-            search_mode=search_mode,
-            print_important_tokens=print_important_tokens,
-            expand_compositional=True,
-        )
+        # When a caller already resolved the query (e.g. the multi-hop router
+        # sharing one query encode across plan_query + the chosen strategy), reuse
+        # those matches instead of re-encoding. resolved_matches carries the query
+        # embeddings/sem nodes, so scoring below is unchanged — only the GPU encode
+        # in _resolve_query_matches is skipped.
+        if resolved_matches is None:
+            query_text, _, resolved_matches = self._resolve_query_matches(
+                query_text,
+                search_mode=search_mode,
+                print_important_tokens=print_important_tokens,
+                expand_compositional=True,
+            )
         low_level_sems, high_level_sems = self._collect_query_cooccurrence_sems(
             resolved_matches, print_important_tokens
         )
@@ -3359,6 +3385,41 @@ class LiteSemRAG(_InspectionReportMixin):
     def multihop_bridge_query(self, query_text, *args, **kwargs):
         from multihop_reasoning import multihop_bridge_query
         return multihop_bridge_query(self, query_text, *args, **kwargs)
+
+    # Milestone 2: build/cache the global semantic co-occurrence index used by
+    # multihop_path_query(). Runtime-only (stripped on pickle, rebuilt on demand).
+    def build_sem_cooccur_index(self, *args, **kwargs):
+        from multihop_reasoning import build_sem_cooccur_index
+        return build_sem_cooccur_index(self, *args, **kwargs)
+
+    # Milestone 2: path-based bridge retrieval over the global co-occurrence
+    # index (beam search from query sem nodes). Thin delegating wrapper.
+    def multihop_path_query(self, query_text, *args, **kwargs):
+        from multihop_reasoning import multihop_path_query
+        return multihop_path_query(self, query_text, *args, **kwargs)
+
+    # Milestone 3: rule-based question decomposition / strategy routing decision.
+    def plan_query(self, query_text):
+        from multihop_reasoning import plan_query
+        return plan_query(self, query_text)
+
+    # Milestone 3: comparison-focused parallel two-side retrieval. Thin wrapper.
+    def comparison_focused_query(self, query_text, *args, **kwargs):
+        from multihop_reasoning import comparison_focused_query
+        return comparison_focused_query(self, query_text, *args, **kwargs)
+
+    # Milestone 3: unified multi-hop entry with strategy routing
+    # (comparison / bridge-path / single-hop). Thin wrapper.
+    def multihop_query(self, query_text, *args, **kwargs):
+        from multihop_reasoning import multihop_query
+        return multihop_query(self, query_text, *args, **kwargs)
+
+    # Milestone 4: build/cache the sentence-level evidence structures used to
+    # re-ground chain local evidence and render readable chains. Runtime-only
+    # (stripped on pickle, rebuilt on demand).
+    def build_sentence_evidence_index(self, *args, **kwargs):
+        from multihop_reasoning import build_sentence_evidence_index
+        return build_sentence_evidence_index(self, *args, **kwargs)
 
     # Chunk-level bounded boosting: local evidence level for a co-occurring node pair.
     #
@@ -6718,6 +6779,19 @@ class LiteSemRAG(_InspectionReportMixin):
         state = self.__dict__.copy()
         for name in RUNTIME_FIELD_NAMES:
             state[name] = None
+        # Milestone 2: never persist the derived co-occurrence index / lazy
+        # multi-hop caches (plan §5.7). They are rebuilt on demand after load and
+        # would otherwise go stale across deletion/rebuild.
+        state["sem_cooccur_index"] = None
+        for name in ("_sem_cooccur_index_params", "_multihop_max_idf",
+                     "_multihop_title_norms", "_multihop_title_to_chunk"):
+            state.pop(name, None)
+        # Milestone 4: sentence-level evidence structures are likewise derived
+        # and rebuilt on demand — never persist them.
+        state["sentence_evidence_index"] = None
+        state["sem_to_sentences"] = None
+        for name in ("_sentence_evidence_available", "_sentence_evidence_params"):
+            state.pop(name, None)
         return state
 
     # Restore a pickled graph state and reinitialize runtime placeholders.
