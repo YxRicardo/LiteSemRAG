@@ -15,8 +15,14 @@ import os
 os.environ.setdefault("LITESEM_PRESERVE_CASE", "1")
 
 import json
+import sys
 import time
 from pathlib import Path
+
+_EVAL_DIR = Path(__file__).resolve().parent
+if str(_EVAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_EVAL_DIR))
+from multihop_eval_store import load_all, save_all
 
 import RAG_graph
 from utils import build_hotpot_retrieval_dataset, mrr_for_one_query_titles
@@ -25,7 +31,6 @@ NUM_SAMPLES = 500
 TOP_K = 10
 HOTPOT_FILE = "jupyter_notebooks/hotpot_dev_distractor_v1.json"
 PKL = "cache/hotpotqa_latest_framework_index/litesemrag_hotpotqa_500_fastidx.pkl"
-OUT = Path("reports/multihop_eval_results.json")
 
 
 def log(msg):
@@ -135,8 +140,11 @@ def main():
         log(f"\n=== {name} ===")
         log(json.dumps(res, ensure_ascii=False, indent=2))
 
-    OUT.write_text(json.dumps(results, ensure_ascii=False, indent=2))
-    log(f"\nwrote {OUT}")
+    all_data = load_all()
+    all_data["baseline"] = results["baseline"]
+    all_data["m1"] = {"multihop_bridge": results["multihop"]}
+    save_all(all_data)
+    log("\nwrote reports/multihop_eval_all.json (m1 section)")
     try:
         db.shutdown()
     except Exception:

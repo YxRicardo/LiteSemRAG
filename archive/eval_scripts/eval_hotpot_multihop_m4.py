@@ -19,8 +19,14 @@ import os
 os.environ.setdefault("LITESEM_PRESERVE_CASE", "1")
 
 import json
+import sys
 import time
 from pathlib import Path
+
+_EVAL_DIR = Path(__file__).resolve().parent
+if str(_EVAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_EVAL_DIR))
+from multihop_eval_store import load_all, save_all
 
 import RAG_graph
 from utils import build_hotpot_retrieval_dataset, mrr_for_one_query_titles
@@ -29,7 +35,6 @@ NUM_SAMPLES = 500
 TOP_K = 10
 HOTPOT_FILE = "jupyter_notebooks/hotpot_dev_distractor_v1.json"
 PKL = "cache/hotpotqa_latest_framework_index/litesemrag_hotpotqa_500_fastidx.pkl"
-OUT = Path("reports/multihop_m4_eval_results.json")
 
 
 def log(msg):
@@ -148,25 +153,28 @@ def main():
     db.build_sentence_evidence_index()
     log(f"sentence_evidence_index built in {time.time()-t0:.1f}s: {db._sentence_evidence_params}")
 
-    results = {
-        "index_params": db._sem_cooccur_index_params,
-        "sentence_evidence_params": db._sentence_evidence_params,
-    }
+    all_data = load_all()
+    all_data["index_params"] = db._sem_cooccur_index_params
+    all_data["sentence_evidence_params"] = db._sentence_evidence_params
+    m4 = {}
     methods = [
-        ("baseline", baseline_titles),
-        ("path_off", make_path_fn(False)),
-        ("path_on", make_path_fn(True)),
-        ("routed_off", make_routed_fn(False)),
-        ("routed_on", make_routed_fn(True)),
+        ("baseline", baseline_titles, "baseline"),
+        ("path_off", make_path_fn(False), "path_sentence_evidence_off"),
+        ("path_on", make_path_fn(True), "path_sentence_evidence_on"),
+        ("routed_off", make_routed_fn(False), "routed_sentence_evidence_off"),
+        ("routed_on", make_routed_fn(True), "routed_sentence_evidence_on"),
     ]
-    for name, fn in methods:
+    for name, fn, key in methods:
         res = evaluate(db, fn, samples, gold_sets, gold_titles_list, type_list)
-        results[name] = res
+        if name == "baseline":
+            all_data["baseline"] = res
+        else:
+            m4[key] = res
         log(f"\n=== {name} ===")
         log(json.dumps(res, ensure_ascii=False, indent=2))
-
-    OUT.write_text(json.dumps(results, ensure_ascii=False, indent=2))
-    log(f"\nwrote {OUT}")
+    all_data["m4"] = m4
+    save_all(all_data)
+    log("\nwrote reports/multihop_eval_all.json (m4 section)")
     try:
         db.shutdown()
     except Exception:
